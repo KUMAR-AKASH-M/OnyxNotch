@@ -463,7 +463,91 @@ box, so it is explained here instead of faked.
   characters anywhere (the cmd-parsing trap from v2/v5).
   The `ole32.lib` pragma is also in `main.cpp`.
 
-### 5. Build (Windows) — v8
+### 5. HOME page customization (in place, after the v8 push)
+
+HOME is no longer a fixed grid. You choose which cards it
+shows, and in what order, up to a hard maximum of six.
+
+The 8 candidates are: System, Calendar, Clock, Media,
+Battery, Network, Clipboard, and Shelf (new in this change:
+title SHELF, parked-file count, the latest parked file name
+truncated, a "Missing" note if that file has moved or been
+deleted, "No parked files yet" when empty, and a
+"Click Shelf tab for files" hint). The other cards keep
+their existing content, including the Media card buttons.
+
+The 6-card cap is enforced at layout, not just in the menu:
+`ComputeLayoutForTab` walks the saved order, takes a card
+only if it is selected AND its feature is on, and stops at
+6. No code path can ever display a 7th card on HOME.
+
+Defaults keep exactly the v6/v7 HOME: System, Calendar,
+Clock, Media, Battery, Network selected, in that order.
+Clipboard and Shelf are NOT selected by default, so turning
+on Clipboard history or File shelf does not auto-add their
+cards to HOME — you add them here, by unchecking something
+else first if you are already at 6.
+
+How to customize (mouse clicks only — there is no dialog
+and no text box, because the notch must not steal keyboard
+focus, same reason as §3):
+
+- Tray menu or notch gear menu -> "Customize Home page"
+  (checkable). This only turns edit mode on or off; edit
+  mode itself is NOT saved, so it always resets to off at
+  startup. Switching tabs while editing keeps edit mode on;
+  it only changes what HOME shows.
+- With edit mode on, HOME paints an edit list instead of
+  the card grid: a header "Home cards — N of 6 selected",
+  then all 8 candidates in the current order. Each row has
+  a checkbox (checked = selected), the card name (with
+  "(feature off)" when its feature toggle is off — such a
+  card can be selected but simply is not displayed until
+  its feature is turned on), and up/down arrows.
+- Click a checkbox to toggle that card. If it is currently
+  unselected and 6 cards are already selected, the click
+  does NOTHING: no silent eviction, no replacement. Uncheck
+  a card first, then check the one you want. The header
+  counter is what explains the cap.
+- Click an up/down arrow to swap that row with its
+  neighbour in the order. The first row's up arrow and the
+  last row's down arrow do nothing.
+- Click "Done" at the bottom of the list, or untick
+  "Customize Home page" in the menu, to exit edit mode.
+  While editing, clicks elsewhere on HOME do nothing (they
+  do not pin or unpin the notch); the dock still switches
+  tabs, and gear/close still work.
+- Every successful checkbox or arrow change saves
+  immediately and resizes all notches, like the other
+  tray toggles.
+
+Persistence, in `%APPDATA%\OnyxNotch\settings.ini`
+(corrupt values ignored, as with every other key):
+
+- `home_order=0,1,2,3,4,5,6,7` — the display order, a
+  permutation of 0..7 (System 0, Calendar 1, Clock 2,
+  Media 3, Battery 4, Network 5, Clipboard 6, Shelf 7).
+  On load, duplicates and unknown ids are ignored and any
+  missing canonical id is appended at the end, so an old
+  file (written before this change, with no such key) gets
+  the default order.
+- `home_cards=0,1,2,3,4,5` — the selected ids, written in
+  display order. On load, duplicates and unknown ids are
+  ignored and only the first 6 unique ids count. Missing
+  key = the default 0-5 selected. An empty value (every
+  card unchecked) reloads as zero selected cards; a value
+  with no valid ids at all is treated as corrupt and the
+  previous selection is kept.
+
+Feature toggles still gate cards: a selected card whose
+feature is off is simply not displayed, and does not count
+against the 6 displayed cards at layout — but it DOES
+count as selected for the header counter and for the
+checkbox cap, so checking a 7th selected card is still
+blocked even if one of the 6 selected cards is currently
+hidden by its feature toggle.
+
+### 6. Build (Windows) — v8
 
 From a Visual Studio Developer Command Prompt, in the folder
 containing `main.cpp`:
@@ -489,7 +573,7 @@ v8 now uses its own identical-layout `OnyxDropFiles` struct
 and `CopyClipItemBack` is forward-declared near the shelf
 forward declarations. No behaviour changed.
 
-### 6. Honest limits — v8 (not verified on Windows)
+### 7. Honest limits — v8 (not verified on Windows)
 
 v8 was written and reviewed in the Linux VM, which has no
 Windows toolchain. Nothing in this section was compiled or
@@ -519,6 +603,12 @@ claimed as verified until Kumar builds and runs it:
   tabs when they are on, so the expanded panel is taller with
   either feature enabled — that height change itself is
   unverified on a real display.
+- HOME customization (this change) is likewise uncompiled
+  and untested on Windows: edit-list clicks, the 6-card cap
+  on a real notch, the edit-list height inside unified tab
+  size, the Shelf HOME card, settings round-tripping for
+  `home_order=` / `home_cards=`, and per-monitor DPI of the
+  edit rows are all unverified.
 
 # OnyxNotch v6 — Card + dock dashboard look, existing data only
 

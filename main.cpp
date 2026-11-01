@@ -235,6 +235,7 @@
 #include <algorithm>
 #include <cmath>
 #include <stdio.h> // v5-settings: sprintf_s in SaveSettings
+#include <stdlib.h> // v8-home-custom: strtol in ParseHomeOrder/ParseHomeCards
 #include <string.h> // v5-settings: strlen/strcmp in LoadSettings
 #include <iphlpapi.h> // v6: GetIfTable for network rates
 #include <mmsystem.h> // v6: waveOutGetVolume for system volume
@@ -290,6 +291,7 @@
 #define ID_TRAY_BLUR            1018
 #define ID_TRAY_CLIPBOARD       1019
 #define ID_TRAY_SHELF           1020
+#define ID_TRAY_HOME_EDIT       1021
 #define IDI_ONYXNOTCH_ICON      100
 
 static const wchar_t kNotchClass[] = L"OnyxNotch";
@@ -318,6 +320,93 @@ static bool g_blurEnabled = false;
 // it on). Saved in settings.ini as clipboard= / shelf=.
 static bool g_clipEnabled = false;
 static bool g_shelfEnabled = false;
+
+// v8-home-custom: HOME card selection + order. Candidate ids:
+// 0 System, 1 Calendar, 2 Clock, 3 Media, 4 Battery, 5 Network,
+// 6 Clipboard, 7 Shelf. g_homeOrder is a permutation of 0..7;
+// g_homeSel says which candidates are chosen. Defaults keep
+// exactly the v6/v7 HOME (ids 0-5); Clipboard and Shelf do NOT
+// auto-appear on HOME when their features are turned on.
+// g_homeEdit is edit mode: NOT saved, resets to off at startup.
+// The 6-card cap is enforced in ComputeLayoutForTab (display),
+// and again in the edit click handler (selection), so no code
+// path can ever show 7 cards on HOME.
+static const int kHomeCardMax = 6;
+static int g_homeOrder[8] = { 0, 1, 2, 3, 4, 5, 6, 7 };
+static bool g_homeSel[8] = { true, true, true, true, true, true, false, false };
+static bool g_homeEdit = false;
+static bool HomeCardFeatureOn(int id)
+{
+    switch (id) {
+    case 0: return g_widgetStats;
+    case 1: return g_widgetCalendar;
+    case 2: return true;
+    case 3: return g_mediaEnabled;
+    case 4: return g_widgetStats;
+    case 5: return g_widgetStats;
+    case 6: return g_clipEnabled;
+    case 7: return g_shelfEnabled;
+    default: return false;
+    }
+}
+static int HomeSelectedCount()
+{
+    int c = 0;
+    for (int i = 0; i < 8; i++) if (g_homeSel[i]) c++;
+    return c;
+}
+// Parse home_order=: comma list, a permutation of 0..7.
+// Duplicates and unknown ids are ignored; any missing canonical
+// id is appended at the end, so an old or corrupt value still
+// yields a full valid order.
+// True if the list text holds anything but digits, commas and
+// whitespace: such a value is corrupt, and the caller keeps the
+// current selection/order instead of applying a half-parsed list.
+// An empty value is NOT corrupt: for home_cards it means the
+// user unchecked every card, which SaveSettings writes as an
+// empty list and which must reload as zero selected cards.
+static bool HomeListHasNonSeparator(const char* val)
+{
+    for (const char* q = val; *q; q++) {
+        if (!(*q >= '0' && *q <= '9') && *q != ',' && *q != ' ' && *q != '\t' && *q != '\r') return true;
+    }
+    return false;
+}
+static void ParseHomeOrder(const char* val)
+{
+    int order[8]; int count = 0; bool seen[8] = { false, false, false, false, false, false, false, false };
+    const char* q = val;
+    while (*q) {
+        char* end = NULL;
+        long v = strtol(q, &end, 10);
+        if (end == q) break;
+        if (v >= 0 && v < 8 && !seen[v]) { seen[v] = true; order[count++] = (int)v; }
+        q = end;
+        while (*q == ',' || *q == ' ' || *q == '\t') q++;
+    }
+    for (int id = 0; id < 8; id++) if (!seen[id]) order[count++] = id;
+    if (count == 0 && HomeListHasNonSeparator(val)) return; // corrupt: keep current order
+    for (int i = 0; i < 8; i++) g_homeOrder[i] = order[i];
+}
+// Parse home_cards=: comma list of SELECTED ids, in display
+// order. Duplicates and unknown ids are ignored; only the
+// first 6 unique ids count, matching the 6-card cap.
+static void ParseHomeCards(const char* val)
+{
+    bool sel[8] = { false, false, false, false, false, false, false, false };
+    int count = 0;
+    const char* q = val;
+    while (*q && count < kHomeCardMax) {
+        char* end = NULL;
+        long v = strtol(q, &end, 10);
+        if (end == q) break;
+        if (v >= 0 && v < 8 && !sel[v]) { sel[v] = true; count++; }
+        q = end;
+        while (*q == ',' || *q == ' ' || *q == '\t') q++;
+    }
+    if (count == 0 && HomeListHasNonSeparator(val)) return; // corrupt: keep current selection
+    for (int i = 0; i < 8; i++) g_homeSel[i] = sel[i];
+}
 
 // v8 clipboard item. Text is capped at 4096 chars stored (longer
 // items are truncated, flagged, and never silently cut to a
@@ -549,6 +638,10 @@ static void LoadSettings()
                     if (ParseBoolValue(val, b)) g_clipEnabled = b;
                 } else if (StrEqualsIgnoreCase(key, "shelf")) {
                     if (ParseBoolValue(val, b)) g_shelfEnabled = b;
+                } else if (StrEqualsIgnoreCase(key, "home_order")) {
+                    ParseHomeOrder(val);
+                } else if (StrEqualsIgnoreCase(key, "home_cards")) {
+                    ParseHomeCards(val);
                 } else if (StrEqualsIgnoreCase(key, "theme")) {
                     // v5-themes: unknown/corrupt values are ignored,
                     // so the current value (Onyx by default) stands.
@@ -579,7 +672,26 @@ static void SaveSettings()
     HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, NULL,
                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h == INVALID_HANDLE_VALUE) return;
-    char buf[640];
+    // v8-home-custom: order list is g_homeOrder verbatim; the
+    // selected list is g_homeSel filtered through g_homeOrder,
+    // so the saved file always lists selected ids in display
+    // order and never more than 6 of them.
+    char orderStr[64] = { 0 };
+    {
+        int pos = 0;
+        for (int i = 0; i < 8; i++) pos += sprintf_s(orderStr + pos, sizeof(orderStr) - pos, "%s%d", i ? "," : "", g_homeOrder[i]);
+    }
+    char cardsStr[64] = { 0 };
+    {
+        int pos = 0; bool first = true;
+        for (int i = 0; i < 8; i++) {
+            int id = g_homeOrder[i];
+            if (!g_homeSel[id]) continue;
+            pos += sprintf_s(cardsStr + pos, sizeof(cardsStr) - pos, "%s%d", first ? "" : ",", id);
+            first = false;
+        }
+    }
+    char buf[768];
     int len = sprintf_s(buf, sizeof(buf),
         "; OnyxNotch settings - rewritten on every change and on clean quit.\r\n"
         "; Unknown keys are ignored on load; values are 0 = off, 1 = on.\r\n"
@@ -592,6 +704,8 @@ static void SaveSettings()
         "blur=%d\r\n"
         "clipboard=%d\r\n"
         "shelf=%d\r\n"
+        "home_order=%s\r\n"
+        "home_cards=%s\r\n"
         "theme=%s\r\n",
         g_size,
         g_hideOnFullscreen ? 1 : 0,
@@ -602,6 +716,8 @@ static void SaveSettings()
         g_blurEnabled ? 1 : 0,
         g_clipEnabled ? 1 : 0,
         g_shelfEnabled ? 1 : 0,
+        orderStr,
+        cardsStr,
         ThemeKey(g_theme));
     if (len > 0) {
         DWORD written = 0;
@@ -921,10 +1037,23 @@ struct Layout {
     RECT dockRects[7] = { { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 } };
     RECT dockPill = { 0, 0, 0, 0 };
     // HOME grid cards. homeCardIds: 0 System, 1 Calendar, 2 Clock,
-    // 3 Media, 4 Battery, 5 Network, 6 Clipboard (v8, only if on).
+    // 3 Media, 4 Battery, 5 Network, 6 Clipboard, 7 Shelf.
+    // At most kHomeCardMax (6) are ever displayed; the arrays
+    // are sized 8 for headroom, not because 8 can show.
     int homeCardCount = 0;
-    int homeCardIds[7] = { 0, 0, 0, 0, 0, 0, 0 };
-    RECT homeCards[7] = { { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 } };
+    int homeCardIds[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+    RECT homeCards[8] = { { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 } };
+    // v8-home-custom edit list: shown instead of the card grid
+    // when g_homeEdit is on and HOME is the shown tab. Row i is
+    // candidate g_homeOrder[i]; check toggles selection, up/down
+    // swap neighbours in g_homeOrder, done exits edit mode.
+    int homeEditHeaderY = 0;
+    int homeEditListY = 0, homeEditRowH = 0;
+    RECT homeEditCheckRects[8] = { { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 } };
+    RECT homeEditUpRects[8] = { { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 } };
+    RECT homeEditDownRects[8] = { { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 } };
+    int homeEditDoneY = 0;
+    RECT homeEditDoneRect = { 0, 0, 0, 0 };
     // v8 clipboard/shelf cards (full-width body cards).
     RECT clipCard = { 0, 0, 0, 0 };
     RECT shelfCard = { 0, 0, 0, 0 };
@@ -1035,10 +1164,39 @@ static Layout ComputeLayoutForTab(Notch* n, int clientW, int tab)
     int bodyH = 0;
     int btnGap = Scale(8, dpi);
     if (effTab == kTabHome) {
-        int ids[7] = { 0, 1, 2, 3, 4, 5, 6 };
-        bool on[7] = { g_widgetStats, g_widgetCalendar, true, g_mediaEnabled, g_widgetStats, g_widgetStats, g_clipEnabled };
+        if (g_homeEdit) {
+            // Edit list instead of the card grid: header line,
+            // hint line, 8 candidate rows, Done row. This is the
+            // HOME natural height in edit mode, so the unified
+            // wrapper below still takes the max over tabs.
+            L.homeCardCount = 0;
+            L.homeEditHeaderY = L.bodyY;
+            L.homeEditListY = L.bodyY + Scale(48, dpi);
+            L.homeEditRowH = Scale(30, dpi);
+            int checkS = Scale(20, dpi);
+            int arrowW = Scale(24, dpi);
+            int rightEdge = clientW - margin - Scale(14, dpi);
+            for (int i = 0; i < 8; i++) {
+                int y0 = L.homeEditListY + i * L.homeEditRowH;
+                int cy = y0 + (L.homeEditRowH - checkS) / 2;
+                L.homeEditCheckRects[i] = { margin + Scale(14, dpi), cy, margin + Scale(14, dpi) + checkS, cy + checkS };
+                int downL = rightEdge - arrowW;
+                int upL = downL - Scale(6, dpi) - arrowW;
+                L.homeEditUpRects[i] = { upL, y0, upL + arrowW, y0 + L.homeEditRowH };
+                L.homeEditDownRects[i] = { downL, y0, downL + arrowW, y0 + L.homeEditRowH };
+            }
+            L.homeEditDoneY = L.homeEditListY + 8 * L.homeEditRowH + Scale(8, dpi);
+            L.homeEditDoneRect = { margin + Scale(14, dpi), L.homeEditDoneY, margin + Scale(110, dpi), L.homeEditDoneY + Scale(22, dpi) };
+            bodyH = L.homeEditDoneRect.bottom - L.bodyY;
+        } else {
         int count = 0;
-        for (int i = 0; i < 7; i++) if (on[i]) { L.homeCardIds[count] = ids[i]; count++; }
+        // Selection + order + feature gate + HARD 6 cap, all
+        // enforced here at layout: no path can display a 7th.
+        for (int oi = 0; oi < 8; oi++) {
+            int id = g_homeOrder[oi];
+            if (count >= kHomeCardMax) break;
+            if (g_homeSel[id] && HomeCardFeatureOn(id)) { L.homeCardIds[count] = id; count++; }
+        }
         L.homeCardCount = count;
         int cols = 3;
         int cardW = (bodyW - (cols - 1) * gap) / cols;
@@ -1064,6 +1222,7 @@ static Layout ComputeLayoutForTab(Notch* n, int clientW, int tab)
             L.homeBtnPrev = { x0, L.homeMediaButtonY, x0 + bw, L.homeMediaButtonY + L.homeMediaButtonH };
             L.homeBtnPlay = { x0 + bw + btnGap, L.homeMediaButtonY, x0 + 2 * bw + btnGap, L.homeMediaButtonY + L.homeMediaButtonH };
             L.homeBtnNext = { x0 + 2 * bw + 2 * btnGap, L.homeMediaButtonY, x0 + 3 * bw + 2 * btnGap, L.homeMediaButtonY + L.homeMediaButtonH };
+        }
         }
     } else if (effTab == kTabSystem) {
         int cardW = (bodyW - gap) / 2;
@@ -1213,6 +1372,15 @@ static Layout ComputeLayout(Notch* n, int clientW)
     if (delta <= 0) return L;
     int shift = delta / 2;
     for (int i = 0; i < L.homeCardCount; i++) ShiftRectY(L.homeCards[i], shift);
+    for (int i = 0; i < 8; i++) {
+        ShiftRectY(L.homeEditCheckRects[i], shift);
+        ShiftRectY(L.homeEditUpRects[i], shift);
+        ShiftRectY(L.homeEditDownRects[i], shift);
+    }
+    L.homeEditHeaderY += shift;
+    L.homeEditListY += shift;
+    L.homeEditDoneY += shift;
+    ShiftRectY(L.homeEditDoneRect, shift);
     if (L.homeMediaTitleY >= 0) L.homeMediaTitleY += shift;
     L.homeMediaButtonY += shift;
     ShiftRectY(L.homeBtnPrev, shift);
@@ -1493,6 +1661,7 @@ static void ShowTrayMenuAt(POINT pt, UINT alignFlags)
     AppendCheck(menu, ID_TRAY_WIDGET_CALENDAR, L"Widget: Calendar", g_widgetCalendar);
     AppendCheck(menu, ID_TRAY_CLIPBOARD, L"Clipboard history", g_clipEnabled);
     AppendCheck(menu, ID_TRAY_SHELF, L"File shelf", g_shelfEnabled);
+    AppendCheck(menu, ID_TRAY_HOME_EDIT, L"Customize Home page", g_homeEdit);
     AppendCheck(menu, ID_TRAY_ANIMATIONS, L"Animations", g_animations);
     AppendCheck(menu, ID_TRAY_BLUR, L"Blur background (experimental)", g_blurEnabled);
     AppendCheck(menu, ID_TRAY_AUTOSTART, L"Start with Windows", g_startWithWindows);
@@ -2474,6 +2643,29 @@ static bool ShelfHitAt(Notch* n, int px, int py, bool usePaint, int& itemOut, in
     return false;
 }
 
+// ---------- v8-home-custom edit hit test (shares ComputeLayout) ----------
+// part codes: 0 checkbox, 1 up arrow, 2 down arrow, 3 Done row.
+// Only in edit mode on HOME, only while expanded.
+static bool HomeEditHitAt(Notch* n, int px, int py, bool usePaint, int& rowOut, int& partOut)
+{
+    if (!g_homeEdit) return false;
+    if (usePaint ? !n->paintExpanded : !n->expanded) return false;
+    if (EffectiveTab(n) != kTabHome) return false;
+    RECT rc; GetClientRect(n->hwnd, &rc);
+    Layout L = ComputeLayout(n, rc.right);
+    if (px >= L.homeEditDoneRect.left && px < L.homeEditDoneRect.right &&
+        py >= L.homeEditDoneRect.top && py < L.homeEditDoneRect.bottom) { partOut = 3; rowOut = -1; return true; }
+    for (int i = 0; i < 8; i++) {
+        RECT cr = L.homeEditCheckRects[i];
+        if (px >= cr.left && px < cr.right && py >= cr.top && py < cr.bottom) { partOut = 0; rowOut = i; return true; }
+        RECT up = L.homeEditUpRects[i];
+        if (px >= up.left && px < up.right && py >= up.top && py < up.bottom) { partOut = 1; rowOut = i; return true; }
+        RECT dn = L.homeEditDownRects[i];
+        if (px >= dn.left && px < dn.right && py >= dn.top && py < dn.bottom) { partOut = 2; rowOut = i; return true; }
+    }
+    return false;
+}
+
 // ---------- v8 OLE drag-out (text + files only; images: click-to-copy) ----------
 // Minimal IDataObject/IDropSource. Drag-out is DoDragDrop with
 // DROPEFFECT_COPY only (the shelf/clipboard never moves the
@@ -3205,6 +3397,38 @@ static void PaintNotchD2D(Notch* n, Canvas* cv)
 
     SYSTEMTIME now; GetLocalTime(&now);
     if (effTab == kTabHome) {
+        if (g_homeEdit) {
+            // Edit list instead of the card grid. Check marks are
+            // drawn as two lines, not a glyph, so they cannot
+            // turn into tofu in Segoe UI; arrows reuse the
+            // up/down glyphs already used for network rates.
+            static const wchar_t* kHomeCardNames[8] = { L"System", L"Calendar", L"Clock", L"Media", L"Battery", L"Network", L"Clipboard", L"Shelf" };
+            wchar_t hdr[96];
+            swprintf(hdr, 96, L"Home cards \x2014 %d of 6 selected", HomeSelectedCount());
+            D2DText(cv, kFontSmall, hdr, (float)margin, (float)L.homeEditHeaderY, (float)(rc.right - 2 * margin), (float)Scale(22, dpi), th.primary, false);
+            D2DText(cv, kFontTiny, L"Check a card to add it. A 7th card cannot be added until one is unchecked. Arrows reorder.", (float)margin, (float)(L.homeEditHeaderY + Scale(22, dpi)), (float)(rc.right - 2 * margin), (float)Scale(20, dpi), th.muted, false);
+            for (int i = 0; i < 8; i++) {
+                int id = g_homeOrder[i];
+                RECT cr = L.homeEditCheckRects[i];
+                cv->StrokeRounded(cr, th.muted, 1.0f, 3.0f);
+                if (g_homeSel[id]) {
+                    float lw = (float)Scale(2, dpi);
+                    float x0 = (float)cr.left + Scale(4, dpi), x1 = (float)cr.left + Scale(9, dpi), x2 = (float)cr.right - Scale(4, dpi);
+                    float ym = (float)(cr.top + cr.bottom) / 2.0f;
+                    cv->Line(x0, ym, x1, (float)cr.bottom - Scale(5, dpi), th.accent, lw);
+                    cv->Line(x1, (float)cr.bottom - Scale(5, dpi), x2, (float)cr.top + Scale(5, dpi), th.accent, lw);
+                }
+                wchar_t nm[64];
+                swprintf(nm, 64, L"%s%s", kHomeCardNames[id], HomeCardFeatureOn(id) ? L"" : L" (feature off)");
+                D2DText(cv, kFontTiny, nm, (float)(cr.right + Scale(8, dpi)), (float)(L.homeEditListY + i * L.homeEditRowH), (float)(L.homeEditUpRects[i].left - cr.right - Scale(16, dpi)), (float)L.homeEditRowH, HomeCardFeatureOn(id) ? th.primary : th.muted, false);
+                RECT up = L.homeEditUpRects[i];
+                D2DText(cv, kFontTiny, L"\x2191", (float)up.left, (float)up.top, (float)(up.right - up.left), (float)(up.bottom - up.top), i == 0 ? th.muted : th.secondary, true);
+                RECT dn = L.homeEditDownRects[i];
+                D2DText(cv, kFontTiny, L"\x2193", (float)dn.left, (float)dn.top, (float)(dn.right - dn.left), (float)(dn.bottom - dn.top), i == 7 ? th.muted : th.secondary, true);
+            }
+            cv->StrokeRounded(L.homeEditDoneRect, th.muted, 1.0f, 4.0f);
+            D2DText(cv, kFontTiny, L"Done", (float)L.homeEditDoneRect.left, (float)L.homeEditDoneRect.top, (float)(L.homeEditDoneRect.right - L.homeEditDoneRect.left), (float)(L.homeEditDoneRect.bottom - L.homeEditDoneRect.top), th.secondary, true);
+        }
         for (int i = 0; i < L.homeCardCount; i++) {
             RECT c = L.homeCards[i];
             int id = L.homeCardIds[i];
@@ -3282,6 +3506,23 @@ static void PaintNotchD2D(Notch* n, Canvas* cv)
                     D2DText(cv, kFontTiny, L"No copied items yet", (float)(c.left + 14), (float)(c.top + Scale(36, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.secondary, false);
                 }
                 D2DText(cv, kFontTiny, L"Click Clipboard tab for history", (float)(c.left + 14), (float)(c.top + Scale(92, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.muted, false);
+            } else if (id == 7) {
+                // v8-home-custom SHELF card: latest parked file
+                // is the LAST element (ShelfAddPath appends).
+                DrawCardD2D(cv, c, L"SHELF");
+                if (!g_shelfItems.empty()) {
+                    ShelfItem& it = g_shelfItems.back();
+                    wchar_t line[160];
+                    wcsncpy_s(line, 160, FileNameOf(it.path).c_str(), _TRUNCATE);
+                    if (it.missing) wcscat_s(line, 160, L"  (Missing)");
+                    D2DTextEllipsis(cv, kFontTiny, line, (float)(c.left + 14), (float)(c.top + Scale(36, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), it.missing ? th.muted : th.primary);
+                    wchar_t cnt[64];
+                    swprintf(cnt, 64, L"%d file%s parked", (int)g_shelfItems.size(), g_shelfItems.size() == 1 ? L"" : L"s");
+                    D2DText(cv, kFontTiny, cnt, (float)(c.left + 14), (float)(c.top + Scale(62, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.secondary, false);
+                } else {
+                    D2DText(cv, kFontTiny, L"No parked files yet", (float)(c.left + 14), (float)(c.top + Scale(36, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.secondary, false);
+                }
+                D2DText(cv, kFontTiny, L"Click Shelf tab for files", (float)(c.left + 14), (float)(c.top + Scale(92, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.muted, false);
             } else if (id == 5) {
                 DrawCardD2D(cv, c, L"NETWORK");
                 if (g_netOk) {
@@ -3840,6 +4081,50 @@ static LRESULT CALLBACK NotchWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             }
             return 0;
         }
+        // v8-home-custom: edit-mode clicks on HOME. After dock
+        // (so dock switching still works while editing) and
+        // before tab content and the pin fallback. A click that
+        // hits no edit control is swallowed, so editing never
+        // accidentally pins or unpins the notch.
+        if (g_homeEdit && EffectiveTab(n) == kTabHome) {
+            int erow = -1, epart = -1;
+            if (HomeEditHitAt(n, pt.x, pt.y, false, erow, epart)) {
+                if (epart == 3) {
+                    g_homeEdit = false;
+                    ApplySizeToAll();
+                } else if (epart == 0 && erow >= 0 && erow < 8) {
+                    int id = g_homeOrder[erow];
+                    if (g_homeSel[id]) {
+                        g_homeSel[id] = false;
+                        SaveSettings();
+                        ApplySizeToAll();
+                    } else if (HomeSelectedCount() < kHomeCardMax) {
+                        g_homeSel[id] = true;
+                        SaveSettings();
+                        ApplySizeToAll();
+                    }
+                    // Else: already at the 6 cap - the click does
+                    // NOTHING. No silent eviction, no replacement;
+                    // the header counter explains the cap.
+                } else if (epart == 1 && erow > 0) {
+                    int tmp = g_homeOrder[erow];
+                    g_homeOrder[erow] = g_homeOrder[erow - 1];
+                    g_homeOrder[erow - 1] = tmp;
+                    SaveSettings();
+                    ApplySizeToAll();
+                } else if (epart == 2 && erow >= 0 && erow < 7) {
+                    int tmp = g_homeOrder[erow];
+                    g_homeOrder[erow] = g_homeOrder[erow + 1];
+                    g_homeOrder[erow + 1] = tmp;
+                    SaveSettings();
+                    ApplySizeToAll();
+                }
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 0;
+            }
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
+        }
         // v8 tab content: clipboard chips/pins/rows and shelf
         // open/remove/rows. Hit order stays gear > X > dock >
         // tab content > pin: this block is after dock and
@@ -4329,6 +4614,14 @@ static LRESULT CALLBACK ManagerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             SaveSettings();
             ApplySizeToAll();
             break;
+        case ID_TRAY_HOME_EDIT:
+            // v8-home-custom: edit mode itself is NOT saved to
+            // settings.ini, so it always resets to off at
+            // startup. Only the selection/order changes made
+            // while editing are saved, by the click handler.
+            g_homeEdit = !g_homeEdit;
+            ApplySizeToAll();
+            break;
         case ID_TRAY_AUTOSTART: {
             // v5-settings: registry only, never the settings file.
             // On registry failure the toggle is left unchanged,
@@ -4380,7 +4673,7 @@ static LRESULT CALLBACK ManagerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
         case ID_TRAY_MEDIA_NEXT: SendMediaKey(VK_MEDIA_NEXT_TRACK); break;
         case ID_TRAY_ABOUT:
             MessageBoxW(hwnd,
-                L"OnyxNotch v8 (clipboard history + file shelf)\nMac-style notch for Windows.\nNative Win32 C++, no runtime, low memory.\nDirect2D/DirectWrite rendering on a layered\nwindow with per-pixel alpha; spring animation;\nblur is an OFF-by-default experimental tray\ntoggle with an opaque fallback.\n\nv4: premium UI — gradient surface, lighter\ntypography, circular media buttons, battery glyph,\ncalendar pill — reorganized in place: compact\ntwo-column body (media beside system stats),\nsection headers, stats rows with bars.\n\nv5-SMTC: with Media controls on, the Media tab\nshows the current track title and artist from\nWindows SMTC (read-only), and Home shows a\ncompact title line. No track, no title — the\nmedia buttons still work via media keys.\n\nv5-settings: size and toggles are saved to\n%APPDATA%\\OnyxNotch\\settings.ini and restored\nat startup. Start with Windows (tray menu) writes\nthe Run registry value for this .exe.\n\nThemes: tray menu Themes submenu — Onyx, Midnight,\nGraphite — applies instantly to all notches and is\nsaved to settings.ini as theme=onyx|midnight|graphite.\n\nClick the notch header to pin it open;\nclick again to unpin. The gear button in the\nexpanded header opens this menu from the notch.\n\nv6: wide card dashboard with a header bar,\ncard grid and a bottom icon dock. Home is a\ncompact summary; System, Clock, Calendar\nand Media show full card versions. Click a\ndock icon to switch. Close X collapses only.\n\nv8: clipboard history + file shelf, both OFF by\ndefault in the tray menu. Clipboard history is\nin-memory only (clears on quit, never written to\ndisk), capped at 50, with a password-manager\nheuristic skip that is NOT a guarantee. Click an\nitem to copy it back; drag text/files out to\nanother app (images: copy only). File shelf parks\nreferenced paths only; paths are saved in\n%APPDATA%\\OnyxNotch\\shelf.ini. No search box:\nthe notch must not steal keyboard focus, so\nfilters are mouse-click chips only.",
+                L"OnyxNotch v8 (clipboard history + file shelf)\nMac-style notch for Windows.\nNative Win32 C++, no runtime, low memory.\nDirect2D/DirectWrite rendering on a layered\nwindow with per-pixel alpha; spring animation;\nblur is an OFF-by-default experimental tray\ntoggle with an opaque fallback.\n\nv4: premium UI — gradient surface, lighter\ntypography, circular media buttons, battery glyph,\ncalendar pill — reorganized in place: compact\ntwo-column body (media beside system stats),\nsection headers, stats rows with bars.\n\nv5-SMTC: with Media controls on, the Media tab\nshows the current track title and artist from\nWindows SMTC (read-only), and Home shows a\ncompact title line. No track, no title — the\nmedia buttons still work via media keys.\n\nv5-settings: size and toggles are saved to\n%APPDATA%\\OnyxNotch\\settings.ini and restored\nat startup. Start with Windows (tray menu) writes\nthe Run registry value for this .exe.\n\nThemes: tray menu Themes submenu — Onyx, Midnight,\nGraphite — applies instantly to all notches and is\nsaved to settings.ini as theme=onyx|midnight|graphite.\n\nClick the notch header to pin it open;\nclick again to unpin. The gear button in the\nexpanded header opens this menu from the notch.\n\nv6: wide card dashboard with a header bar,\ncard grid and a bottom icon dock. Home is a\ncompact summary; System, Clock, Calendar\nand Media show full card versions. Click a\ndock icon to switch. Close X collapses only.\n\nv8: clipboard history + file shelf, both OFF by\ndefault in the tray menu. Clipboard history is\nin-memory only (clears on quit, never written to\ndisk), capped at 50, with a password-manager\nheuristic skip that is NOT a guarantee. Click an\nitem to copy it back; drag text/files out to\nanother app (images: copy only). File shelf parks\nreferenced paths only; paths are saved in\n%APPDATA%\\OnyxNotch\\shelf.ini. No search box:\nthe notch must not steal keyboard focus, so\nfilters are mouse-click chips only.\n\nHome page: tray or gear menu, Customize Home page,\nopens an edit list on HOME (mouse clicks only):\ncheck up to 6 of the 8 cards (System, Calendar,\nClock, Media, Battery, Network, Clipboard, Shelf),\narrows reorder them, Done exits. Edit mode itself\nis not saved; the selection and order are saved in\nsettings.ini as home_cards= and home_order=.",
                 L"OnyxNotch", MB_OK | MB_ICONINFORMATION);
             break;
         }
