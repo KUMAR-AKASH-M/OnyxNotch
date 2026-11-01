@@ -1,4 +1,20 @@
-// OnyxNotch v3 - Mac-style notch for Windows, native Win32 C++.
+// OnyxNotch v4 - Mac-style notch for Windows, native Win32 C++.
+// v4 changes over v3 (UI ONLY: no new features, no behaviour changes):
+//  1. Premium surface: vertical near-black gradient, subtle light
+//     border, and a soft inner top highlight, instead of flat black.
+//  2. Premium typography: Segoe UI, lighter big-clock weight, more
+//     generous spacing, near-white primary text, muted secondary text.
+//  3. Circular media buttons (diameter = media-row height) with the
+//     hit test updated to match the drawn circles exactly.
+//  4. Thin divider between the clock/date/battery block and the
+//     media/widgets sections; a drawn battery glyph next to the
+//     battery text; today in the calendar as a white pill.
+//  5. No acrylic/blur: deliberately skipped, not faked (see README).
+//     The window is region-shaped and non-layered, and acrylic
+//     interplay with that shape cannot be verified without a
+//     Windows test, so the gradient version is the shipped look.
+//  6. No new timers, threads, polling, or dependencies; animation
+//     timing and the 1-second clock timer are exactly as in v3.
 // v3 changes over v2 (v2 behaviour is otherwise intact):
 //  1. Smooth expand/collapse animation (~220 ms, ease-out cubic),
 //     driven by a short-lived per-notch timer that stops when the
@@ -193,7 +209,10 @@ static Layout ComputeLayout(Notch* n, int clientW)
 {
     Layout L;
     int dpi = n->dpi;
-    int y = Scale(118, dpi); // after big clock, date, battery (v1 positions)
+    // v4 rhythm: big clock, date, battery, then a divider, then the
+    // media/widgets sections. The extra breathing room over v3 is
+    // deliberate premium spacing, not a layout change in content.
+    int y = Scale(126, dpi); // after big clock, date, battery, divider
     if (g_mediaEnabled) {
         L.mediaLabelY = y; y += Scale(20, dpi);
         L.mediaButtonY = y; L.mediaButtonH = Scale(28, dpi); y += L.mediaButtonH + Scale(8, dpi);
@@ -366,10 +385,14 @@ static void RecreateFonts(Notch* n)
     if (n->hFontSmall) DeleteObject(n->hFontSmall);
     if (n->hFontTiny) DeleteObject(n->hFontTiny);
     int dpi = n->dpi;
-    n->hFontClock = CreateFontW(Scale(20, dpi), 0, 0, 0, FW_MEDIUM, FALSE, FALSE, FALSE,
+    // v4 typography: Segoe UI throughout, lighter weights for a
+    // premium feel. The big clock drops from semibold to light;
+    // the collapsed clock drops from medium to normal. Sizes are
+    // unchanged, so layout positions do not move for weight alone.
+    n->hFontClock = CreateFontW(Scale(20, dpi), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
         DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-    n->hFontBig = CreateFontW(Scale(36, dpi), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+    n->hFontBig = CreateFontW(Scale(36, dpi), 0, 0, 0, FW_LIGHT, FALSE, FALSE, FALSE,
         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
         DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
     n->hFontSmall = CreateFontW(Scale(17, dpi), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
@@ -683,6 +706,21 @@ static void RequestRebuild(HINSTANCE hInst)
 // toggles pin instead of firing a media key). Rects are identical
 // in both cases: the layout is shared, so hover, pressed and click
 // can never disagree about where a button is.
+// v4: media buttons are drawn as circles, so the hit test is a
+// circle test, not a rectangle test. One shared helper computes the
+// drawn circle for a button from the shared Layout rects: the
+// circle is centred on the old button rect, with diameter equal to
+// the media-row height. PaintNotch and MediaButtonIndexAt both use
+// it, so a visible circle is exactly what is clickable, and the
+// invisible corners of the old rectangles are no longer clickable.
+static void MediaButtonCircle(const Layout& L, int idx, int& cx, int& cy, int& r)
+{
+    RECT btn = (idx == 0) ? L.btnPrev : (idx == 1) ? L.btnPlay : L.btnNext;
+    cx = (btn.left + btn.right) / 2;
+    cy = L.mediaButtonY + L.mediaButtonH / 2;
+    r = L.mediaButtonH / 2;
+}
+
 static int MediaButtonIndexAt(Notch* n, int px, int py, bool usePaint)
 {
     if (!g_mediaEnabled) return -1;
@@ -690,9 +728,12 @@ static int MediaButtonIndexAt(Notch* n, int px, int py, bool usePaint)
     RECT rc; GetClientRect(n->hwnd, &rc);
     Layout L = ComputeLayout(n, rc.right);
     if (py < L.mediaButtonY || py >= L.mediaButtonY + L.mediaButtonH) return -1;
-    if (px >= L.btnPrev.left && px < L.btnPrev.right) return 0;
-    if (px >= L.btnPlay.left && px < L.btnPlay.right) return 1;
-    if (px >= L.btnNext.left && px < L.btnNext.right) return 2;
+    for (int i = 0; i < 3; i++) {
+        int cx, cy, r;
+        MediaButtonCircle(L, i, cx, cy, r);
+        int dx = px - cx, dy = py - cy;
+        if (dx * dx + dy * dy <= r * r) return i;
+    }
     return -1;
 }
 
@@ -705,12 +746,115 @@ static bool MediaButtonHit(Notch* n, int px, int py, WORD& vkOut)
     return true;
 }
 
+// v4 premium surface helpers. No new allocations, no new timers:
+// the gradient is drawn row by row with plain GDI (the window
+// region already clips it to the pill shape), and the border and
+// top highlight are single strokes drawn over the content.
+static void PaintPremiumSurface(HDC hdc, const RECT& rc)
+{
+    // Vertical near-black gradient: slightly lighter at the top,
+    // darker at the bottom. Pure GDI, no GradientFill/msimg32 lib.
+    int h = rc.bottom - rc.top;
+    if (h < 1) h = 1;
+    for (int y = 0; y < rc.bottom; y++) {
+        int t = y * 100 / h; // 0 at top, 100 at bottom
+        int r = 32 + (10 - 32) * t / 100;
+        int g = 32 + (10 - 32) * t / 100;
+        int b = 36 + (12 - 36) * t / 100;
+        HBRUSH rowBrush = CreateSolidBrush(RGB(r, g, b));
+        RECT row = { rc.left, y, rc.right, y + 1 };
+        FillRect(hdc, &row, rowBrush);
+        DeleteObject(rowBrush);
+    }
+}
+
+static void PaintPremiumBorder(HDC hdc, const RECT& rc, int dpi, bool hover)
+{
+    // Subtle 1 px light border, a touch brighter on hover (the v3
+    // hover outline, restyled as the permanent premium border).
+    COLORREF border = hover ? RGB(104, 104, 110) : RGB(58, 58, 62);
+    HPEN pen = CreatePen(PS_SOLID, 1, border);
+    HPEN oldPen = (HPEN)SelectObject(hdc, pen);
+    HBRUSH nullBrush = (HBRUSH)GetStockObject(NULL_BRUSH);
+    HBRUSH oldBrush = (HBRUSH)SelectObject(hdc, nullBrush);
+    RoundRect(hdc, 0, 0, rc.right, rc.bottom, 28, 28);
+    SelectObject(hdc, oldPen);
+    SelectObject(hdc, oldBrush);
+    DeleteObject(pen);
+    // Soft inner top highlight: a 1 px light line, inset so it
+    // never touches the rounded corners.
+    int inset = Scale(20, dpi);
+    HBRUSH hl = CreateSolidBrush(RGB(78, 78, 84));
+    RECT line = { inset, Scale(1, dpi), rc.right - inset, Scale(2, dpi) };
+    if (line.right > line.left) FillRect(hdc, &line, hl);
+    DeleteObject(hl);
+}
+
+// Battery state for the v4 glyph. Returns false when there is no
+// battery (desktop / unknown), in which case only the outline is
+// drawn and the text stays "Battery: --" as before.
+static bool BatteryInfo(int& pct, bool& charging)
+{
+    SYSTEM_POWER_STATUS sps;
+    if (!GetSystemPowerStatus(&sps) || sps.BatteryLifePercent == 255) return false;
+    pct = (int)sps.BatteryLifePercent;
+    charging = (sps.ACLineStatus == 1 && (sps.BatteryFlag & 8) != 0);
+    return true;
+}
+
+static void DrawBatteryGlyph(HDC hdc, int x, int y, int w, int h, int pct, bool charging, bool known)
+{
+    HPEN pen = CreatePen(PS_SOLID, 1, RGB(220, 220, 224));
+    HPEN oldPen = (HPEN)SelectObject(hdc, pen);
+    HBRUSH nullBrush = (HBRUSH)GetStockObject(NULL_BRUSH);
+    HBRUSH oldBrush = (HBRUSH)SelectObject(hdc, nullBrush);
+    RoundRect(hdc, x, y, x + w, y + h, 4, 4);
+    SelectObject(hdc, oldPen);
+    SelectObject(hdc, oldBrush);
+    DeleteObject(pen);
+    // Tip nub on the right.
+    int tipW = (w / 8 < 2) ? 2 : w / 8;
+    int tipH = h / 2;
+    HBRUSH tipBrush = CreateSolidBrush(RGB(220, 220, 224));
+    RECT tip = { x + w, y + (h - tipH) / 2, x + w + tipW, y + (h + tipH) / 2 };
+    FillRect(hdc, &tip, tipBrush);
+    DeleteObject(tipBrush);
+    if (!known) return;
+    // Fill by percentage, inset inside the outline.
+    int innerX = x + 2, innerY = y + 2;
+    int innerW = w - 4, innerH = h - 4;
+    if (innerW > 0 && innerH > 0) {
+        int fillW = innerW * pct / 100;
+        if (fillW > 0) {
+            HBRUSH fillBrush = CreateSolidBrush(RGB(248, 248, 250));
+            RECT fill = { innerX, innerY, innerX + fillW, innerY + innerH };
+            FillRect(hdc, &fill, fillBrush);
+            DeleteObject(fillBrush);
+        }
+    }
+    if (charging) {
+        // Lightning bolt in dark grey over the fill, centred.
+        int cx = x + w / 2, cy = y + h / 2, bh = h * 3 / 4, bw = bh / 2;
+        POINT bolt[6] = {
+            { cx + bw / 2, cy - bh / 2 }, { cx - bw / 2, cy + 1 },
+            { cx, cy + 1 }, { cx - bw / 2, cy + bh / 2 },
+            { cx + bw / 2, cy - 1 }, { cx, cy - 1 }
+        };
+        HBRUSH boltBrush = CreateSolidBrush(RGB(24, 24, 26));
+        HBRUSH oldB = (HBRUSH)SelectObject(hdc, boltBrush);
+        HPEN nullP = (HPEN)GetStockObject(NULL_PEN);
+        HPEN oldP = (HPEN)SelectObject(hdc, nullP);
+        Polygon(hdc, bolt, 6);
+        SelectObject(hdc, oldP);
+        SelectObject(hdc, oldB);
+        DeleteObject(boltBrush);
+    }
+}
+
 static void PaintNotch(Notch* n, HDC hdc)
 {
     RECT rc; GetClientRect(n->hwnd, &rc);
-    HBRUSH brush = CreateSolidBrush(RGB(0, 0, 0));
-    FillRect(hdc, &rc, brush);
-    DeleteObject(brush);
+    PaintPremiumSurface(hdc, rc);
 
     wchar_t clockText[32]; FormatClock(clockText, 32);
     int dpi = n->dpi;
@@ -718,45 +862,74 @@ static void PaintNotch(Notch* n, HDC hdc)
     // animation keeps drawing expanded content until it finishes
     // instead of popping to the collapsed clock on the first frame.
     if (!n->paintExpanded) {
-        DrawCenteredText(hdc, n->hFontClock, clockText, 0, 0, rc.right, rc.bottom, RGB(255, 255, 255));
+        DrawCenteredText(hdc, n->hFontClock, clockText, 0, 0, rc.right, rc.bottom, RGB(248, 248, 250));
+        PaintPremiumBorder(hdc, rc, dpi, n->hoverNotch);
         return;
     }
 
     Layout L = ComputeLayout(n, rc.right);
-    DrawCenteredText(hdc, n->hFontBig, clockText, 0, Scale(12, dpi), rc.right, Scale(48, dpi), RGB(255, 255, 255));
+    DrawCenteredText(hdc, n->hFontBig, clockText, 0, Scale(12, dpi), rc.right, Scale(48, dpi), RGB(248, 248, 250));
     wchar_t dateText[64]; FormatDate(dateText, 64);
-    DrawCenteredText(hdc, n->hFontSmall, dateText, 0, Scale(66, dpi), rc.right, Scale(24, dpi), RGB(200, 200, 200));
+    DrawCenteredText(hdc, n->hFontSmall, dateText, 0, Scale(64, dpi), rc.right, Scale(22, dpi), RGB(165, 165, 170));
+    // v4 battery row: drawn glyph + text, centred as a pair, so the
+    // row reads as one unit instead of text alone.
     wchar_t batteryText[64]; FormatBattery(batteryText, 64);
-    DrawCenteredText(hdc, n->hFontSmall, batteryText, 0, Scale(92, dpi), rc.right, Scale(24, dpi), RGB(200, 200, 200));
+    {
+        HFONT oldF = (HFONT)SelectObject(hdc, n->hFontSmall);
+        SIZE sz = { 0, 0 };
+        GetTextExtentPoint32W(hdc, batteryText, lstrlenW(batteryText), &sz);
+        SelectObject(hdc, oldF);
+        int glyphW = Scale(24, dpi), glyphH = Scale(13, dpi), gap = Scale(8, dpi);
+        int totalW = glyphW + gap + sz.cx;
+        int startX = (rc.right - totalW) / 2;
+        if (startX < 0) startX = 0;
+        int glyphY = Scale(88, dpi) + (Scale(22, dpi) - glyphH) / 2;
+        int pct = 0; bool charging = false; bool known = BatteryInfo(pct, charging);
+        DrawBatteryGlyph(hdc, startX, glyphY, glyphW, glyphH, pct, charging, known);
+        DrawCenteredText(hdc, n->hFontSmall, batteryText,
+                         startX + glyphW + gap, Scale(88, dpi), sz.cx, Scale(22, dpi),
+                         RGB(165, 165, 170));
+    }
+    // v4 divider: a thin line between the clock/date/battery block
+    // and whatever sections follow (media and/or widgets).
+    if (g_mediaEnabled || g_widgetStats || g_widgetCalendar) {
+        int margin = Scale(20, dpi);
+        HBRUSH divBrush = CreateSolidBrush(RGB(52, 52, 56));
+        RECT div = { margin, Scale(118, dpi), rc.right - margin, Scale(119, dpi) };
+        if (div.right > div.left) FillRect(hdc, &div, divBrush);
+        DeleteObject(divBrush);
+    }
 
     if (g_mediaEnabled) {
         DrawCenteredText(hdc, n->hFontSmall, L"Media controls (media keys)",
-                         0, L.mediaLabelY, rc.right, Scale(20, dpi), RGB(170, 170, 170));
-        // Buttons: rounded dark-grey boxes with white vector glyphs
-        // (no text labels, no font dependence, no image files).
-        // v3 hover/pressed polish: hover lightens a button, pressed
-        // lightens it further. Colours are the only change; the
-        // rects (and therefore the hit test) are untouched.
+                         0, L.mediaLabelY, rc.right, Scale(20, dpi), RGB(150, 150, 155));
+        // v4 buttons: circles, not rectangles. Diameter = media-row
+        // height, centred on the old button rects, so the row stays
+        // centred and balanced. The hit test (MediaButtonIndexAt)
+        // uses these same circles, so drawing and clicking agree.
+        // Hover/pressed states are the v3 idea, restrained: a
+        // lighter circle on hover, lighter still on press.
         HBRUSH glyphBrush = CreateSolidBrush(RGB(255, 255, 255));
         HPEN nullPen = (HPEN)GetStockObject(NULL_PEN);
         HPEN oldPen = (HPEN)SelectObject(hdc, nullPen);
         HBRUSH oldBrush = (HBRUSH)GetCurrentObject(hdc, OBJ_BRUSH);
-        RECT btns[3] = { L.btnPrev, L.btnPlay, L.btnNext };
         for (int i = 0; i < 3; i++) {
-            COLORREF bg = RGB(38, 38, 38);
-            if (i == n->pressedBtn) bg = RGB(90, 90, 90);
-            else if (i == n->hoverBtn) bg = RGB(62, 62, 62);
+            int cx, cy, r;
+            MediaButtonCircle(L, i, cx, cy, r);
+            COLORREF bg = RGB(44, 44, 48);
+            if (i == n->pressedBtn) bg = RGB(94, 94, 98);
+            else if (i == n->hoverBtn) bg = RGB(66, 66, 70);
             HBRUSH btnBrush = CreateSolidBrush(bg);
             HBRUSH prevBrush = (HBRUSH)SelectObject(hdc, btnBrush);
-            RoundRect(hdc, btns[i].left, btns[i].top, btns[i].right, btns[i].bottom, 8, 8);
+            Ellipse(hdc, cx - r, cy - r, cx + r, cy + r);
             SelectObject(hdc, prevBrush);
             DeleteObject(btnBrush);
         }
         SelectObject(hdc, glyphBrush);
         for (int i = 0; i < 3; i++) {
-            int cx = (btns[i].left + btns[i].right) / 2;
-            int cy = (btns[i].top + btns[i].bottom) / 2;
-            int h = (btns[i].bottom - btns[i].top) * 11 / 20; // glyph height
+            int cx, cy, r;
+            MediaButtonCircle(L, i, cx, cy, r);
+            int h = (2 * r) * 11 / 20; // glyph height, as in v3
             int half = h / 2;
             if (i == 0 || i == 2) {
                 // Prev: bar + two triangles pointing left.
@@ -808,7 +981,7 @@ static void PaintNotch(Notch* n, HDC hdc)
         wchar_t statsText[128];
         swprintf(statsText, 128, L"CPU: %d%%   RAM: %d%%  (%.1f / %.1f GB)",
                  g_cpuPercent, g_memPercent, g_memUsedGB, g_memTotalGB);
-        DrawCenteredText(hdc, n->hFontSmall, statsText, 0, L.statsY, rc.right, Scale(24, dpi), RGB(200, 200, 200));
+        DrawCenteredText(hdc, n->hFontSmall, statsText, 0, L.statsY, rc.right, Scale(24, dpi), RGB(165, 165, 170));
     }
 
     if (g_widgetCalendar) {
@@ -817,7 +990,7 @@ static void PaintNotch(Notch* n, HDC hdc)
             L"July", L"August", L"September", L"October", L"November", L"December" };
         wchar_t monthText[64];
         swprintf(monthText, 64, L"%s %d", kMonths[(st.wMonth - 1) % 12], st.wYear);
-        DrawCenteredText(hdc, n->hFontSmall, monthText, 0, L.calendarY, rc.right, Scale(24, dpi), RGB(255, 255, 255));
+        DrawCenteredText(hdc, n->hFontSmall, monthText, 0, L.calendarY, rc.right, Scale(24, dpi), RGB(248, 248, 250));
         int margin = Scale(16, dpi);
         int cellW = (rc.right - 2 * margin) / 7;
         int cellH = Scale(20, dpi);
@@ -834,32 +1007,33 @@ static void PaintNotch(Notch* n, HDC hdc)
             int col = idx % 7, row = idx / 7;
             int x = margin + col * cellW;
             int y = weekY + cellH + row * cellH;
-            if (d == st.wDay) {
-                HBRUSH hl = CreateSolidBrush(RGB(48, 48, 48));
-                RECT hlRc = { x, y, x + cellW, y + cellH };
-                FillRect(hdc, &hlRc, hl);
-                DeleteObject(hl);
+            // v4 today highlight: a white pill with dark text, not
+            // a plain grey box — it reads as selected at a glance.
+            bool isToday = (d == st.wDay);
+            if (isToday) {
+                HPEN nullP = (HPEN)GetStockObject(NULL_PEN);
+                HPEN oldP = (HPEN)SelectObject(hdc, nullP);
+                HBRUSH pill = CreateSolidBrush(RGB(248, 248, 250));
+                HBRUSH oldB = (HBRUSH)SelectObject(hdc, pill);
+                RoundRect(hdc, x + Scale(2, dpi), y + Scale(1, dpi),
+                          x + cellW - Scale(2, dpi), y + cellH - Scale(1, dpi),
+                          cellH, cellH);
+                SelectObject(hdc, oldP);
+                SelectObject(hdc, oldB);
+                DeleteObject(pill);
             }
             wchar_t dayText[8]; swprintf(dayText, 8, L"%d", d);
             DrawCenteredText(hdc, n->hFontTiny, dayText, x, y, cellW, cellH,
-                             (d == st.wDay) ? RGB(255, 255, 255) : RGB(200, 200, 200));
+                             isToday ? RGB(18, 18, 20) : RGB(165, 165, 170));
         }
     }
 
-    DrawCenteredText(hdc, n->hFontSmall, L"OnyxNotch v3  |  Click to pin",
+    DrawCenteredText(hdc, n->hFontSmall, L"OnyxNotch v4  |  Click to pin",
                      0, L.footerY, rc.right, Scale(20, dpi), RGB(140, 140, 140));
-    // v3 hover polish for the whole notch (which is itself clickable
-    // to pin): a subtle 1 px outline while the mouse is over it.
-    if (n->hoverNotch) {
-        HPEN outlinePen = CreatePen(PS_SOLID, 1, RGB(70, 70, 70));
-        HPEN oldPen2 = (HPEN)SelectObject(hdc, outlinePen);
-        HBRUSH nullBrush = (HBRUSH)GetStockObject(NULL_BRUSH);
-        HBRUSH oldBrush2 = (HBRUSH)SelectObject(hdc, nullBrush);
-        RoundRect(hdc, 0, 0, rc.right, rc.bottom, 28, 28);
-        SelectObject(hdc, oldPen2);
-        SelectObject(hdc, oldBrush2);
-        DeleteObject(outlinePen);
-    }
+    // v4 border (drawn last, over the content): subtle always, a
+    // touch brighter on hover. This replaces the v3 hover-only
+    // outline; the hover state is now part of the border itself.
+    PaintPremiumBorder(hdc, rc, dpi, n->hoverNotch);
 }
 
 static LRESULT CALLBACK NotchWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -1061,7 +1235,7 @@ static LRESULT CALLBACK ManagerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
         case ID_TRAY_MEDIA_NEXT: SendMediaKey(VK_MEDIA_NEXT_TRACK); break;
         case ID_TRAY_ABOUT:
             MessageBoxW(hwnd,
-                L"OnyxNotch v3\nMac-style notch for Windows.\nNative Win32 C++, no runtime, low memory.\n\nv3: smooth expand/collapse animation (tray tick,\non by default), media-button hover/pressed states,\nanti-aliased text. v2 features unchanged.",
+                L"OnyxNotch v4\nMac-style notch for Windows.\nNative Win32 C++, no runtime, low memory.\n\nv4: premium UI only — gradient surface, lighter\ntypography, circular media buttons, battery glyph,\ncalendar pill. No behaviour changes from v3.",
                 L"OnyxNotch", MB_OK | MB_ICONINFORMATION);
             break;
         }

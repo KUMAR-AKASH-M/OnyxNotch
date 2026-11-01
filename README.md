@@ -1,4 +1,4 @@
-# OnyxNotch v3
+# OnyxNotch v4
 
 Mac-style notch for Windows, in native C++ Win32. One source file, one
 `.exe`, no Electron, no Python, no .NET runtime.
@@ -142,6 +142,80 @@ changes and widget/media toggles. Turning it back on re-enables
 animation for the next size change. There is no setting file:
 like the other v2 toggles, it resets to ON at each start.
 
+## What's new in v4 — Premium UI only
+
+UI-only redesign. No new features, no behaviour changes, no
+changed defaults, no new tray toggles. Everything from v3
+(multi-monitor, animations, hide-on-fullscreen, media controls,
+widgets, toggles) works exactly as before — only how it looks
+changed.
+
+### 1. Premium surface
+Flat black is gone. The notch now paints a vertical near-black
+gradient (slightly lighter at the top, darker at the bottom),
+with a subtle 1 px light border and a soft inner top highlight
+line, inset so it never touches the rounded corners. The pill
+shape is unchanged: the same rounded region as v3, applied frame
+by frame during animation, so the gradient moves with the notch
+as it expands and collapses. The gradient is drawn row by row
+with plain GDI — no new library, no image asset.
+
+### 2. Premium typography and spacing
+Segoe UI throughout (as in v3), with lighter weights: the big
+clock drops from semibold to light, the collapsed clock from
+medium to normal. Primary text (clocks, calendar month) is
+near-white; secondary text (date, battery, labels, stats) is a
+muted grey. Spacing is more generous: the date and battery rows
+sit slightly lower with more air, and the expanded sections
+start a few pixels further down. What text is shown is
+unchanged — only weight, colour, and spacing changed.
+
+### 3. Premium media buttons — circles
+The rectangular media buttons are now circles: diameter equals
+the media-row height, centred on the old button positions, so
+the row stays centred and balanced. Hover and pressed states
+are the same restrained idea as v3 (lighter circle on hover,
+lighter still on press, on slightly raised greys). The hit test
+was updated to match: it now tests distance from each circle's
+centre, so a visible circle is exactly what is clickable and
+the invisible corners of the old rectangles no longer respond.
+The glyphs themselves (Prev bar + double triangles, Play/Pause
+triangle + bars, Next double triangles + bar) are unchanged.
+
+### 4. Premium details
+- **Divider:** a thin dark line now separates the
+  clock/date/battery block from the media/widgets sections
+  below it. It only appears when a section follows; the
+  header-only expanded view has no stray line.
+- **Battery glyph:** next to the battery text, a small drawn
+  battery outline with a fill proportional to the percentage
+  and a lightning bolt when charging. On a desktop / unknown
+  battery, only the outline is drawn and the text stays
+  "Battery: --" as before. The text itself is unchanged.
+- **Calendar today:** today is now a white pill with dark text
+  instead of a plain grey box, so it reads as selected at a
+  glance. Other days are muted grey as before.
+
+### 5. Glass / acrylic — deliberately skipped, not faked
+Windows acrylic/blur (SetWindowCompositionAttribute) was
+evaluated and deliberately NOT included. The notch is a
+region-shaped, non-layered, topmost, no-activate window, and
+acrylic's interplay with that shape cannot be verified without
+a Windows test; a failed or half-applied attempt risks a
+black, transparent, or flickering notch. The shipped look is
+therefore the solid gradient version above, which renders
+identically with or without composition. If acrylic is wanted
+later, it should be done as its own change with a
+layered-window test on Windows, not bundled into a UI pass.
+
+### 6. Performance — unchanged
+No new timers, no polling, no new threads, no per-frame
+allocations that grow idle memory. The gradient is drawn only
+during a paint (the same paints v3 already did), the animation
+timer still runs only during a ~220 ms size change, and the
+clock timer is still 1 second. Idle cost should be identical
+to v3 — measure it in Task Manager to confirm.
+
 ## Build (Windows) — unchanged from v2
 
 ## Build (Windows)
@@ -226,6 +300,31 @@ with `build.bat` on Windows and runs it:
   warn on first run. That is normal for a self-built unsigned app;
   code-signing is a paid certificate, not a code change.
 
+## Honest limits — v4 additions (not verified on Windows)
+
+- **Not compiled on Windows.** This Linux VM has no Windows
+  toolchain, so `cl`/`rc` were never run on the v4 code. The
+  changes use only standard Win32 GDI APIs already in use
+  (`FillRect`, `RoundRect`, `Ellipse`, `Polygon`,
+  `GetTextExtentPoint32W`, `CreateFontW`), but a compile error
+  is still possible until the first Windows build.
+- **The premium look is untested on a real display.** The
+  gradient tones, border, highlight line, circle size, glyph
+  size inside the circles, battery glyph, and calendar pill
+  have not been seen on screen. They are chosen to be
+  restrained on black, but may need tuning — in particular,
+  the gradient step (top 32,32,36 to bottom 10,10,12) and the
+  circle diameter (media-row height) are the first things to
+  check visually.
+- **DPI behaviour during animation is untested**, as in v3:
+  gradient rows, glyph, and pill insets all scale with DPI via
+  `Scale()`, but per-monitor DPI animation has not been run.
+- **No acrylic/blur** (see v4 section 5) — the notch is
+  opaque gradient, by design, not by omission in the build.
+- **Idle memory under 10 MB is still a target, not a
+  measurement**, as in v3. The v4 paints add no new timers or
+  retained objects, but measure it in Task Manager to confirm.
+
 ## Honest limits — v3 additions (not verified on Windows)
 
 - **Not compiled on Windows.** This Linux VM has no Windows
@@ -266,6 +365,11 @@ with `build.bat` on Windows and runs it:
   v3 adds: per-notch animation timer (~220 ms, ease-out),
   media-button hover/pressed states, notch hover outline,
   ClearType fonts, and the Animations tray tick.
+  v4 adds (UI only): vertical gradient surface, light border
+  and top highlight, lighter Segoe UI weights, circular media
+  buttons with a matching circular hit test, a section
+  divider, a drawn battery glyph, and a white-pill calendar
+  today highlight. No acrylic, no new timers or dependencies.
 - `build.bat` — MSVC build script (resource compile + compile/link).
 - `onyxnotch.rc` — resource script binding the icon (ID 100).
 - `onyxnotch.ico` — custom black-pill icon, 16/32/48 px, 32-bit.
