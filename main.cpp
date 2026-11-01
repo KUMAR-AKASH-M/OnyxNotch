@@ -989,6 +989,7 @@ struct Notch {
     int shelfScroll = 0;
     int noteScroll = 0; // v8-continued: notes list scroll
     int screenScroll = 0; // v8-continued: screen-time list scroll
+    int mixScroll = 0; // v8-ui-fix: mixer list scroll (Media tab, per-notch)
     int dragKind = 0; // 0 none, 1 clipboard row, 2 shelf row
     int dragIndex = -1; // storage index of the drag candidate
     int dragStartX = 0, dragStartY = 0;
@@ -1207,6 +1208,7 @@ struct Layout {
     RECT mixCard = { 0, 0, 0, 0 };
     RECT mixRefreshRect = { 0, 0, 0, 0 };
     int mixListY = 0, mixRowH = 0, mixRowCount = 0;
+    int mixVisibleRows = 4; // v8-ui-fix: mixer shows 4 rows, scrolls past that
     RECT mixRowMinusRects[8] = { { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 } };
     RECT mixRowPlusRects[8] = { { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 } };
     RECT mixRowMuteRects[8] = { { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 } };
@@ -1424,62 +1426,67 @@ static Layout ComputeLayoutForTab(Notch* n, int clientW, int tab)
         L.worldCard = { margin + clockW + gap, L.bodyY, margin + clockW + gap + worldW, L.bodyY + cardH };
         bodyH = cardH;
     } else if (effTab == kTabMedia) {
-        L.mediaCard = { margin, L.bodyY, margin + bodyW, L.bodyY + Scale(120, dpi) };
-        int y = L.bodyY + Scale(36, dpi);
+        // v8-ui-fix: compact MEDIA. Track card tightened to 96,
+        // SOUND and MIC share one 110 row side by side (half width
+        // each), and the MIXER is a FIXED 150 with 4 visible rows
+        // and a scroll offset, so MEDIA body is 96+12+110+12+150
+        // = 380 at 96 DPI whatever the mixer session count is.
+        // Before this fix MEDIA was 520 (no sessions) to 730
+        // (8 sessions) and, via unified tab size, stretched every
+        // other tab to that height.
+        L.mediaCard = { margin, L.bodyY, margin + bodyW, L.bodyY + Scale(96, dpi) };
+        int y = L.bodyY + Scale(24, dpi);
         // v6-fix: ALWAYS reserve both rows when media is on, whether
         // or not a track is playing, so a track starting or stopping
         // never snaps the card or panel height.
-        L.mediaTitleY = y; y += Scale(22, dpi);
+        L.mediaTitleY = y; y += Scale(20, dpi);
         L.mediaArtistY = y; y += Scale(20, dpi);
-        L.mediaButtonH = Scale(32, dpi);
-        L.mediaButtonY = y + Scale(6, dpi);
+        L.mediaButtonH = Scale(26, dpi);
+        L.mediaButtonY = y + Scale(2, dpi);
         int bw = (bodyW - 2 * btnGap) / 3;
         if (bw < 20) bw = 20;
         L.btnPrev = { margin, L.mediaButtonY, margin + bw, L.mediaButtonY + L.mediaButtonH };
         L.btnPlay = { margin + bw + btnGap, L.mediaButtonY, margin + 2 * bw + btnGap, L.mediaButtonY + L.mediaButtonH };
         L.btnNext = { margin + 2 * bw + 2 * btnGap, L.mediaButtonY, margin + 3 * bw + 2 * btnGap, L.mediaButtonY + L.mediaButtonH };
-        bodyH = L.mediaButtonY + L.mediaButtonH + Scale(12, dpi) - L.bodyY;
-        L.mediaCard.bottom = L.mediaButtonY + L.mediaButtonH + Scale(12, dpi);
-        // v8-sound: SOUND card (moved from SYSTEM), then MIC, then
-        // the per-app mixer. Mixer rows follow the live session
-        // count (at least 1 row, for the "No apps" line), so
-        // MEDIA height follows the mixer; unified size takes the
-        // max over tabs, and entering Media re-applies the size
-        // (see the dock handler) when the count changed.
-        int soundH = Scale(176, dpi);
-        int soundY = L.mediaCard.bottom + gap;
-        L.mediaSoundCard = { margin, soundY, margin + bodyW, soundY + soundH };
+        bodyH = L.mediaButtonY + L.mediaButtonH + Scale(4, dpi) - L.bodyY;
+        L.mediaCard.bottom = L.mediaButtonY + L.mediaButtonH + Scale(4, dpi);
+        // SOUND (left) + MIC (right) on one row, half width each.
+        int halfW = (bodyW - gap) / 2;
+        int rowH = Scale(110, dpi);
+        int rowY = L.mediaCard.bottom + gap;
+        L.mediaSoundCard = { margin, rowY, margin + halfW, rowY + rowH };
+        L.micCard = { margin + halfW + gap, rowY, margin + halfW + gap + halfW, rowY + rowH };
         {
-            int by = soundY + Scale(136, dpi);
-            L.volMinusRect = { margin + Scale(14, dpi), by, margin + Scale(62, dpi), by + Scale(26, dpi) };
-            L.volPlusRect = { margin + Scale(70, dpi), by, margin + Scale(118, dpi), by + Scale(26, dpi) };
-            L.volMuteRect = { margin + Scale(126, dpi), by, margin + Scale(206, dpi), by + Scale(26, dpi) };
-            L.volTrackRect = { margin + Scale(14, dpi), soundY + Scale(116, dpi), margin + bodyW - Scale(14, dpi), soundY + Scale(132, dpi) };
+            int sx = L.mediaSoundCard.left;
+            int by = rowY + Scale(80, dpi);
+            L.volMinusRect = { sx + Scale(14, dpi), by, sx + Scale(62, dpi), by + Scale(26, dpi) };
+            L.volPlusRect = { sx + Scale(70, dpi), by, sx + Scale(118, dpi), by + Scale(26, dpi) };
+            L.volMuteRect = { sx + Scale(126, dpi), by, sx + Scale(206, dpi), by + Scale(26, dpi) };
+            L.volTrackRect = { sx + Scale(14, dpi), rowY + Scale(66, dpi), L.mediaSoundCard.right - Scale(14, dpi), rowY + Scale(74, dpi) };
         }
-        int micH = Scale(110, dpi);
-        int micY = soundY + soundH + gap;
-        L.micCard = { margin, micY, margin + bodyW, micY + micH };
         {
-            int by = micY + Scale(62, dpi);
-            L.micMinusRect = { margin + Scale(14, dpi), by, margin + Scale(62, dpi), by + Scale(26, dpi) };
-            L.micPlusRect = { margin + Scale(70, dpi), by, margin + Scale(118, dpi), by + Scale(26, dpi) };
-            L.micMuteRect = { margin + Scale(126, dpi), by, margin + Scale(206, dpi), by + Scale(26, dpi) };
+            int mx = L.micCard.left;
+            int by = rowY + Scale(80, dpi);
+            L.micMinusRect = { mx + Scale(14, dpi), by, mx + Scale(62, dpi), by + Scale(26, dpi) };
+            L.micPlusRect = { mx + Scale(70, dpi), by, mx + Scale(118, dpi), by + Scale(26, dpi) };
+            L.micMuteRect = { mx + Scale(126, dpi), by, mx + Scale(206, dpi), by + Scale(26, dpi) };
         }
-        int mixRows = (int)g_mixSessions.size();
-        if (mixRows < 1) mixRows = 1;
-        if (mixRows > 8) mixRows = 8;
+        // MIXER: FIXED height, 4 visible rows, scrolled by the
+        // per-notch mixScroll (see WM_MOUSEWHEEL + MixHitAt).
+        // Session count never changes the panel size any more.
         int mixRowH = Scale(30, dpi);
-        int mixY = micY + micH + gap;
-        int mixH = Scale(48, dpi) + mixRows * mixRowH;
+        int mixY = rowY + rowH + gap;
+        int mixH = Scale(150, dpi);
         L.mixCard = { margin, mixY, margin + bodyW, mixY + mixH };
-        L.mixListY = mixY + Scale(48, dpi);
+        L.mixListY = mixY + Scale(30, dpi);
         L.mixRowH = mixRowH;
+        L.mixVisibleRows = 4;
         L.mixRowCount = (int)g_mixSessions.size();
         if (L.mixRowCount > 8) L.mixRowCount = 8;
         {
-            int ry = mixY + Scale(14, dpi);
-            L.mixRefreshRect = { margin + bodyW - Scale(114, dpi), ry, margin + bodyW - Scale(14, dpi), ry + Scale(22, dpi) };
-            for (int i = 0; i < 8; i++) {
+            int ry = mixY + Scale(6, dpi);
+            L.mixRefreshRect = { margin + bodyW - Scale(114, dpi), ry, margin + bodyW - Scale(14, dpi), ry + Scale(20, dpi) };
+            for (int i = 0; i < 4; i++) {
                 int y0 = L.mixListY + i * mixRowH;
                 int by2 = y0 + (mixRowH - Scale(24, dpi)) / 2;
                 int muteL = margin + bodyW - Scale(14, dpi) - Scale(80, dpi);
@@ -1553,14 +1560,16 @@ static Layout ComputeLayoutForTab(Notch* n, int clientW, int tab)
     } else if (effTab == kTabTimer) {
         // v8-continued TIMER: display, mode row, preset row,
         // step row, action row. All mouse clicks, no typing.
-        int cardH = Scale(28, dpi) + Scale(52, dpi) + Scale(34, dpi) * 3 + Scale(34, dpi) + Scale(40, dpi);
+        // v8-ui-fix: row pitch 42 -> 30 (26px buttons, 4px gap),
+        // footer shortened: body 256 -> 226 at 96 DPI.
+        int cardH = Scale(28, dpi) + Scale(52, dpi) + Scale(30, dpi) * 3 + Scale(26, dpi) + Scale(30, dpi);
         L.timerCard = { margin, L.bodyY, margin + bodyW, L.bodyY + cardH };
         int innerX = margin + Scale(14, dpi);
         int innerW = bodyW - Scale(28, dpi);
         int modeY = L.bodyY + Scale(28, dpi) + Scale(52, dpi);
-        int presetY = modeY + Scale(34, dpi) + Scale(8, dpi);
-        int stepY = presetY + Scale(34, dpi) + Scale(8, dpi);
-        int actY = stepY + Scale(34, dpi) + Scale(8, dpi);
+        int presetY = modeY + Scale(30, dpi);
+        int stepY = presetY + Scale(30, dpi);
+        int actY = stepY + Scale(30, dpi);
         for (int i = 0; i < 3; i++) {
             int w = (innerW - 2 * gap) / 3;
             int x = innerX + i * (w + gap);
@@ -1580,10 +1589,12 @@ static Layout ComputeLayoutForTab(Notch* n, int clientW, int tab)
         L.timerResetRect = { innerX + Scale(168, dpi), actY, innerX + Scale(278, dpi), actY + Scale(26, dpi) };
         bodyH = cardH;
     } else if (effTab == kTabNotes) {
-        // v8-continued NOTES: 4 top buttons, 8 list rows.
+        // v8-continued NOTES: 4 top buttons, 6 list rows.
         // No typing: notes are created blank or from the
         // clipboard, and edited in Notepad (see README).
-        int cardH = Scale(28, dpi) + Scale(34, dpi) + 8 * Scale(30, dpi) + Scale(12, dpi);
+        // v8-ui-fix: 8 -> 6 visible rows (314 -> 254 at 96 DPI);
+        // the rest scrolls via noteScroll, as before.
+        int cardH = Scale(28, dpi) + Scale(34, dpi) + 6 * Scale(30, dpi) + Scale(12, dpi);
         L.notesCard = { margin, L.bodyY, margin + bodyW, L.bodyY + cardH };
         int topY = L.bodyY + Scale(28, dpi);
         int topW[4] = { Scale(140, dpi), Scale(170, dpi), Scale(120, dpi), Scale(110, dpi) };
@@ -1596,8 +1607,10 @@ static Layout ComputeLayoutForTab(Notch* n, int clientW, int tab)
         L.notesRowH = Scale(30, dpi);
         bodyH = cardH;
     } else if (effTab == kTabScreen) {
-        // v8-continued SCREEN: 8 list rows, Reset today row.
-        int cardH = Scale(28, dpi) + 8 * Scale(30, dpi) + Scale(34, dpi);
+        // v8-continued SCREEN: 6 list rows, Reset today row.
+        // v8-ui-fix: 8 -> 6 visible rows (302 -> 242 at 96 DPI);
+        // the rest scrolls via screenScroll, as before.
+        int cardH = Scale(28, dpi) + 6 * Scale(30, dpi) + Scale(34, dpi);
         L.screenCard = { margin, L.bodyY, margin + bodyW, L.bodyY + cardH };
         L.screenListY = L.bodyY + Scale(28, dpi);
         L.screenRowH = Scale(30, dpi);
@@ -3032,7 +3045,7 @@ static bool NotesHitAt(Notch* n, int px, int py, bool usePaint, int& itemOut, in
     // returned itemOut is a STORAGE index, not a row index.
     std::vector<int> disp;
     for (int pass = 0; pass < 2; pass++) for (size_t i = 0; i < g_notes.size(); i++) if ((pass == 0) == g_notes[i].pinned) disp.push_back((int)i);
-    for (int row = 0; row < 8; row++) {
+    for (int row = 0; row < 6; row++) {
         int di = n->noteScroll + row;
         if (di < 0 || di >= (int)disp.size()) break;
         int storageIdx = disp[di];
@@ -3099,10 +3112,18 @@ static bool MixHitAt(Notch* n, int px, int py, bool usePaint, int& itemOut, int&
     RECT rc; GetClientRect(n->hwnd, &rc);
     Layout L = ComputeLayout(n, rc.right);
     if (px >= L.mixRefreshRect.left && px < L.mixRefreshRect.right && py >= L.mixRefreshRect.top && py < L.mixRefreshRect.bottom) { partOut = 3; itemOut = -1; return true; }
-    for (int i = 0; i < L.mixRowCount; i++) {
-        if (px >= L.mixRowMinusRects[i].left && px < L.mixRowMinusRects[i].right && py >= L.mixRowMinusRects[i].top && py < L.mixRowMinusRects[i].bottom) { partOut = 0; itemOut = i; return true; }
-        if (px >= L.mixRowPlusRects[i].left && px < L.mixRowPlusRects[i].right && py >= L.mixRowPlusRects[i].top && py < L.mixRowPlusRects[i].bottom) { partOut = 1; itemOut = i; return true; }
-        if (px >= L.mixRowMuteRects[i].left && px < L.mixRowMuteRects[i].right && py >= L.mixRowMuteRects[i].top && py < L.mixRowMuteRects[i].bottom) { partOut = 2; itemOut = i; return true; }
+    // v8-ui-fix: only the 4 visible rows are hit-testable; the
+    // row index maps through mixScroll to a session index, which
+    // is what the click handler indexes into g_mixSessions.
+    int effScroll = n->mixScroll;
+    int maxScroll = L.mixRowCount - L.mixVisibleRows; if (maxScroll < 0) maxScroll = 0;
+    if (effScroll > maxScroll) effScroll = maxScroll;
+    for (int row = 0; row < L.mixVisibleRows; row++) {
+        int di = effScroll + row;
+        if (di < 0 || di >= L.mixRowCount) break;
+        if (px >= L.mixRowMinusRects[row].left && px < L.mixRowMinusRects[row].right && py >= L.mixRowMinusRects[row].top && py < L.mixRowMinusRects[row].bottom) { partOut = 0; itemOut = di; return true; }
+        if (px >= L.mixRowPlusRects[row].left && px < L.mixRowPlusRects[row].right && py >= L.mixRowPlusRects[row].top && py < L.mixRowPlusRects[row].bottom) { partOut = 1; itemOut = di; return true; }
+        if (px >= L.mixRowMuteRects[row].left && px < L.mixRowMuteRects[row].right && py >= L.mixRowMuteRects[row].top && py < L.mixRowMuteRects[row].bottom) { partOut = 2; itemOut = di; return true; }
     }
     return false;
 }
@@ -5093,7 +5114,7 @@ static void PaintNotchD2D(Notch* n, Canvas* cv)
             D2DText(cv, kFontTiny, g_timerRunning ? L"Pause" : L"Start", (float)L.timerStartRect.left, (float)L.timerStartRect.top, (float)(L.timerStartRect.right - L.timerStartRect.left), (float)(L.timerStartRect.bottom - L.timerStartRect.top), th.secondary, true);
             cv->StrokeRounded(L.timerResetRect, th.muted, 1.0f, 4.0f);
             D2DText(cv, kFontTiny, L"Reset", (float)L.timerResetRect.left, (float)L.timerResetRect.top, (float)(L.timerResetRect.right - L.timerResetRect.left), (float)(L.timerResetRect.bottom - L.timerResetRect.top), th.secondary, true);
-            D2DText(cv, kFontTiny, L"Presets and steps apply to Countdown/Focus only, and only while paused. Timers are not saved across quit. No sound on finish.", (float)(c.left + 14), (float)(L.timerResetRect.bottom + Scale(6, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.muted, false);
+            D2DText(cv, kFontTiny, L"Presets/steps: Countdown/Focus only, while paused. Not saved.", (float)(c.left + 14), (float)(L.timerResetRect.bottom + Scale(6, dpi)), (float)(c.right - c.left - 28), (float)Scale(16, dpi), th.muted, false);
         }
     } else if (effTab == kTabNotes) {
         DrawCardD2D(cv, L.notesCard, L"NOTES");
@@ -5112,7 +5133,7 @@ static void PaintNotchD2D(Notch* n, Canvas* cv)
                 D2DText(cv, kFontTiny, L"No notes yet", (float)(c.left + 14), (float)L.notesListY, (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.secondary, false);
                 D2DText(cv, kFontTiny, L"The notch cannot accept typing (it must not steal focus), so notes are created blank or from the clipboard and edited in Notepad: Open, edit, save, then Reload all. Notes are saved in notes.ini.", (float)(c.left + 14), (float)(L.notesListY + Scale(22, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.muted, false);
             } else {
-                for (int row = 0; row < 8; row++) {
+                for (int row = 0; row < 6; row++) {
                     int di = n->noteScroll + row;
                     if (di < 0 || di >= (int)disp.size()) break;
                     NoteItem& it = g_notes[disp[di]];
@@ -5125,7 +5146,7 @@ static void PaintNotchD2D(Notch* n, Canvas* cv)
                     D2DText(cv, kFontTiny, L"Open", (float)openL, (float)y0, 48.0f, (float)Scale(20, dpi), th.accent, true);
                     D2DText(cv, kFontTiny, L"X", (float)delL, (float)y0, 24.0f, (float)Scale(20, dpi), th.muted, true);
                 }
-                if (n->noteScroll > 0 || n->noteScroll + 8 < (int)disp.size())
+                if (n->noteScroll > 0 || n->noteScroll + 6 < (int)disp.size())
                     D2DText(cv, kFontTiny, L"Scroll with mouse wheel", (float)(c.left + 14), (float)(L.notesCard.bottom - Scale(20, dpi)), (float)(c.right - c.left - 28), (float)Scale(16, dpi), th.muted, false);
             }
         }
@@ -5139,7 +5160,7 @@ static void PaintNotchD2D(Notch* n, Canvas* cv)
                 D2DText(cv, kFontTiny, L"No apps tracked yet today", (float)(c.left + 14), (float)L.screenListY, (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.secondary, false);
                 D2DText(cv, kFontTiny, L"Exe names only — window titles are never read, so no private text is recorded. Totals are saved in screentime.ini and reset at local midnight.", (float)(c.left + 14), (float)(L.screenListY + Scale(22, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.muted, false);
             } else {
-                for (int row = 0; row < 8; row++) {
+                for (int row = 0; row < 6; row++) {
                     int di = n->screenScroll + row;
                     if (di < 0 || di >= (int)sorted.size()) break;
                     ScreenApp& app = sorted[di];
@@ -5167,20 +5188,21 @@ static void PaintNotchD2D(Notch* n, Canvas* cv)
         // there is no documented public API to set the default
         // audio device (IPolicyConfig is undocumented), so the
         // device name is shown, never switched.
+        // v8-ui-fix: SOUND is now the left half of the sound/mic
+        // row. Device name sits on the title row (right of the
+        // SOUND label, truncated); the balance line was dropped
+        // from the card — it did not fit the half-width card
+        // without cramping, and it was an indicator only.
         DrawCardD2D(cv, L.mediaSoundCard, L"SOUND");
         {
             RECT c = L.mediaSoundCard;
+            if (g_outDeviceName[0] != L'\0') D2DTextEllipsis(cv, kFontTiny, g_outDeviceName, (float)(c.left + Scale(80, dpi)), (float)(c.top + Scale(10, dpi)), (float)(c.right - c.left - Scale(94, dpi)), (float)Scale(16, dpi), th.muted);
+            else D2DText(cv, kFontTiny, L"Output device unknown", (float)(c.left + Scale(80, dpi)), (float)(c.top + Scale(10, dpi)), (float)(c.right - c.left - Scale(94, dpi)), (float)Scale(16, dpi), th.muted, false);
             if (g_volOk) {
                 wchar_t big[16]; swprintf(big, 16, L"%d%%", g_volPercent);
-                D2DText(cv, kFontBig, big, (float)(c.left + 14), (float)(c.top + Scale(30, dpi)), (float)(c.right - c.left - 28), (float)Scale(40, dpi), th.primary, false);
+                D2DText(cv, kFontBig, big, (float)(c.left + 14), (float)(c.top + Scale(26, dpi)), (float)(c.right - c.left - 28), (float)Scale(36, dpi), th.primary, false);
             } else {
-                D2DText(cv, kFontTiny, L"Volume unavailable", (float)(c.left + 14), (float)(c.top + Scale(36, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.secondary, false);
-            }
-            if (g_outDeviceName[0] != L'\0') D2DTextEllipsis(cv, kFontTiny, g_outDeviceName, (float)(c.left + 14), (float)(c.top + Scale(72, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.secondary);
-            else D2DText(cv, kFontTiny, L"Output device unknown", (float)(c.left + 14), (float)(c.top + Scale(72, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.muted, false);
-            if (g_balOk) {
-                wchar_t bal[64]; swprintf(bal, 64, L"Balance  L %d%%  \x00B7  R %d%%", g_balLeft, g_balRight);
-                D2DText(cv, kFontTiny, bal, (float)(c.left + 14), (float)(c.top + Scale(94, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.muted, false);
+                D2DText(cv, kFontTiny, L"Volume unavailable", (float)(c.left + 14), (float)(c.top + Scale(32, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.secondary, false);
             }
             RECT tb = L.volTrackRect;
             int midY = (tb.top + tb.bottom) / 2;
@@ -5196,12 +5218,14 @@ static void PaintNotchD2D(Notch* n, Canvas* cv)
             cv->StrokeRounded(L.volMuteRect, th.muted, 1.0f, 4.0f);
             D2DText(cv, kFontTiny, g_volMuted ? L"Unmute" : L"Mute", (float)L.volMuteRect.left, (float)L.volMuteRect.top, (float)(L.volMuteRect.right - L.volMuteRect.left), (float)(L.volMuteRect.bottom - L.volMuteRect.top), th.secondary, true);
         }
+        // v8-ui-fix: MIC is the right half of the sound/mic row;
+        // its buttons are at rowY+80 in the layout, % above them.
         DrawCardD2D(cv, L.micCard, L"MIC");
         {
             RECT c = L.micCard;
             if (g_micOk) {
                 wchar_t big[16]; swprintf(big, 16, L"%d%%", g_micPercent);
-                D2DText(cv, kFontBig, big, (float)(c.left + 14), (float)(c.top + Scale(30, dpi)), (float)(c.right - c.left - 28), (float)Scale(40, dpi), th.primary, false);
+                D2DText(cv, kFontBig, big, (float)(c.left + 14), (float)(c.top + Scale(26, dpi)), (float)(c.right - c.left - 28), (float)Scale(36, dpi), th.primary, false);
                 cv->StrokeRounded(L.micMinusRect, th.muted, 1.0f, 4.0f);
                 D2DText(cv, kFontTiny, L"-", (float)L.micMinusRect.left, (float)L.micMinusRect.top, (float)(L.micMinusRect.right - L.micMinusRect.left), (float)(L.micMinusRect.bottom - L.micMinusRect.top), th.secondary, true);
                 cv->StrokeRounded(L.micPlusRect, th.muted, 1.0f, 4.0f);
@@ -5209,26 +5233,37 @@ static void PaintNotchD2D(Notch* n, Canvas* cv)
                 cv->StrokeRounded(L.micMuteRect, th.muted, 1.0f, 4.0f);
                 D2DText(cv, kFontTiny, g_micMuted ? L"Unmute" : L"Mute", (float)L.micMuteRect.left, (float)L.micMuteRect.top, (float)(L.micMuteRect.right - L.micMuteRect.left), (float)(L.micMuteRect.bottom - L.micMuteRect.top), th.secondary, true);
             } else {
-                D2DText(cv, kFontTiny, L"No microphone found", (float)(c.left + 14), (float)(c.top + Scale(36, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.secondary, false);
+                D2DText(cv, kFontTiny, L"No microphone found", (float)(c.left + 14), (float)(c.top + Scale(32, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.secondary, false);
             }
         }
+        // v8-ui-fix: MIXER is fixed-height with 4 visible rows;
+        // rows shown are sessions[mixScroll .. mixScroll+3], and
+        // the scroll hint sits on the title row (there is no room
+        // for a hint row inside the fixed card).
         DrawCardD2D(cv, L.mixCard, L"MIXER");
         cv->StrokeRounded(L.mixRefreshRect, th.muted, 1.0f, 4.0f);
         D2DText(cv, kFontTiny, L"Refresh", (float)L.mixRefreshRect.left, (float)L.mixRefreshRect.top, (float)(L.mixRefreshRect.right - L.mixRefreshRect.left), (float)(L.mixRefreshRect.bottom - L.mixRefreshRect.top), th.secondary, true);
         if (L.mixRowCount == 0) {
             D2DText(cv, kFontTiny, L"No apps playing audio", (float)(L.mixCard.left + 14), (float)L.mixListY, (float)(L.mixCard.right - L.mixCard.left - 28), (float)Scale(20, dpi), th.secondary, false);
         } else {
-            for (int i = 0; i < L.mixRowCount; i++) {
-                int y0 = L.mixListY + i * L.mixRowH;
-                D2DTextEllipsis(cv, kFontTiny, g_mixSessions[i].exe.c_str(), (float)(L.mixCard.left + 14), (float)y0, (float)(L.mixRowMinusRects[i].left - L.mixCard.left - 22), (float)Scale(20, dpi), th.primary);
-                wchar_t pct[16]; swprintf(pct, 16, L"%d%%", g_mixSessions[i].percent);
-                D2DText(cv, kFontTiny, pct, (float)(L.mixRowMinusRects[i].left - Scale(56, dpi)), (float)y0, (float)Scale(48, dpi), (float)Scale(20, dpi), th.secondary, true);
-                cv->StrokeRounded(L.mixRowMinusRects[i], th.muted, 1.0f, 4.0f);
-                D2DText(cv, kFontTiny, L"-", (float)L.mixRowMinusRects[i].left, (float)L.mixRowMinusRects[i].top, (float)(L.mixRowMinusRects[i].right - L.mixRowMinusRects[i].left), (float)(L.mixRowMinusRects[i].bottom - L.mixRowMinusRects[i].top), th.secondary, true);
-                cv->StrokeRounded(L.mixRowPlusRects[i], th.muted, 1.0f, 4.0f);
-                D2DText(cv, kFontTiny, L"+", (float)L.mixRowPlusRects[i].left, (float)L.mixRowPlusRects[i].top, (float)(L.mixRowPlusRects[i].right - L.mixRowPlusRects[i].left), (float)(L.mixRowPlusRects[i].bottom - L.mixRowPlusRects[i].top), th.secondary, true);
-                cv->StrokeRounded(L.mixRowMuteRects[i], th.muted, 1.0f, 4.0f);
-                D2DText(cv, kFontTiny, g_mixSessions[i].muted ? L"Unmute" : L"Mute", (float)L.mixRowMuteRects[i].left, (float)L.mixRowMuteRects[i].top, (float)(L.mixRowMuteRects[i].right - L.mixRowMuteRects[i].left), (float)(L.mixRowMuteRects[i].bottom - L.mixRowMuteRects[i].top), th.secondary, true);
+            int effMixScroll = n->mixScroll;
+            int maxMixScroll = L.mixRowCount - L.mixVisibleRows; if (maxMixScroll < 0) maxMixScroll = 0;
+            if (effMixScroll > maxMixScroll) effMixScroll = maxMixScroll;
+            if (L.mixRowCount > L.mixVisibleRows)
+                D2DText(cv, kFontTiny, L"Scroll with mouse wheel", (float)(L.mixCard.left + Scale(120, dpi)), (float)(L.mixCard.top + Scale(10, dpi)), (float)Scale(200, dpi), (float)Scale(16, dpi), th.muted, false);
+            for (int row = 0; row < L.mixVisibleRows; row++) {
+                int di = effMixScroll + row;
+                if (di < 0 || di >= L.mixRowCount) break;
+                int y0 = L.mixListY + row * L.mixRowH;
+                D2DTextEllipsis(cv, kFontTiny, g_mixSessions[di].exe.c_str(), (float)(L.mixCard.left + 14), (float)y0, (float)(L.mixRowMinusRects[row].left - L.mixCard.left - 22), (float)Scale(20, dpi), th.primary);
+                wchar_t pct[16]; swprintf(pct, 16, L"%d%%", g_mixSessions[di].percent);
+                D2DText(cv, kFontTiny, pct, (float)(L.mixRowMinusRects[row].left - Scale(56, dpi)), (float)y0, (float)Scale(48, dpi), (float)Scale(20, dpi), th.secondary, true);
+                cv->StrokeRounded(L.mixRowMinusRects[row], th.muted, 1.0f, 4.0f);
+                D2DText(cv, kFontTiny, L"-", (float)L.mixRowMinusRects[row].left, (float)L.mixRowMinusRects[row].top, (float)(L.mixRowMinusRects[row].right - L.mixRowMinusRects[row].left), (float)(L.mixRowMinusRects[row].bottom - L.mixRowMinusRects[row].top), th.secondary, true);
+                cv->StrokeRounded(L.mixRowPlusRects[row], th.muted, 1.0f, 4.0f);
+                D2DText(cv, kFontTiny, L"+", (float)L.mixRowPlusRects[row].left, (float)L.mixRowPlusRects[row].top, (float)(L.mixRowPlusRects[row].right - L.mixRowPlusRects[row].left), (float)(L.mixRowPlusRects[row].bottom - L.mixRowPlusRects[row].top), th.secondary, true);
+                cv->StrokeRounded(L.mixRowMuteRects[row], th.muted, 1.0f, 4.0f);
+                D2DText(cv, kFontTiny, g_mixSessions[di].muted ? L"Unmute" : L"Mute", (float)L.mixRowMuteRects[row].left, (float)L.mixRowMuteRects[row].top, (float)(L.mixRowMuteRects[row].right - L.mixRowMuteRects[row].left), (float)(L.mixRowMuteRects[row].bottom - L.mixRowMuteRects[row].top), th.secondary, true);
             }
         }
     }
@@ -5537,11 +5572,15 @@ static LRESULT CALLBACK NotchWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                 // per paint frame, so a slow WMI call cannot
                 // stall every frame).
                 if (dockTab == kTabSystem) RefreshBrightness();
+                // v8-ui-fix: entering Media refreshes sound/mixer,
+                // but the panel size NO LONGER depends on the mixer
+                // count (fixed-height mixer), so no size re-apply.
+                // mixScroll is clamped to the new count.
                 if (dockTab == kTabMedia) {
-                    int beforeMix = (int)g_mixSessions.size();
                     RefreshSoundDevices();
                     RefreshMixer();
-                    if ((int)g_mixSessions.size() != beforeMix) ApplySizeToAll();
+                    int maxMix = (int)g_mixSessions.size() - 4; if (maxMix < 0) maxMix = 0;
+                    if (n->mixScroll > maxMix) n->mixScroll = maxMix;
                 }
                 // v6-unified-size: the panel size is identical on
                 // every tab, so a switch only repaints content
@@ -5792,7 +5831,8 @@ static LRESULT CALLBACK NotchWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                 if (mixPart == 3) {
                     RefreshSoundDevices();
                     RefreshMixer();
-                    ApplySizeToAll();
+                    int maxMix = (int)g_mixSessions.size() - 4; if (maxMix < 0) maxMix = 0;
+                    if (n->mixScroll > maxMix) n->mixScroll = maxMix;
                 } else if (mixItem >= 0 && mixItem < (int)g_mixSessions.size()) {
                     std::wstring exe = g_mixSessions[mixItem].exe;
                     if (mixPart == 0 || mixPart == 1) {
@@ -5889,16 +5929,24 @@ static LRESULT CALLBACK NotchWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                 if (n->shelfScroll > maxOff) n->shelfScroll = maxOff;
                 InvalidateRect(hwnd, NULL, FALSE);
             } else if (EffectiveTab(n) == kTabNotes) {
-                int maxOff = (int)g_notes.size() - 8; if (maxOff < 0) maxOff = 0;
+                int maxOff = (int)g_notes.size() - 6; if (maxOff < 0) maxOff = 0;
                 n->noteScroll -= step;
                 if (n->noteScroll < 0) n->noteScroll = 0;
                 if (n->noteScroll > maxOff) n->noteScroll = maxOff;
                 InvalidateRect(hwnd, NULL, FALSE);
             } else if (EffectiveTab(n) == kTabScreen) {
-                int maxOff = (int)g_screenApps.size() - 8; if (maxOff < 0) maxOff = 0;
+                int maxOff = (int)g_screenApps.size() - 6; if (maxOff < 0) maxOff = 0;
                 n->screenScroll -= step;
                 if (n->screenScroll < 0) n->screenScroll = 0;
                 if (n->screenScroll > maxOff) n->screenScroll = maxOff;
+                InvalidateRect(hwnd, NULL, FALSE);
+            } else if (EffectiveTab(n) == kTabMedia) {
+                // v8-ui-fix: wheel scrolls the fixed-height mixer
+                // (4 visible rows); panel size never changes.
+                int maxOff = (int)g_mixSessions.size() - 4; if (maxOff < 0) maxOff = 0;
+                n->mixScroll -= step;
+                if (n->mixScroll < 0) n->mixScroll = 0;
+                if (n->mixScroll > maxOff) n->mixScroll = maxOff;
                 InvalidateRect(hwnd, NULL, FALSE);
             }
         }
@@ -6338,7 +6386,7 @@ static LRESULT CALLBACK ManagerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
         case ID_TRAY_MEDIA_NEXT: SendMediaKey(VK_MEDIA_NEXT_TRACK); break;
         case ID_TRAY_ABOUT:
             MessageBoxW(hwnd,
-                L"OnyxNotch v8 (clipboard history + file shelf)\nMac-style notch for Windows.\nNative Win32 C++, no runtime, low memory.\nDirect2D/DirectWrite rendering on a layered\nwindow with per-pixel alpha; spring animation;\nblur is an OFF-by-default experimental tray\ntoggle with an opaque fallback.\n\nv4: premium UI — gradient surface, lighter\ntypography, circular media buttons, battery glyph,\ncalendar pill — reorganized in place: compact\ntwo-column body (media beside system stats),\nsection headers, stats rows with bars.\n\nv5-SMTC: with Media controls on, the Media tab\nshows the current track title and artist from\nWindows SMTC (read-only), and Home shows a\ncompact title line. No track, no title — the\nmedia buttons still work via media keys.\n\nv5-settings: size and toggles are saved to\n%APPDATA%\\OnyxNotch\\settings.ini and restored\nat startup. Start with Windows (tray menu) writes\nthe Run registry value for this .exe.\n\nThemes: tray menu Themes submenu — Onyx, Midnight,\nGraphite — applies instantly to all notches and is\nsaved to settings.ini as theme=onyx|midnight|graphite.\n\nClick the notch header to pin it open;\nclick again to unpin. The gear button in the\nexpanded header opens this menu from the notch.\n\nv6: wide card dashboard with a header bar,\ncard grid and a bottom icon dock. Home is a\ncompact summary; System, Clock, Calendar\nand Media show full card versions. Click a\ndock icon to switch. Close X collapses only.\n\nv8: clipboard history + file shelf, both OFF by\ndefault in the tray menu. Clipboard history is\nin-memory by default (clears on quit unless the\nkeep-after-quit toggle is on), capped at 50, with a password-manager\nheuristic skip that is NOT a guarantee. Click an\nitem to copy it back; drag text/files out to\nanother app (images: drag/copy as thumbnails only). File shelf parks\nreferenced paths only; paths are saved in\n%APPDATA%\\OnyxNotch\\shelf.ini. No search box:\nthe notch must not steal keyboard focus, so\nfilters are mouse-click chips only.\n\nHome page: tray or gear menu, Customize Home page,\nopens an edit list on HOME (mouse clicks only):\ncheck up to 6 of the 11 cards (System, Calendar,\nClock, Media, Battery, Network, Clipboard, Shelf,\nTimer, Notes, Screen),\narrows reorder them, Done exits. Edit mode itself\nis not saved; the selection and order are saved in\nsettings.ini as home_cards= and home_order=.\n\nv8-continued: TIMER tab (stopwatch, countdown, focus;\npresets and steps, mouse only, in-memory, no sound),\nNOTES tab (local notes.ini; blank or from clipboard;\nedited in Notepad, never typed in the notch), SCREEN\ntab (exe names only, screentime.ini, OFF by default),\nMEDIA sound card (wave-out volume, slider, device name, mic, per-app mixer) and SYSTEM brightness (WMI)\n(unavailable on displays WMI cannot control), clipboard\npersistence (OFF by default, text only, DPAPI file\nclipboard.dat), image drag-out (thumbnails only).\nPrivacy dots and Bluetooth battery were CUT: no\nreliable public native signal exists for either, and\nfaking them would be worse than omitting them.",
+                L"OnyxNotch v8 (clipboard history + file shelf)\nMac-style notch for Windows.\nNative Win32 C++, no runtime, low memory.\nDirect2D/DirectWrite rendering on a layered\nwindow with per-pixel alpha; spring animation;\nblur is an OFF-by-default experimental tray\ntoggle with an opaque fallback.\n\nv4: premium UI — gradient surface, lighter\ntypography, circular media buttons, battery glyph,\ncalendar pill — reorganized in place: compact\ntwo-column body (media beside system stats),\nsection headers, stats rows with bars.\n\nv5-SMTC: with Media controls on, the Media tab\nshows the current track title and artist from\nWindows SMTC (read-only), and Home shows a\ncompact title line. No track, no title — the\nmedia buttons still work via media keys.\n\nv5-settings: size and toggles are saved to\n%APPDATA%\\OnyxNotch\\settings.ini and restored\nat startup. Start with Windows (tray menu) writes\nthe Run registry value for this .exe.\n\nThemes: tray menu Themes submenu — Onyx, Midnight,\nGraphite — applies instantly to all notches and is\nsaved to settings.ini as theme=onyx|midnight|graphite.\n\nClick the notch header to pin it open;\nclick again to unpin. The gear button in the\nexpanded header opens this menu from the notch.\n\nv6: wide card dashboard with a header bar,\ncard grid and a bottom icon dock. Home is a\ncompact summary; System, Clock, Calendar\nand Media show full card versions. Click a\ndock icon to switch. Close X collapses only.\n\nv8: clipboard history + file shelf, both OFF by\ndefault in the tray menu. Clipboard history is\nin-memory by default (clears on quit unless the\nkeep-after-quit toggle is on), capped at 50, with a password-manager\nheuristic skip that is NOT a guarantee. Click an\nitem to copy it back; drag text/files out to\nanother app (images: drag/copy as thumbnails only). File shelf parks\nreferenced paths only; paths are saved in\n%APPDATA%\\OnyxNotch\\shelf.ini. No search box:\nthe notch must not steal keyboard focus, so\nfilters are mouse-click chips only.\n\nHome page: tray or gear menu, Customize Home page,\nopens an edit list on HOME (mouse clicks only):\ncheck up to 6 of the 11 cards (System, Calendar,\nClock, Media, Battery, Network, Clipboard, Shelf,\nTimer, Notes, Screen),\narrows reorder them, Done exits. Edit mode itself\nis not saved; the selection and order are saved in\nsettings.ini as home_cards= and home_order=.\n\nv8-continued: TIMER tab (stopwatch, countdown, focus;\npresets and steps, mouse only, in-memory, no sound),\nNOTES tab (local notes.ini; blank or from clipboard;\nedited in Notepad, never typed in the notch), SCREEN\ntab (exe names only, screentime.ini, OFF by default),\nMEDIA sound/mic row + fixed 150px scrolling mixer (4 visible rows; Media body 380px, unified max) and SYSTEM brightness (WMI)\n(unavailable on displays WMI cannot control), clipboard\npersistence (OFF by default, text only, DPAPI file\nclipboard.dat), image drag-out (thumbnails only).\nPrivacy dots and Bluetooth battery were CUT: no\nreliable public native signal exists for either, and\nfaking them would be worse than omitting them.",
                 L"OnyxNotch", MB_OK | MB_ICONINFORMATION);
             break;
         }

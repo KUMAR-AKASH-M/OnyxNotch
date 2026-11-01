@@ -654,18 +654,39 @@ now a 2x2 grid — Battery, Network, Performance, BRIGHTNESS
 (the brightness card moved into the vacated grid slot, with
 its - / + / Refresh buttons at the bottom of that card) —
 and its subtitle is now "Power · Network · Display". The
-MEDIA tab now holds, below the track card: a SOUND card, a
-MIC card, and a per-app MIXER. Order on the tab is SOUND,
-then MIC, then MIXER, top to bottom.
+MEDIA tab now holds, below the track card: a SOUND/MIC row
+(two half-width cards side by side), then a fixed-height
+per-app MIXER. Order on the tab is track, SOUND + MIC,
+then MIXER, top to bottom.
 
-SOUND card: the system wave-out volume % (big), the
-default output device's friendly name (small muted line),
-a balance indicator ("Balance L x% · R x%") when the
-endpoint has exactly 2 channels, a clickable volume bar
-(clicking the track sets the volume proportionally to the
-click position, in addition to the - / + buttons stepping
-5 and Mute remembering the pre-mute level), and the same
-- / + / Mute buttons as before. Volume is sampled every
+v8-ui-fix (compact Media): the old stacked SOUND (176px)
++ MIC (110px) + growing MIXER made MEDIA 520px tall with
+no sessions and 730px with 8 sessions, and unified tab
+size stretched EVERY tab to that height. The fix shrinks
+MEDIA itself, it does not abandon unification: the track
+card is tightened to 96px, SOUND and MIC share one 110px
+row, and the MIXER is fixed at 150px with 4 visible rows
+and mouse-wheel scrolling — so MEDIA body is 96 + 12 +
+110 + 12 + 150 = 380px at 96 DPI whatever the session
+count is. The new unified max is therefore 380px (MEDIA),
+down from 520px (no sessions) and 730px (8 sessions) —
+every tab shrinks by 140px / 350px respectively. TIMER
+(256 -> 226px), NOTES (314 -> 254px, 6 visible rows) and
+SCREEN (302 -> 242px, 6 visible rows) were also compacted
+in the same pass; Clipboard/Shelf keep their 8-row lists
+(332px / 302px) and were deliberately left alone.
+
+SOUND card (left half of the sound/mic row): the system
+wave-out volume % (big), the default output device's
+friendly name on the title row (right of the SOUND label,
+truncated), a clickable volume bar (clicking the track
+sets the volume proportionally to the click position, in
+addition to the - / + buttons stepping 5 and Mute
+remembering the pre-mute level). The balance indicator
+that used to sit under the device name was dropped from
+the card in the compaction — the half-width card has no
+room for it without cramping, and it was an indicator
+only, never a control. Volume is sampled every
 second on the existing timer regardless of the stats
 toggle, because the card no longer lives on the stats
 tab. Changing the volume changes the SYSTEM wave volume,
@@ -682,15 +703,19 @@ this is volume control only.
 MIXER card: up to 8 active audio sessions, enumerated
 via Core Audio (`IMMDeviceEnumerator` +
 `IAudioSessionManager2` + `IAudioSessionEnumerator`, volume
-via `ISimpleAudioVolume` per session). Each row shows the
+via `ISimpleAudioVolume` per session), shown 4 at a time
+in a fixed-height card. Each row shows the
 process exe name only (never a window title), its volume
 %, and - / + (step 5) and Mute/Unmute buttons that affect
-that session only. Sessions are refreshed when you switch
+that session only. Scroll the rest with the mouse wheel
+(a "Scroll with mouse wheel" hint appears on the card's
+title row only when more than 4 sessions exist); the
+panel size never changes with the session count, and
+entering Media or pressing Refresh no longer resizes
+anything. Sessions are refreshed when you switch
 to the Media tab and when you press the mixer's Refresh
-button — never per paint frame, so COM cost stays bounded
-— and the Media tab height follows the session count (the
-panel resizes when the count changes on entering Media or
-on Refresh). If no app is playing audio, the card says
+button — never per paint frame, so COM cost stays bounded.
+If no app is playing audio, the card says
 "No apps playing audio" and invents no sessions. System
 sounds and OnyxNotch itself are never listed, and two
 sessions of the same exe are shown once. Session volumes
@@ -700,9 +725,9 @@ keys were added for them.
 Output-device switching is deliberately NOT offered:
 there is no documented public API to set the default
 audio device (`IPolicyConfig` is undocumented), so the
-device name is shown and never switched. Balance is an
-indicator only, not a control: it falls out of the same
-endpoint-volume read as the device name, and no separate
+device name is shown and never switched. Balance was an
+indicator only, not a control, and was dropped from the
+SOUND card in the compaction (see above); no separate
 balance subsystem was built in this pass.
 
 Consequence of the move, stated plainly: volume, mic and
@@ -902,6 +927,15 @@ claimed as verified until Kumar builds and runs it:
   mixer height changes inside unified tab size, and the
   Media-tab gating consequence (sound hidden when Media
   controls are off) are all unverified.
+- v8-ui-fix (this change) is likewise uncompiled and
+  untested on Windows: the compact Media layout (track
+  96px, SOUND/MIC side by side, fixed 150px mixer with 4
+  visible rows), mixer mouse-wheel scrolling and its
+  title-row hint, the dropped balance line, the compact
+  Timer (226px) / Notes (254px, 6 rows) / Screen (242px,
+  6 rows) layouts, scroll clamping after Refresh, and
+  the new unified max (380px Media body) on a real
+  display at 96 DPI and at other DPIs are all unverified.
 
 # OnyxNotch v6 — Card + dock dashboard look, existing data only
 
