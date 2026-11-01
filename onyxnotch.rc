@@ -1,0 +1,4 @@
+// OnyxNotch v2 resource script: custom black-pill tray/app icon.
+// ID 100 must match IDI_ONYXNOTCH_ICON in main.cpp.
+#include <windows.h>
+100 ICON "onyxnotch.ico"

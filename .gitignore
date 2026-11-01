@@ -1,6 +1,8 @@
 OnyxNotch.exe
 *.obj
-*.pdb
+*.res
 *.ilk
-*.exp
-*.lib
+*.pdb
+*.log
+*.user
+.vs/
