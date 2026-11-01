@@ -1,4 +1,17 @@
-// OnyxNotch v2 - Mac-style notch for Windows, native Win32 C++.
+// OnyxNotch v3 - Mac-style notch for Windows, native Win32 C++.
+// v3 changes over v2 (v2 behaviour is otherwise intact):
+//  1. Smooth expand/collapse animation (~220 ms, ease-out cubic),
+//     driven by a short-lived per-notch timer that stops when the
+//     animation finishes. Turning the Animations tray tick off
+//     restores the instant v2 behaviour everywhere.
+//  2. Media-button hover and pressed highlights, plus a subtle
+//     outline when the mouse is over the notch. Hit-test rects
+//     are unchanged; only the drawing changes.
+//  3. Anti-aliased text (ClearType font quality) and the same
+//     rounded-corner region as v2. No fade/slide-in on first show:
+//     that would need a layered-window rewrite, so first show
+//     stays instant (see README). No new threads, no polling,
+//     no network, no new dependencies.
 // No Electron, no Python, no .NET runtime. One .exe, one source file
 // (plus a small .rc/.ico for the custom tray/app icon).
 // Build on Windows: run build.bat in a Visual Studio Developer Command Prompt.
@@ -53,6 +66,8 @@
 #define WM_TRAY                 (WM_APP + 1)
 #define WM_APP_REBUILD          (WM_APP + 2)
 #define ID_TIMER_CLOCK          1
+#define ID_TIMER_ANIM           2
+#define ID_TRAY_ANIMATIONS      1013
 #define ID_TRAY_QUIT            1001
 #define ID_TRAY_SIZE_S          1002
 #define ID_TRAY_SIZE_M          1003
@@ -79,6 +94,7 @@ static bool g_hideOnFullscreen = false; // opt-in
 static bool g_mediaEnabled = false;     // opt-in
 static bool g_widgetStats = false;      // opt-in
 static bool g_widgetCalendar = false;   // opt-in
+static bool g_animations = true;        // v3: ON by default, tray tick
 
 static HWND g_managerHwnd = NULL;
 static NOTIFYICONDATAW g_nid = { 0 };
@@ -109,6 +125,19 @@ struct Notch {
     bool pinned = false;
     bool trackingLeave = false;
     bool hiddenByFullscreen = false;
+    // v3 animation / hover state. paintExpanded is what PaintNotch
+    // draws: it becomes true as soon as an expand starts, and only
+    // becomes false when a collapse animation finishes, so content
+    // does not pop out mid-collapse. hoverBtn/pressedBtn are -1 for
+    // none, else 0 = Prev, 1 = Play/Pause, 2 = Next.
+    bool paintExpanded = false;
+    bool hoverNotch = false;
+    int hoverBtn = -1;
+    int pressedBtn = -1;
+    bool animActive = false;
+    ULONGLONG animStartTick = 0;
+    int animFromW = 0, animFromH = 0;
+    int animToW = 0, animToH = 0;
 };
 
 static std::vector<Notch*> g_notches;
@@ -204,7 +233,7 @@ static void ApplyRegion(HWND hwnd, int w, int h, bool expanded)
     SetWindowRgn(hwnd, rgn, TRUE); // SetWindowRgn takes ownership of rgn.
 }
 
-static void ApplyNotchSize(Notch* n, bool expanded)
+static void ApplyNotchSizeInstant(Notch* n, bool expanded)
 {
     if (!n || !n->hwnd) return;
     int dpi = n->dpi;
@@ -224,12 +253,110 @@ static void ApplyNotchSize(Notch* n, bool expanded)
     ApplyRegion(n->hwnd, w, h, expanded);
 }
 
+// v3 animation: 220 ms, ease-out cubic, ~16 ms frames. The timer is
+// per-notch, started only for a size change and killed on finish,
+// so an idle notch has no animation timer at all.
+static const int kAnimDurationMs = 220;
+static const int kAnimIntervalMs = 16;
+
+static void TargetSizeFor(Notch* n, bool expanded, int& outW, int& outH)
+{
+    int dpi = n->dpi;
+    outW = expanded ? Scale(340, dpi) : CollapsedWidth(dpi);
+    if (expanded) {
+        Layout L = ComputeLayout(n, outW);
+        outH = L.totalH;
+    } else {
+        outH = Scale(34, dpi);
+    }
+}
+
+static void StopAnimation(Notch* n)
+{
+    if (!n) return;
+    if (n->hwnd) KillTimer(n->hwnd, ID_TIMER_ANIM);
+    n->animActive = false;
+}
+
+// Animate (or instantly apply, when animations are off) to the size
+// for targetExpanded. n->expanded must already be targetExpanded
+// when this is called from SetNotchExpanded; for size-only changes
+// (tray Size, widget toggles, DPI) it is already correct too.
+static void ApplyTargetSize(Notch* n, bool targetExpanded)
+{
+    if (!n || !n->hwnd) return;
+    int toW, toH;
+    TargetSizeFor(n, targetExpanded, toW, toH);
+    if (!g_animations) {
+        StopAnimation(n);
+        n->paintExpanded = targetExpanded;
+        ApplyNotchSizeInstant(n, targetExpanded);
+        InvalidateRect(n->hwnd, NULL, TRUE);
+        return;
+    }
+    RECT cur = { 0, 0, 0, 0 };
+    GetWindowRect(n->hwnd, &cur);
+    int fromW = cur.right - cur.left;
+    int fromH = cur.bottom - cur.top;
+    if (fromW == toW && fromH == toH) {
+        StopAnimation(n);
+        n->paintExpanded = targetExpanded;
+        ApplyNotchSizeInstant(n, targetExpanded);
+        InvalidateRect(n->hwnd, NULL, TRUE);
+        return;
+    }
+    if (targetExpanded) n->paintExpanded = true; // collapsing keeps
+    // paintExpanded true until the collapse finishes (see Step).
+    n->animFromW = fromW; n->animFromH = fromH;
+    n->animToW = toW; n->animToH = toH;
+    n->animStartTick = GetTickCount64();
+    n->animActive = true;
+    SetTimer(n->hwnd, ID_TIMER_ANIM, kAnimIntervalMs, NULL);
+}
+
+static void StepAnimation(Notch* n)
+{
+    if (!n || !n->hwnd || !n->animActive) return;
+    ULONGLONG elapsed = GetTickCount64() - n->animStartTick;
+    if (elapsed >= (ULONGLONG)kAnimDurationMs) {
+        // Finish exactly on target: snap, then switch painting to
+        // the final state (this is where a collapse stops drawing
+        // expanded content).
+        StopAnimation(n);
+        n->paintExpanded = n->expanded;
+        ApplyNotchSizeInstant(n, n->expanded);
+        InvalidateRect(n->hwnd, NULL, TRUE);
+        return;
+    }
+    double t = (double)elapsed / (double)kAnimDurationMs;
+    double e = 1.0 - (1.0 - t) * (1.0 - t) * (1.0 - t); // ease-out cubic
+    int w = (int)(n->animFromW + (n->animToW - n->animFromW) * e + 0.5);
+    int h = (int)(n->animFromH + (n->animToH - n->animFromH) * e + 0.5);
+    if (w < 1) w = 1;
+    if (h < 1) h = 1;
+    int workW = n->workRect.right - n->workRect.left;
+    int x = n->workRect.left + (workW - w) / 2;
+    if (x < n->workRect.left) x = n->workRect.left;
+    SetWindowPos(n->hwnd, HWND_TOPMOST, x, n->workRect.top, w, h,
+                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    // Region follows the current height, so the shape stays rounded
+    // while tall and matches the v2 collapsed shape once short.
+    ApplyRegion(n->hwnd, w, h, h > Scale(34, n->dpi) + 2);
+    InvalidateRect(n->hwnd, NULL, FALSE);
+    UpdateWindow(n->hwnd);
+}
+
 static void SetNotchExpanded(Notch* n, bool expanded)
 {
-    if (!n || n->expanded == expanded) return;
+    if (!n) return;
+    // Already at target and not animating: nothing to do. Already
+    // animating to this target: let it finish there (pinning
+    // mid-expand settles at expanded; hovering away mid-expand
+    // is handled by the caller changing the target instead).
+    if (n->expanded == expanded && !n->animActive) return;
+    if (n->expanded == expanded && n->animActive) return;
     n->expanded = expanded;
-    ApplyNotchSize(n, expanded);
-    InvalidateRect(n->hwnd, NULL, TRUE);
+    ApplyTargetSize(n, expanded);
 }
 
 static void RecreateFonts(Notch* n)
@@ -240,16 +367,16 @@ static void RecreateFonts(Notch* n)
     if (n->hFontTiny) DeleteObject(n->hFontTiny);
     int dpi = n->dpi;
     n->hFontClock = CreateFontW(Scale(20, dpi), 0, 0, 0, FW_MEDIUM, FALSE, FALSE, FALSE,
-        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
         DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
     n->hFontBig = CreateFontW(Scale(36, dpi), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
-        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
         DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
     n->hFontSmall = CreateFontW(Scale(17, dpi), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
         DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
     n->hFontTiny = CreateFontW(Scale(14, dpi), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
         DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
 }
 
@@ -292,6 +419,7 @@ static void ShowTrayMenu(HWND hwnd)
     AppendCheck(menu, ID_TRAY_MEDIA, L"Media controls", g_mediaEnabled);
     AppendCheck(menu, ID_TRAY_WIDGET_STATS, L"Widget: System stats", g_widgetStats);
     AppendCheck(menu, ID_TRAY_WIDGET_CALENDAR, L"Widget: Calendar", g_widgetCalendar);
+    AppendCheck(menu, ID_TRAY_ANIMATIONS, L"Animations", g_animations);
     if (g_mediaEnabled) {
         AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
         AppendMenuW(menu, MF_STRING, ID_TRAY_MEDIA_PREV, L"Media: Previous track");
@@ -452,7 +580,7 @@ static void UpdateFullscreenAndVisibility()
         } else if (!fs && n->hiddenByFullscreen) {
             n->hiddenByFullscreen = false;
             ShowWindow(n->hwnd, SW_SHOWNOACTIVATE);
-            ApplyNotchSize(n, n->expanded);
+            ApplyTargetSize(n, n->expanded);
         }
     }
 }
@@ -470,8 +598,7 @@ static void ApplySizeToAll()
 {
     for (size_t i = 0; i < g_notches.size(); i++) {
         if (g_notches[i]->hwnd && !g_notches[i]->hiddenByFullscreen) {
-            ApplyNotchSize(g_notches[i], g_notches[i]->expanded);
-            InvalidateRect(g_notches[i]->hwnd, NULL, TRUE);
+            ApplyTargetSize(g_notches[i], g_notches[i]->expanded);
         }
     }
 }
@@ -549,16 +676,33 @@ static void RequestRebuild(HINSTANCE hInst)
 // ---------------------------------------------------------------------------
 // Notch window procedure.
 // ---------------------------------------------------------------------------
-static bool MediaButtonHit(Notch* n, int px, int py, WORD& vkOut)
+// Media-button hit test. Returns -1 for none, else 0/1/2.
+// usePaint=true matches what is drawn (paintExpanded, so buttons
+// still show during a collapse animation); usePaint=false matches
+// click semantics (expanded only, so a click during a collapse
+// toggles pin instead of firing a media key). Rects are identical
+// in both cases: the layout is shared, so hover, pressed and click
+// can never disagree about where a button is.
+static int MediaButtonIndexAt(Notch* n, int px, int py, bool usePaint)
 {
-    if (!g_mediaEnabled || !n->expanded) return false;
+    if (!g_mediaEnabled) return -1;
+    if (usePaint ? !n->paintExpanded : !n->expanded) return -1;
     RECT rc; GetClientRect(n->hwnd, &rc);
     Layout L = ComputeLayout(n, rc.right);
-    if (py < L.mediaButtonY || py >= L.mediaButtonY + L.mediaButtonH) return false;
-    if (px >= L.btnPrev.left && px < L.btnPrev.right) { vkOut = VK_MEDIA_PREV_TRACK; return true; }
-    if (px >= L.btnPlay.left && px < L.btnPlay.right) { vkOut = VK_MEDIA_PLAY_PAUSE; return true; }
-    if (px >= L.btnNext.left && px < L.btnNext.right) { vkOut = VK_MEDIA_NEXT_TRACK; return true; }
-    return false;
+    if (py < L.mediaButtonY || py >= L.mediaButtonY + L.mediaButtonH) return -1;
+    if (px >= L.btnPrev.left && px < L.btnPrev.right) return 0;
+    if (px >= L.btnPlay.left && px < L.btnPlay.right) return 1;
+    if (px >= L.btnNext.left && px < L.btnNext.right) return 2;
+    return -1;
+}
+
+static bool MediaButtonHit(Notch* n, int px, int py, WORD& vkOut)
+{
+    static const WORD kVk[3] = { VK_MEDIA_PREV_TRACK, VK_MEDIA_PLAY_PAUSE, VK_MEDIA_NEXT_TRACK };
+    int idx = MediaButtonIndexAt(n, px, py, false);
+    if (idx < 0) return false;
+    vkOut = kVk[idx];
+    return true;
 }
 
 static void PaintNotch(Notch* n, HDC hdc)
@@ -570,7 +714,10 @@ static void PaintNotch(Notch* n, HDC hdc)
 
     wchar_t clockText[32]; FormatClock(clockText, 32);
     int dpi = n->dpi;
-    if (!n->expanded) {
+    // v3: paint by paintExpanded, not expanded, so a collapse
+    // animation keeps drawing expanded content until it finishes
+    // instead of popping to the collapsed clock on the first frame.
+    if (!n->paintExpanded) {
         DrawCenteredText(hdc, n->hFontClock, clockText, 0, 0, rc.right, rc.bottom, RGB(255, 255, 255));
         return;
     }
@@ -587,16 +734,23 @@ static void PaintNotch(Notch* n, HDC hdc)
                          0, L.mediaLabelY, rc.right, Scale(20, dpi), RGB(170, 170, 170));
         // Buttons: rounded dark-grey boxes with white vector glyphs
         // (no text labels, no font dependence, no image files).
-        // The hit test in MediaButtonHit uses exactly these rects,
-        // so only the drawing changes here, not the clickable area.
-        HBRUSH btnBrush = CreateSolidBrush(RGB(38, 38, 38));
+        // v3 hover/pressed polish: hover lightens a button, pressed
+        // lightens it further. Colours are the only change; the
+        // rects (and therefore the hit test) are untouched.
         HBRUSH glyphBrush = CreateSolidBrush(RGB(255, 255, 255));
         HPEN nullPen = (HPEN)GetStockObject(NULL_PEN);
         HPEN oldPen = (HPEN)SelectObject(hdc, nullPen);
-        HBRUSH oldBrush = (HBRUSH)SelectObject(hdc, btnBrush);
+        HBRUSH oldBrush = (HBRUSH)GetCurrentObject(hdc, OBJ_BRUSH);
         RECT btns[3] = { L.btnPrev, L.btnPlay, L.btnNext };
         for (int i = 0; i < 3; i++) {
+            COLORREF bg = RGB(38, 38, 38);
+            if (i == n->pressedBtn) bg = RGB(90, 90, 90);
+            else if (i == n->hoverBtn) bg = RGB(62, 62, 62);
+            HBRUSH btnBrush = CreateSolidBrush(bg);
+            HBRUSH prevBrush = (HBRUSH)SelectObject(hdc, btnBrush);
             RoundRect(hdc, btns[i].left, btns[i].top, btns[i].right, btns[i].bottom, 8, 8);
+            SelectObject(hdc, prevBrush);
+            DeleteObject(btnBrush);
         }
         SelectObject(hdc, glyphBrush);
         for (int i = 0; i < 3; i++) {
@@ -647,7 +801,6 @@ static void PaintNotch(Notch* n, HDC hdc)
         }
         SelectObject(hdc, oldPen);
         SelectObject(hdc, oldBrush);
-        DeleteObject(btnBrush);
         DeleteObject(glyphBrush);
     }
 
@@ -693,14 +846,29 @@ static void PaintNotch(Notch* n, HDC hdc)
         }
     }
 
-    DrawCenteredText(hdc, n->hFontSmall, L"OnyxNotch v2  |  Click to pin",
+    DrawCenteredText(hdc, n->hFontSmall, L"OnyxNotch v3  |  Click to pin",
                      0, L.footerY, rc.right, Scale(20, dpi), RGB(140, 140, 140));
+    // v3 hover polish for the whole notch (which is itself clickable
+    // to pin): a subtle 1 px outline while the mouse is over it.
+    if (n->hoverNotch) {
+        HPEN outlinePen = CreatePen(PS_SOLID, 1, RGB(70, 70, 70));
+        HPEN oldPen2 = (HPEN)SelectObject(hdc, outlinePen);
+        HBRUSH nullBrush = (HBRUSH)GetStockObject(NULL_BRUSH);
+        HBRUSH oldBrush2 = (HBRUSH)SelectObject(hdc, nullBrush);
+        RoundRect(hdc, 0, 0, rc.right, rc.bottom, 28, 28);
+        SelectObject(hdc, oldPen2);
+        SelectObject(hdc, oldBrush2);
+        DeleteObject(outlinePen);
+    }
 }
 
 static LRESULT CALLBACK NotchWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     Notch* n = FindNotch(hwnd);
     switch (msg) {
+    case WM_TIMER:
+        if (wParam == ID_TIMER_ANIM && n) StepAnimation(n);
+        return 0;
     case WM_CREATE: {
         LPCREATESTRUCT cs = (LPCREATESTRUCT)lParam;
         Notch* created = (Notch*)cs->lpCreateParams;
@@ -712,7 +880,9 @@ static LRESULT CALLBACK NotchWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             bool already = false;
             for (size_t i = 0; i < g_notches.size(); i++) if (g_notches[i] == created) already = true;
             if (!already) g_notches.push_back(created);
-            ApplyNotchSize(created, false);
+            // First show is instant on purpose (v3): no fade/slide-in,
+            // which would need a layered-window rewrite (see README).
+            ApplyNotchSizeInstant(created, false);
         }
         return 0;
     }
@@ -720,8 +890,7 @@ static LRESULT CALLBACK NotchWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         if (n) {
             n->dpi = HIWORD(wParam);
             RecreateFonts(n);
-            ApplyNotchSize(n, n->expanded);
-            InvalidateRect(hwnd, NULL, TRUE);
+            ApplyTargetSize(n, n->expanded);
         }
         return 0;
     }
@@ -729,6 +898,15 @@ static LRESULT CALLBACK NotchWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         if (g_managerHwnd) PostMessage(g_managerHwnd, WM_APP_REBUILD, 0, 0);
         return 0;
     case WM_MOUSEMOVE: {
+        if (n) {
+            n->hoverNotch = true;
+            POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+            int idx = MediaButtonIndexAt(n, pt.x, pt.y, true);
+            if (idx != n->hoverBtn) {
+                n->hoverBtn = idx;
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
+        }
         if (n && !n->expanded) SetNotchExpanded(n, true);
         if (n && !n->trackingLeave) {
             TRACKMOUSEEVENT tme = { 0 };
@@ -743,6 +921,9 @@ static LRESULT CALLBACK NotchWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
     case WM_MOUSELEAVE:
         if (n) {
             n->trackingLeave = false;
+            n->hoverNotch = false;
+            n->hoverBtn = -1;
+            n->pressedBtn = -1;
             if (n->expanded && !n->pinned) SetNotchExpanded(n, false);
         }
         return 0;
@@ -751,6 +932,8 @@ static LRESULT CALLBACK NotchWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
         WORD vk = 0;
         if (MediaButtonHit(n, pt.x, pt.y, vk)) {
+            n->pressedBtn = MediaButtonIndexAt(n, pt.x, pt.y, false);
+            InvalidateRect(hwnd, NULL, FALSE);
             SendMediaKey(vk);
             return 0;
         }
@@ -758,6 +941,12 @@ static LRESULT CALLBACK NotchWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         SetNotchExpanded(n, n->pinned);
         return 0;
     }
+    case WM_LBUTTONUP:
+        if (n && n->pressedBtn >= 0) {
+            n->pressedBtn = -1;
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        return 0;
     case WM_PAINT: {
         PAINTSTRUCT ps;
         HDC hdc = BeginPaint(hwnd, &ps);
@@ -769,6 +958,7 @@ static LRESULT CALLBACK NotchWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         return 1;
     case WM_DESTROY: {
         if (n) {
+            KillTimer(hwnd, ID_TIMER_ANIM);
             if (n->hFontClock) DeleteObject(n->hFontClock);
             if (n->hFontBig) DeleteObject(n->hFontBig);
             if (n->hFontSmall) DeleteObject(n->hFontSmall);
@@ -847,12 +1037,31 @@ static LRESULT CALLBACK ManagerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             g_widgetCalendar = !g_widgetCalendar;
             ApplySizeToAll();
             break;
+        case ID_TRAY_ANIMATIONS:
+            g_animations = !g_animations;
+            if (!g_animations) {
+                // Stop every in-progress animation instantly and
+                // snap each notch to its final v2 size at once.
+                for (size_t i = 0; i < g_notches.size(); i++) {
+                    Notch* an = g_notches[i];
+                    // Hidden-by-fullscreen notches stay hidden; their
+                    // size is snapped on restore instead (which would
+                    // otherwise un-hide them here via SHOWWINDOW).
+                    if (an && an->hwnd && !an->hiddenByFullscreen) {
+                        StopAnimation(an);
+                        an->paintExpanded = an->expanded;
+                        ApplyNotchSizeInstant(an, an->expanded);
+                        InvalidateRect(an->hwnd, NULL, TRUE);
+                    }
+                }
+            }
+            break;
         case ID_TRAY_MEDIA_PREV: SendMediaKey(VK_MEDIA_PREV_TRACK); break;
         case ID_TRAY_MEDIA_PLAYPAUSE: SendMediaKey(VK_MEDIA_PLAY_PAUSE); break;
         case ID_TRAY_MEDIA_NEXT: SendMediaKey(VK_MEDIA_NEXT_TRACK); break;
         case ID_TRAY_ABOUT:
             MessageBoxW(hwnd,
-                L"OnyxNotch v2\nMac-style notch for Windows.\nNative Win32 C++, no runtime, low memory.\n\nv2: one notch per monitor, hide on fullscreen (opt-in),\ncustom icon, media controls (opt-in), system-stats and\ncalendar widgets (each opt-in).",
+                L"OnyxNotch v3\nMac-style notch for Windows.\nNative Win32 C++, no runtime, low memory.\n\nv3: smooth expand/collapse animation (tray tick,\non by default), media-button hover/pressed states,\nanti-aliased text. v2 features unchanged.",
                 L"OnyxNotch", MB_OK | MB_ICONINFORMATION);
             break;
         }

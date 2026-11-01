@@ -1,4 +1,4 @@
-# OnyxNotch v2
+# OnyxNotch v3
 
 Mac-style notch for Windows, in native C++ Win32. One source file, one
 `.exe`, no Electron, no Python, no .NET runtime.
@@ -84,6 +84,66 @@ is off, so idle memory stays low when they are off.
 The v1 expanded view (large clock, date, battery) stays always on,
 whether or not any widget is enabled.
 
+
+## What's new in v3 — Animations and polish only
+
+No new features, no changed defaults except the Animations tick
+itself. Everything from v2 (multi-monitor, hide-on-fullscreen,
+custom icon, media controls, widgets) works exactly as before.
+
+### 1. Smooth expand/collapse — 220 ms, ease-out
+Expanding and collapsing now animates the notch height (and width,
+when it changes) over about 220 ms with an ease-out cubic curve,
+at roughly 16 ms per frame. The animation timer is per-notch,
+starts only for a size change, and is killed the moment the
+animation finishes — an idle notch has no animation timer, so
+idle cost is unchanged from v2.
+
+Interrupt behaviour, by design:
+- Hovering away mid-expand reverses smoothly from the current
+  size back to collapsed — it does not snap or restart from
+  full size.
+- Clicking to pin mid-expand settles at the expanded size.
+- Unpinning (or moving away when unpinned) animates back to
+  collapsed, and the expanded content keeps drawing until the
+  collapse finishes, so it does not pop to the clock on the
+  first frame.
+- Tray size changes and widget/media toggles animate the same
+  way, from the current size to the new size.
+
+### 2. Button hover / pressed states
+Media buttons now highlight on hover (lighter grey) and again on
+press, so it is obvious what you are about to click. The whole
+notch (which is itself clickable to pin) also gets a subtle
+1 px outline while the mouse is over it. Clickable areas are
+unchanged: hover, pressed and click all use the same shared
+layout rects as v2, so a button never looks clickable somewhere
+it is not.
+
+### 3. Visual polish, low-cost only
+- Text is now anti-aliased (ClearType font quality on all four
+  notch fonts) instead of the default quality.
+- Rounded corners are the same v2 region shape, applied frame by
+  frame during animation so the shape stays rounded while tall
+  and matches the v2 collapsed shape once short.
+- No fade/slide-in on first show, deliberately: that would need
+  a layered-window rewrite (alpha blending on top of the custom
+  region), which risks breaking the region and focus behaviour
+  the notch depends on. First show stays instant, exactly as
+  in v2. If a fade is wanted later, it should be done as its
+  own change with a layered-window test, not bundled here.
+
+### 4. Animations toggle — ON by default
+Right-click the tray icon and tick/untick **Animations**. Turning
+it off stops every in-progress animation instantly, snaps each
+notch to its final size at once, and restores the instant v2
+expand/collapse behaviour everywhere — including tray size
+changes and widget/media toggles. Turning it back on re-enables
+animation for the next size change. There is no setting file:
+like the other v2 toggles, it resets to ON at each start.
+
+## Build (Windows) — unchanged from v2
+
 ## Build (Windows)
 
 1. Install Visual Studio with "Desktop development with C++"
@@ -126,6 +186,7 @@ folder (`Win + R`, type `shell:startup`).
 - Media controls (off by default)
 - Widget: System stats (off by default)
 - Widget: Calendar (off by default)
+- Animations (ON by default)
 - When media controls are on: Media: Previous track / Play / Pause /
   Next track
 - About, Quit
@@ -165,6 +226,30 @@ with `build.bat` on Windows and runs it:
   warn on first run. That is normal for a self-built unsigned app;
   code-signing is a paid certificate, not a code change.
 
+## Honest limits — v3 additions (not verified on Windows)
+
+- **Not compiled on Windows.** This Linux VM has no Windows
+  toolchain, so `cl`/`rc` were never run on the v3 code. The
+  changes are small and use only standard Win32 APIs
+  (`SetTimer`/`KillTimer`, `GetTickCount64`, `RoundRect`,
+  ClearType font quality), but a compile error is still
+  possible until the first Windows build.
+- **Animation smoothness is untested.** 220 ms / 16 ms frames
+  should feel smooth on a normal machine, but frame pacing,
+  flicker during animation, and behaviour on very high-DPI or
+  very slow machines have not been seen. If animation
+  flickers, turn **Animations** off in the tray and report it
+  — that restores v2 behaviour exactly.
+- **Hover/pressed states are untested on screen.** The colour
+  steps (normal 38, hover 62, pressed 90 grey) are chosen to be
+  visible against the black notch, but have not been seen on a
+  real display; they may need tuning.
+- **First-show fade is intentionally absent** (see v3 section 3).
+- **Idle memory under 10 MB is still a target, not a
+  measurement**, as in v2. The animation timer runs only
+  during a ~220 ms size change, so it should not change idle
+  memory, but measure it in Task Manager to confirm.
+
 ## Limitations carried over from v1
 
 - No notifications, calendar sync, or other networked widgets.
@@ -178,6 +263,9 @@ with `build.bat` on Windows and runs it:
   1-second timer, tray icon, battery via `GetSystemPowerStatus`,
   media keys, stats via `GetSystemTimes`/`GlobalMemoryStatusEx`,
   calendar grid.
+  v3 adds: per-notch animation timer (~220 ms, ease-out),
+  media-button hover/pressed states, notch hover outline,
+  ClearType fonts, and the Animations tray tick.
 - `build.bat` — MSVC build script (resource compile + compile/link).
 - `onyxnotch.rc` — resource script binding the icon (ID 100).
 - `onyxnotch.ico` — custom black-pill icon, 16/32/48 px, 32-bit.
