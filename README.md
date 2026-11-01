@@ -767,6 +767,17 @@ v8 now uses its own identical-layout `OnyxDropFiles` struct
 and `CopyClipItemBack` is forward-declared near the shelf
 forward declarations. No behaviour changed.
 
+Build fix 2 (2026-11-02, after the v8-continued push): the
+first v8-continued build failed with C2065
+`g_screenTimeEnabled` undeclared at main.cpp line 365.
+Cause: `HomeCardFeatureOn` (case 10, Screen card) reads that
+toggle, but the toggle was defined later in the file, in the
+screen-time section. Fix: the two v8-continued toggles
+(`g_screenTimeEnabled`, `g_keepClipboard`) were moved up to
+just before `HomeCardFeatureOn`, with a comment at the old
+site. No behaviour changed — same defaults, same settings
+keys.
+
 ### 8. Honest limits — v8 (not verified on Windows)
 
 v8 was written and reviewed in the Linux VM, which has no

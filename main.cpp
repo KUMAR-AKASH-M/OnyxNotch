@@ -349,6 +349,10 @@ static const int kHomeCardCount = 11;
 static int g_homeOrder[11] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
 static bool g_homeSel[11] = { true, true, true, true, true, true, false, false, false, false, false };
 static bool g_homeEdit = false;
+// v8-continued toggles, defined here because HomeCardFeatureOn
+// below reads g_screenTimeEnabled (C2065 if defined later).
+static bool g_screenTimeEnabled = false;
+static bool g_keepClipboard = false;
 static bool HomeCardFeatureOn(int id)
 {
     switch (id) {
@@ -519,8 +523,7 @@ static std::vector<NoteItem> g_notes;
 struct ScreenApp { std::wstring exe; ULONGLONG seconds = 0; };
 static std::vector<ScreenApp> g_screenApps;
 static wchar_t g_screenDay[16] = { 0 };
-static bool g_screenTimeEnabled = false;
-static bool g_keepClipboard = false;
+// v8-continued toggles moved up: see definitions before HomeCardFeatureOn.
 static ULONGLONG ScreenTotalSeconds()
 {
     ULONGLONG t = 0;
