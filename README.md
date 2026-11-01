@@ -647,28 +647,82 @@ ignored, at most 64 apps), and reset at local midnight. The
 tab's empty state names both the exe-only rule and the
 file, so the recording behaviour is visible in the app.
 
-#### 6.4 SYSTEM tab: volume buttons and brightness
+#### 6.4 Sound moved to MEDIA, plus new sound features (v8-sound)
 
-Volume was already read-only (wave-out level). It is now
-also adjustable: - and + buttons step the SYSTEM wave-out
-volume by 5 (not a per-app volume), and Mute remembers the
-pre-mute level and restores it on Unmute. Changing the
-volume changes the system volume — that is the point of
-the buttons, and it is stated here and in the tab so it is
-never a surprise.
+The VOLUME card has moved from SYSTEM to MEDIA. SYSTEM is
+now a 2x2 grid — Battery, Network, Performance, BRIGHTNESS
+(the brightness card moved into the vacated grid slot, with
+its - / + / Refresh buttons at the bottom of that card) —
+and its subtitle is now "Power · Network · Display". The
+MEDIA tab now holds, below the track card: a SOUND card, a
+MIC card, and a per-app MIXER. Order on the tab is SOUND,
+then MIC, then MIXER, top to bottom.
 
-Brightness uses native WMI (`ROOT\WMI`,
-`WmiMonitorBrightness` / `WmiMonitorBrightnessMethods`) for
-internal displays, with - / + buttons stepping 10 and a
-Refresh button. Brightness is refreshed when you switch to
-the SYSTEM tab and when you press Refresh or a step button
-— never per paint frame, so a slow WMI call cannot stall
-every frame. If WMI finds no controllable display, the card
-says "Brightness control unavailable on this display"
-instead of showing a fake slider. No gamma-ramp hacks are
-used. If WMI fails on a particular machine, the buttons do
-nothing harmful: they re-query and leave the card at
-Unavailable.
+SOUND card: the system wave-out volume % (big), the
+default output device's friendly name (small muted line),
+a balance indicator ("Balance L x% · R x%") when the
+endpoint has exactly 2 channels, a clickable volume bar
+(clicking the track sets the volume proportionally to the
+click position, in addition to the - / + buttons stepping
+5 and Mute remembering the pre-mute level), and the same
+- / + / Mute buttons as before. Volume is sampled every
+second on the existing timer regardless of the stats
+toggle, because the card no longer lives on the stats
+tab. Changing the volume changes the SYSTEM wave volume,
+not a per-app volume — that is the point of the buttons,
+and it is stated here and in the tab.
+
+MIC card: the default capture endpoint's master volume %
+with - / + (step 5) and Mute/Unmute, via
+`IAudioEndpointVolume`. If no capture device exists, the
+card says "No microphone found" and draws no buttons. No
+mic monitoring, recording, or loopback capture is done —
+this is volume control only.
+
+MIXER card: up to 8 active audio sessions, enumerated
+via Core Audio (`IMMDeviceEnumerator` +
+`IAudioSessionManager2` + `IAudioSessionEnumerator`, volume
+via `ISimpleAudioVolume` per session). Each row shows the
+process exe name only (never a window title), its volume
+%, and - / + (step 5) and Mute/Unmute buttons that affect
+that session only. Sessions are refreshed when you switch
+to the Media tab and when you press the mixer's Refresh
+button — never per paint frame, so COM cost stays bounded
+— and the Media tab height follows the session count (the
+panel resizes when the count changes on entering Media or
+on Refresh). If no app is playing audio, the card says
+"No apps playing audio" and invents no sessions. System
+sounds and OnyxNotch itself are never listed, and two
+sessions of the same exe are shown once. Session volumes
+are system state, not OnyxNotch settings, so no settings
+keys were added for them.
+
+Output-device switching is deliberately NOT offered:
+there is no documented public API to set the default
+audio device (`IPolicyConfig` is undocumented), so the
+device name is shown and never switched. Balance is an
+indicator only, not a control: it falls out of the same
+endpoint-volume read as the device name, and no separate
+balance subsystem was built in this pass.
+
+Consequence of the move, stated plainly: volume, mic and
+mixer now live in the Media tab, so they are only
+reachable when Media controls are on (the Media tab is
+gated on `g_mediaEnabled`, as before). Turning Media
+controls off hides the sound controls along with the
+track controls. That is the trade-off of putting sound
+with music, and it is documented here rather than worked
+around by changing Media gating.
+
+Brightness is unchanged apart from its new grid slot:
+native WMI (`ROOT\WMI`, `WmiMonitorBrightness` /
+`WmiMonitorBrightnessMethods`) for internal displays,
+with - / + buttons stepping 10 and a Refresh button,
+refreshed when you switch to the SYSTEM tab and when you
+press Refresh or a step button — never per paint frame.
+If WMI finds no controllable display, the grid card says
+"Brightness unavailable / on this display" instead of
+showing a fake slider. No gamma-ramp hacks are used.
 
 #### 6.5 Clipboard persistence (OFF by default)
 
@@ -827,6 +881,17 @@ claimed as verified until Kumar builds and runs it:
   file handling), image drag-out to real target apps,
   unified tab size with 10 dock icons, and idle memory
   with the new tabs enabled.
+
+- v8-sound (this change) is likewise uncompiled and
+  untested on Windows: the SOUND card move (System grid
+  with Brightness, Media with SOUND/MIC/MIXER), the
+  clickable slider track, Core Audio session enumeration
+  and per-session volume/mute on real apps, the output
+  device friendly name, the 2-channel balance indicator,
+  mic volume/mute (including the No-microphone path),
+  mixer height changes inside unified tab size, and the
+  Media-tab gating consequence (sound hidden when Media
+  controls are off) are all unverified.
 
 # OnyxNotch v6 — Card + dock dashboard look, existing data only
 

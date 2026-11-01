@@ -250,6 +250,12 @@
 #include <ole2.h> // v8: DoDragDrop / IDataObject for drag-out
 #include <wbemidl.h> // v8-continued: WMI brightness (root\\WMI)
 #include <wincrypt.h> // v8-continued: DPAPI clipboard persistence
+#include <mmdeviceapi.h> // v8-sound: Core Audio device/session enumeration
+#include <endpointvolume.h> // v8-sound: IAudioEndpointVolume (mic, balance)
+#include <audiopolicy.h> // v8-sound: IAudioSessionManager2/Enumerator/Control2
+#include <audioclient.h> // v8-sound: ISimpleAudioVolume (per-app session volume)
+#include <propkey.h> // v8-sound: PROPVARIANT for the friendly name
+#include <functiondiscoverykeys_devpkey.h> // v8-sound: PKEY_Device_FriendlyName
 // v5-SMTC: C++/WinRT headers for the local SMTC session manager.
 // These need the Windows SDK with C++/WinRT and /std:c++17 (see
 // build.bat). No other WinRT API is used; there is no network use.
@@ -275,6 +281,7 @@
 #pragma comment(lib, "ole32.lib") // v8: DoDragDrop
 #pragma comment(lib, "wbemuuid.lib") // v8-continued: WMI brightness
 #pragma comment(lib, "crypt32.lib") // v8-continued: DPAPI
+#pragma comment(lib, "uuid.lib") // v8-sound: Core Audio CLSIDs/IIDs
 
 #define ID_TRAY_ICON            1
 #define WM_TRAY                 (WM_APP + 1)
@@ -537,6 +544,24 @@ static bool g_volMuted = false;
 static int g_volBeforeMute = 50;
 static bool g_brightOk = false;
 static int g_brightPercent = 0;
+// v8-sound: Core Audio state. Device name, mic and balance are
+// refreshed on entering Media (RefreshSoundDevices, after the
+// brightness code). Mixer rows are exe names only, never window
+// titles; session volumes are system state, never saved to
+// settings.ini. Defined here because ComputeLayoutForTab reads
+// g_mixSessions for the mixer row count.
+static wchar_t g_outDeviceName[128] = { 0 };
+static bool g_micOk = false;
+static int g_micPercent = 0;
+static bool g_micMuted = false;
+static bool g_balOk = false;
+static int g_balLeft = 0, g_balRight = 0;
+struct MixSession { std::wstring exe; int percent = 0; bool muted = false; };
+static std::vector<MixSession> g_mixSessions;
+static void RefreshSoundDevices();
+static void RefreshMixer();
+static void MixerSet(const std::wstring& exe, int newPercent, int newMute);
+static void MicSet(int newPercent, int newMute);
 
 // ---------------------------------------------------------------------------
 // v5-themes: theme table. Onyx reproduces the v4 colours exactly
@@ -1173,7 +1198,18 @@ struct Layout {
     RECT screenCard = { 0, 0, 0, 0 };
     int screenListY = 0, screenRowH = 0;
     RECT screenResetRect = { 0, 0, 0, 0 };
-    RECT sysExtraCard = { 0, 0, 0, 0 };
+    RECT mediaSoundCard = { 0, 0, 0, 0 };
+    RECT volTrackRect = { 0, 0, 0, 0 };
+    RECT micCard = { 0, 0, 0, 0 };
+    RECT micMinusRect = { 0, 0, 0, 0 };
+    RECT micPlusRect = { 0, 0, 0, 0 };
+    RECT micMuteRect = { 0, 0, 0, 0 };
+    RECT mixCard = { 0, 0, 0, 0 };
+    RECT mixRefreshRect = { 0, 0, 0, 0 };
+    int mixListY = 0, mixRowH = 0, mixRowCount = 0;
+    RECT mixRowMinusRects[8] = { { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 } };
+    RECT mixRowPlusRects[8] = { { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 } };
+    RECT mixRowMuteRects[8] = { { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 } };
     RECT volMinusRect = { 0, 0, 0, 0 };
     RECT volPlusRect = { 0, 0, 0, 0 };
     RECT volMuteRect = { 0, 0, 0, 0 };
@@ -1204,7 +1240,8 @@ struct Layout {
     RECT btnPrev = { 0, 0, 0, 0 };
     RECT btnPlay = { 0, 0, 0, 0 };
     RECT btnNext = { 0, 0, 0, 0 };
-    // SYSTEM cards: 0 Battery, 1 Network, 2 Performance, 3 Volume.
+    // SYSTEM cards: 0 Battery, 1 Network, 2 Performance, 3 Brightness.
+    // (v8-sound: VOLUME moved to the MEDIA tab as the SOUND card.)
     RECT sysCards[4] = { { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 } };
     // CLOCK cards.
     RECT clockCard = { 0, 0, 0, 0 };
@@ -1365,27 +1402,20 @@ static Layout ComputeLayoutForTab(Notch* n, int clientW, int tab)
             int y = L.bodyY + row * (cardH + gap);
             L.sysCards[i] = { x, y, x + cardW, y + cardH };
         }
-        // v8-continued: volume buttons inside the VOLUME card
-        // (sysCards[3]), and a full-width BRIGHTNESS card below
-        // the 2x2 grid. Bluetooth battery is NOT here: it was
-        // cut (see README), so no dead section is drawn for it.
+        // v8-sound: VOLUME is gone from SYSTEM. The 2x2 grid is
+        // now Battery, Network, Performance, BRIGHTNESS, with the
+        // brightness buttons inside the grid card at its bottom
+        // (the grid card fits minus/plus/refresh). Bluetooth
+        // battery is NOT here: it was cut (see README), so no
+        // dead section is drawn for it.
         {
-            RECT vc = L.sysCards[3];
-            int vy = vc.bottom - Scale(34, dpi);
-            L.volMinusRect = { vc.left + Scale(14, dpi), vy, vc.left + Scale(62, dpi), vy + Scale(26, dpi) };
-            L.volPlusRect = { vc.left + Scale(70, dpi), vy, vc.left + Scale(118, dpi), vy + Scale(26, dpi) };
-            L.volMuteRect = { vc.left + Scale(126, dpi), vy, vc.left + Scale(206, dpi), vy + Scale(26, dpi) };
+            RECT bc = L.sysCards[3];
+            int by = bc.bottom - Scale(34, dpi);
+            L.brightMinusRect = { bc.left + Scale(14, dpi), by, bc.left + Scale(62, dpi), by + Scale(26, dpi) };
+            L.brightPlusRect = { bc.left + Scale(70, dpi), by, bc.left + Scale(118, dpi), by + Scale(26, dpi) };
+            L.brightRefreshRect = { bc.left + Scale(126, dpi), by, bc.left + Scale(226, dpi), by + Scale(26, dpi) };
         }
-        int extraH = Scale(110, dpi);
-        int extraY = L.bodyY + 2 * cardH + gap + gap;
-        L.sysExtraCard = { margin, extraY, margin + bodyW, extraY + extraH };
-        {
-            int by = extraY + Scale(62, dpi);
-            L.brightMinusRect = { margin + Scale(14, dpi), by, margin + Scale(62, dpi), by + Scale(26, dpi) };
-            L.brightPlusRect = { margin + Scale(70, dpi), by, margin + Scale(118, dpi), by + Scale(26, dpi) };
-            L.brightRefreshRect = { margin + Scale(126, dpi), by, margin + Scale(226, dpi), by + Scale(26, dpi) };
-        }
-        bodyH = 2 * cardH + gap + gap + extraH;
+        bodyH = 2 * cardH + gap;
     } else if (effTab == kTabClock) {
         int clockW = bodyW * 55 / 100;
         int worldW = bodyW - clockW - gap;
@@ -1410,6 +1440,57 @@ static Layout ComputeLayoutForTab(Notch* n, int clientW, int tab)
         L.btnNext = { margin + 2 * bw + 2 * btnGap, L.mediaButtonY, margin + 3 * bw + 2 * btnGap, L.mediaButtonY + L.mediaButtonH };
         bodyH = L.mediaButtonY + L.mediaButtonH + Scale(12, dpi) - L.bodyY;
         L.mediaCard.bottom = L.mediaButtonY + L.mediaButtonH + Scale(12, dpi);
+        // v8-sound: SOUND card (moved from SYSTEM), then MIC, then
+        // the per-app mixer. Mixer rows follow the live session
+        // count (at least 1 row, for the "No apps" line), so
+        // MEDIA height follows the mixer; unified size takes the
+        // max over tabs, and entering Media re-applies the size
+        // (see the dock handler) when the count changed.
+        int soundH = Scale(176, dpi);
+        int soundY = L.mediaCard.bottom + gap;
+        L.mediaSoundCard = { margin, soundY, margin + bodyW, soundY + soundH };
+        {
+            int by = soundY + Scale(136, dpi);
+            L.volMinusRect = { margin + Scale(14, dpi), by, margin + Scale(62, dpi), by + Scale(26, dpi) };
+            L.volPlusRect = { margin + Scale(70, dpi), by, margin + Scale(118, dpi), by + Scale(26, dpi) };
+            L.volMuteRect = { margin + Scale(126, dpi), by, margin + Scale(206, dpi), by + Scale(26, dpi) };
+            L.volTrackRect = { margin + Scale(14, dpi), soundY + Scale(116, dpi), margin + bodyW - Scale(14, dpi), soundY + Scale(132, dpi) };
+        }
+        int micH = Scale(110, dpi);
+        int micY = soundY + soundH + gap;
+        L.micCard = { margin, micY, margin + bodyW, micY + micH };
+        {
+            int by = micY + Scale(62, dpi);
+            L.micMinusRect = { margin + Scale(14, dpi), by, margin + Scale(62, dpi), by + Scale(26, dpi) };
+            L.micPlusRect = { margin + Scale(70, dpi), by, margin + Scale(118, dpi), by + Scale(26, dpi) };
+            L.micMuteRect = { margin + Scale(126, dpi), by, margin + Scale(206, dpi), by + Scale(26, dpi) };
+        }
+        int mixRows = (int)g_mixSessions.size();
+        if (mixRows < 1) mixRows = 1;
+        if (mixRows > 8) mixRows = 8;
+        int mixRowH = Scale(30, dpi);
+        int mixY = micY + micH + gap;
+        int mixH = Scale(48, dpi) + mixRows * mixRowH;
+        L.mixCard = { margin, mixY, margin + bodyW, mixY + mixH };
+        L.mixListY = mixY + Scale(48, dpi);
+        L.mixRowH = mixRowH;
+        L.mixRowCount = (int)g_mixSessions.size();
+        if (L.mixRowCount > 8) L.mixRowCount = 8;
+        {
+            int ry = mixY + Scale(14, dpi);
+            L.mixRefreshRect = { margin + bodyW - Scale(114, dpi), ry, margin + bodyW - Scale(14, dpi), ry + Scale(22, dpi) };
+            for (int i = 0; i < 8; i++) {
+                int y0 = L.mixListY + i * mixRowH;
+                int by2 = y0 + (mixRowH - Scale(24, dpi)) / 2;
+                int muteL = margin + bodyW - Scale(14, dpi) - Scale(80, dpi);
+                int plusL = muteL - Scale(6, dpi) - Scale(48, dpi);
+                int minusL = plusL - Scale(6, dpi) - Scale(48, dpi);
+                L.mixRowMinusRects[i] = { minusL, by2, minusL + Scale(48, dpi), by2 + Scale(24, dpi) };
+                L.mixRowPlusRects[i] = { plusL, by2, plusL + Scale(48, dpi), by2 + Scale(24, dpi) };
+                L.mixRowMuteRects[i] = { muteL, by2, muteL + Scale(80, dpi), by2 + Scale(24, dpi) };
+            }
+        }
+        bodyH = mixY + mixH - L.bodyY;
     } else if (effTab == kTabCalendar) {
         // v6-fix: FIXED 6-week height, whatever the month.
         int dispY = 0, dispM = 0; CalDisplayed(n, dispY, dispM);
@@ -1601,6 +1682,16 @@ static Layout ComputeLayout(Notch* n, int clientW)
     ShiftRectY(L.btnPrev, shift);
     ShiftRectY(L.btnPlay, shift);
     ShiftRectY(L.btnNext, shift);
+    ShiftRectY(L.mediaSoundCard, shift);
+    ShiftRectY(L.volTrackRect, shift);
+    ShiftRectY(L.micCard, shift);
+    ShiftRectY(L.micMinusRect, shift);
+    ShiftRectY(L.micPlusRect, shift);
+    ShiftRectY(L.micMuteRect, shift);
+    ShiftRectY(L.mixCard, shift);
+    ShiftRectY(L.mixRefreshRect, shift);
+    L.mixListY += shift;
+    for (int i = 0; i < 8; i++) { ShiftRectY(L.mixRowMinusRects[i], shift); ShiftRectY(L.mixRowPlusRects[i], shift); ShiftRectY(L.mixRowMuteRects[i], shift); }
     for (int i = 0; i < 4; i++) ShiftRectY(L.sysCards[i], shift);
     ShiftRectY(L.clockCard, shift);
     ShiftRectY(L.worldCard, shift);
@@ -1631,7 +1722,6 @@ static Layout ComputeLayout(Notch* n, int clientW)
     ShiftRectY(L.screenCard, shift);
     L.screenListY += shift;
     ShiftRectY(L.screenResetRect, shift);
-    ShiftRectY(L.sysExtraCard, shift);
     ShiftRectY(L.volMinusRect, shift);
     ShiftRectY(L.volPlusRect, shift);
     ShiftRectY(L.volMuteRect, shift);
@@ -2127,6 +2217,7 @@ static int SmtcPlayPauseGlyphMode()
 // System stats (sampled only while the widget is on, on the 1s timer).
 // ---------------------------------------------------------------------------
 static void SampleDiskNetVolume();
+static void SampleVolume();
 static ULONGLONG FileTimeToU64(const FILETIME& ft)
 {
     ULARGE_INTEGER v; v.LowPart = ft.dwLowDateTime; v.HighPart = ft.dwHighDateTime;
@@ -2161,7 +2252,7 @@ static void SampleStats()
 }
 
 // ---------------------------------------------------------------------------
-// v6 local data: Disk, Network, Volume, sparkline histories.
+// v6 local data: Disk, Network, sparkline histories.
 // All sampled on the existing 1-second timer and only while the
 // stats widget is on, exactly like CPU/RAM sampling above, so
 // idle cost does not grow when everything is off. No network
@@ -2230,23 +2321,27 @@ static void SampleDiskNetVolume()
         }
         if (table) free(table);
     }
-    // Volume: default playback device level via waveOut, which is
-    // plain Win32 and needs no COM. If it fails, the card shows
-    // "Volume unavailable" instead of a fake value.
-    {
-        DWORD vol = 0;
-        if (waveOutGetVolume((HWAVEOUT)(UINT_PTR)WAVE_MAPPER, &vol) == MMSYSERR_NOERROR) {
-            int left = (int)(vol & 0xFFFF), right = (int)((vol >> 16) & 0xFFFF);
-            g_volPercent = ((left + right) / 2) * 100 / 65535;
-            g_volOk = true;
-        } else {
-            g_volOk = false;
-        }
-    }
+    // v8-sound: volume sampling moved to SampleVolume (called
+    // on the timer regardless of the stats toggle).
     if (g_histCount < 30) g_histCount++;
     PushHist(g_cpuHist, g_cpuPercent);
     PushHist(g_ramHist, g_memPercent);
     PushHist(g_diskHist, g_diskPercent);
+}
+// v8-sound: volume is sampled on the 1-second timer regardless
+// of the stats toggle, because the SOUND card now lives on the
+// MEDIA tab (which needs no stats toggle). SampleStats is still
+// gated on stats for CPU/RAM/Disk/Network.
+static void SampleVolume()
+{
+    DWORD vol = 0;
+    if (waveOutGetVolume((HWAVEOUT)(UINT_PTR)WAVE_MAPPER, &vol) == MMSYSERR_NOERROR) {
+        int left = (int)(vol & 0xFFFF), right = (int)((vol >> 16) & 0xFFFF);
+        g_volPercent = ((left + right) / 2) * 100 / 65535;
+        g_volOk = true;
+    } else {
+        g_volOk = false;
+    }
 }
 
 // v6 world clocks: resolve a Windows timezone key, convert UTC
@@ -2968,14 +3063,47 @@ static bool ScreenHitAt(Notch* n, int px, int py, bool usePaint, int& itemOut, i
 }
 static bool VolHitAt(Notch* n, int px, int py, bool usePaint, int& partOut)
 {
-    if (!g_widgetStats) return false;
+    // v8-sound: volume moved to MEDIA. EffectiveTab already
+    // enforces g_mediaEnabled (Media falls back to HOME when
+    // media is off), so no separate toggle check is needed.
     if (usePaint ? !n->paintExpanded : !n->expanded) return false;
-    if (EffectiveTab(n) != kTabSystem) return false;
+    if (EffectiveTab(n) != kTabMedia) return false;
     RECT rc; GetClientRect(n->hwnd, &rc);
     Layout L = ComputeLayout(n, rc.right);
     if (px >= L.volMinusRect.left && px < L.volMinusRect.right && py >= L.volMinusRect.top && py < L.volMinusRect.bottom) { partOut = 0; return true; }
     if (px >= L.volPlusRect.left && px < L.volPlusRect.right && py >= L.volPlusRect.top && py < L.volPlusRect.bottom) { partOut = 1; return true; }
     if (px >= L.volMuteRect.left && px < L.volMuteRect.right && py >= L.volMuteRect.top && py < L.volMuteRect.bottom) { partOut = 2; return true; }
+    if (px >= L.volTrackRect.left && px < L.volTrackRect.right && py >= L.volTrackRect.top && py < L.volTrackRect.bottom) { partOut = 3; return true; }
+    return false;
+}
+static bool MicHitAt(Notch* n, int px, int py, bool usePaint, int& partOut)
+{
+    // v8-sound: mic row on MEDIA. No mic device means no buttons
+    // are drawn, so the hit test must not fire on invisible rows.
+    if (!g_micOk) return false;
+    if (usePaint ? !n->paintExpanded : !n->expanded) return false;
+    if (EffectiveTab(n) != kTabMedia) return false;
+    RECT rc; GetClientRect(n->hwnd, &rc);
+    Layout L = ComputeLayout(n, rc.right);
+    if (px >= L.micMinusRect.left && px < L.micMinusRect.right && py >= L.micMinusRect.top && py < L.micMinusRect.bottom) { partOut = 0; return true; }
+    if (px >= L.micPlusRect.left && px < L.micPlusRect.right && py >= L.micPlusRect.top && py < L.micPlusRect.bottom) { partOut = 1; return true; }
+    if (px >= L.micMuteRect.left && px < L.micMuteRect.right && py >= L.micMuteRect.top && py < L.micMuteRect.bottom) { partOut = 2; return true; }
+    return false;
+}
+static bool MixHitAt(Notch* n, int px, int py, bool usePaint, int& itemOut, int& partOut)
+{
+    // v8-sound: mixer rows on MEDIA. part 0 minus, 1 plus,
+    // 2 mute, 3 refresh; itemOut is the row index, -1 for refresh.
+    if (usePaint ? !n->paintExpanded : !n->expanded) return false;
+    if (EffectiveTab(n) != kTabMedia) return false;
+    RECT rc; GetClientRect(n->hwnd, &rc);
+    Layout L = ComputeLayout(n, rc.right);
+    if (px >= L.mixRefreshRect.left && px < L.mixRefreshRect.right && py >= L.mixRefreshRect.top && py < L.mixRefreshRect.bottom) { partOut = 3; itemOut = -1; return true; }
+    for (int i = 0; i < L.mixRowCount; i++) {
+        if (px >= L.mixRowMinusRects[i].left && px < L.mixRowMinusRects[i].right && py >= L.mixRowMinusRects[i].top && py < L.mixRowMinusRects[i].bottom) { partOut = 0; itemOut = i; return true; }
+        if (px >= L.mixRowPlusRects[i].left && px < L.mixRowPlusRects[i].right && py >= L.mixRowPlusRects[i].top && py < L.mixRowPlusRects[i].bottom) { partOut = 1; itemOut = i; return true; }
+        if (px >= L.mixRowMuteRects[i].left && px < L.mixRowMuteRects[i].right && py >= L.mixRowMuteRects[i].top && py < L.mixRowMuteRects[i].bottom) { partOut = 2; itemOut = i; return true; }
+    }
     return false;
 }
 static bool BrightHitAt(Notch* n, int px, int py, bool usePaint, int& partOut)
@@ -3609,6 +3737,170 @@ static bool SetBrightness(int pct)
     svc->Release();
     if (done) { g_brightPercent = pct; g_brightOk = true; }
     return done;
+}
+// --- v8-sound: Core Audio (output device name, mic, balance, mixer).
+// All COM, local only, no recording, no loopback capture. Every
+// function releases everything it acquires and leaves the
+// globals untouched on failure, so a missing device or a COM
+// failure shows Unavailable instead of a fake value. Refreshes
+// run on entering Media and on the mixer Refresh button, never
+// per paint frame, to bound COM cost.
+static void RefreshSoundDevices()
+{
+    g_outDeviceName[0] = L'\0';
+    g_micOk = false;
+    g_balOk = false;
+    IMMDeviceEnumerator* en = NULL;
+    if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), NULL, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), (void**)&en)) || !en) return;
+    IMMDevice* out = NULL;
+    if (SUCCEEDED(en->GetDefaultAudioEndpoint(eRender, eConsole, &out)) && out) {
+        IPropertyStore* st = NULL;
+        if (SUCCEEDED(out->OpenPropertyStore(STGM_READ, &st)) && st) {
+            PROPVARIANT pv = { 0 };
+            if (SUCCEEDED(st->GetValue(PKEY_Device_FriendlyName, &pv)) && pv.vt == VT_LPWSTR && pv.pwszVal) {
+                wcsncpy_s(g_outDeviceName, 128, pv.pwszVal, _TRUNCATE);
+            }
+            if (pv.vt == VT_LPWSTR && pv.pwszVal) CoTaskMemFree(pv.pwszVal);
+            st->Release();
+        }
+        IAudioEndpointVolume* ev = NULL;
+        if (SUCCEEDED(out->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, NULL, (void**)&ev)) && ev) {
+            UINT ch = 0;
+            if (SUCCEEDED(ev->GetChannelCount(&ch)) && ch == 2) {
+                float l = 0, r = 0;
+                if (SUCCEEDED(ev->GetChannelVolumeLevelScalar(0, &l)) && SUCCEEDED(ev->GetChannelVolumeLevelScalar(1, &r))) {
+                    g_balLeft = (int)(l * 100.0f + 0.5f);
+                    g_balRight = (int)(r * 100.0f + 0.5f);
+                    g_balOk = true;
+                }
+            }
+            ev->Release();
+        }
+        out->Release();
+    }
+    IMMDevice* mic = NULL;
+    if (SUCCEEDED(en->GetDefaultAudioEndpoint(eCapture, eConsole, &mic)) && mic) {
+        IAudioEndpointVolume* ev = NULL;
+        if (SUCCEEDED(mic->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, NULL, (void**)&ev)) && ev) {
+            float v = 0; BOOL m = FALSE;
+            if (SUCCEEDED(ev->GetMasterVolumeLevelScalar(&v))) {
+                g_micPercent = (int)(v * 100.0f + 0.5f);
+                g_micOk = true;
+            }
+            if (SUCCEEDED(ev->GetMute(&m))) g_micMuted = (m != FALSE);
+            ev->Release();
+        }
+        mic->Release();
+    }
+    en->Release();
+}
+static void MicSet(int newPercent, int newMute)
+{
+    IMMDeviceEnumerator* en = NULL;
+    if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), NULL, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), (void**)&en)) || !en) return;
+    IMMDevice* mic = NULL;
+    if (SUCCEEDED(en->GetDefaultAudioEndpoint(eCapture, eConsole, &mic)) && mic) {
+        IAudioEndpointVolume* ev = NULL;
+        if (SUCCEEDED(mic->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, NULL, (void**)&ev)) && ev) {
+            if (newPercent >= 0) ev->SetMasterVolumeLevelScalar((float)newPercent / 100.0f, NULL);
+            if (newMute >= 0) ev->SetMute(newMute != 0, NULL);
+            ev->Release();
+        }
+        mic->Release();
+    }
+    en->Release();
+}
+static std::wstring MixerExeOfSession(IAudioSessionControl* ctl)
+{
+    if (!ctl) return L"";
+    IAudioSessionControl2* ctl2 = NULL;
+    if (FAILED(ctl->QueryInterface(__uuidof(IAudioSessionControl2), (void**)&ctl2)) || !ctl2) return L"";
+    BOOL sys = FALSE;
+    ctl2->IsSystemSoundsSession(&sys);
+    DWORD pid = 0;
+    if (FAILED(ctl2->GetProcessId(&pid))) pid = 0;
+    ctl2->Release();
+    if (sys || pid == 0 || pid == GetCurrentProcessId()) return L"";
+    HANDLE hp = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    wchar_t full[MAX_PATH] = { 0 };
+    if (hp) { DWORD sz = MAX_PATH; QueryFullProcessImageNameW(hp, 0, full, &sz); CloseHandle(hp); }
+    if (!full[0]) return L"";
+    return FileNameOf(full);
+}
+static void RefreshMixer()
+{
+    g_mixSessions.clear();
+    IMMDeviceEnumerator* en = NULL;
+    if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), NULL, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), (void**)&en)) || !en) return;
+    IMMDevice* dev = NULL;
+    if (FAILED(en->GetDefaultAudioEndpoint(eRender, eConsole, &dev)) || !dev) { en->Release(); return; }
+    IAudioSessionManager2* mgr = NULL;
+    if (FAILED(dev->Activate(__uuidof(IAudioSessionManager2), CLSCTX_ALL, NULL, (void**)&mgr)) || !mgr) { dev->Release(); en->Release(); return; }
+    IAudioSessionEnumerator* ses = NULL;
+    if (FAILED(mgr->GetSessionEnumerator(&ses)) || !ses) { mgr->Release(); dev->Release(); en->Release(); return; }
+    int count = 0;
+    if (FAILED(ses->GetCount(&count))) count = 0;
+    for (int i = 0; i < count && (int)g_mixSessions.size() < 8; i++) {
+        IAudioSessionControl* ctl = NULL;
+        if (FAILED(ses->GetSession(i, &ctl)) || !ctl) continue;
+        AudioSessionState state = AudioSessionStateInactive;
+        ctl->GetState(&state);
+        std::wstring exe;
+        if (state == AudioSessionStateActive) exe = MixerExeOfSession(ctl);
+        if (!exe.empty()) {
+            bool dup = false;
+            for (size_t k = 0; k < g_mixSessions.size(); k++) if (g_mixSessions[k].exe == exe) dup = true;
+            if (!dup) {
+                ISimpleAudioVolume* sv = NULL;
+                if (SUCCEEDED(ctl->QueryInterface(__uuidof(ISimpleAudioVolume), (void**)&sv)) && sv) {
+                    float v = 0; BOOL m = FALSE;
+                    sv->GetMasterVolume(&v, NULL);
+                    sv->GetMute(&m, NULL);
+                    MixSession ms; ms.exe = exe; ms.percent = (int)(v * 100.0f + 0.5f); ms.muted = (m != FALSE);
+                    g_mixSessions.push_back(ms);
+                    sv->Release();
+                }
+            }
+        }
+        ctl->Release();
+    }
+    ses->Release(); mgr->Release(); dev->Release(); en->Release();
+}
+static void MixerSet(const std::wstring& exe, int newPercent, int newMute)
+{
+    // Applies to the first non-expired session of this exe (the
+    // same dedupe rule as RefreshMixer). COM pointers are never
+    // kept across calls: enumerate, apply, release.
+    IMMDeviceEnumerator* en = NULL;
+    if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), NULL, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), (void**)&en)) || !en) return;
+    IMMDevice* dev = NULL;
+    if (FAILED(en->GetDefaultAudioEndpoint(eRender, eConsole, &dev)) || !dev) { en->Release(); return; }
+    IAudioSessionManager2* mgr = NULL;
+    if (FAILED(dev->Activate(__uuidof(IAudioSessionManager2), CLSCTX_ALL, NULL, (void**)&mgr)) || !mgr) { dev->Release(); en->Release(); return; }
+    IAudioSessionEnumerator* ses = NULL;
+    if (FAILED(mgr->GetSessionEnumerator(&ses)) || !ses) { mgr->Release(); dev->Release(); en->Release(); return; }
+    int count = 0;
+    if (FAILED(ses->GetCount(&count))) count = 0;
+    for (int i = 0; i < count; i++) {
+        IAudioSessionControl* ctl = NULL;
+        if (FAILED(ses->GetSession(i, &ctl)) || !ctl) continue;
+        AudioSessionState state = AudioSessionStateInactive;
+        ctl->GetState(&state);
+        bool match = false;
+        if (state != AudioSessionStateExpired) match = (MixerExeOfSession(ctl) == exe);
+        if (match) {
+            ISimpleAudioVolume* sv = NULL;
+            if (SUCCEEDED(ctl->QueryInterface(__uuidof(ISimpleAudioVolume), (void**)&sv)) && sv) {
+                if (newPercent >= 0) sv->SetMasterVolume((float)newPercent / 100.0f, NULL);
+                if (newMute >= 0) sv->SetMute(newMute != 0, NULL);
+                sv->Release();
+            }
+            ctl->Release();
+            break;
+        }
+        ctl->Release();
+    }
+    ses->Release(); mgr->Release(); dev->Release(); en->Release();
 }
 // --- Clipboard persistence via DPAPI (user scope).
 // Payload (UTF-8, in memory only until protected):
@@ -4314,7 +4606,7 @@ static void PaintNotchD2D(Notch* n, Canvas* cv)
     static const wchar_t* kTabTitles[10] = { L"Home", L"Media", L"System", L"Calendar", L"Clock", L"Clipboard", L"Shelf", L"Timer", L"Notes", L"Screen" };
     wchar_t subtitle[128] = { 0 };
     if (effTab == kTabHome) { FormatDate(subtitle, 128); }
-    else if (effTab == kTabSystem) { wcscpy_s(subtitle, 128, L"Power \x00B7 Network \x00B7 Audio"); }
+    else if (effTab == kTabSystem) { wcscpy_s(subtitle, 128, L"Power \x00B7 Network \x00B7 Display"); }
     else if (effTab == kTabClock) { wcscpy_s(subtitle, 128, L"Local Time & Date"); }
     else if (effTab == kTabCalendar) {
         int dy = 0, dm = 0; CalDisplayed(n, dy, dm);
@@ -4574,43 +4866,15 @@ static void PaintNotchD2D(Notch* n, Canvas* cv)
                 DrawSparklineD2D(cv, sp, hists[k], g_histCount, th.accent);
             }
         }
-        DrawCardD2D(cv, L.sysCards[3], L"VOLUME");
+        DrawCardD2D(cv, L.sysCards[3], L"BRIGHTNESS");
         {
             RECT c = L.sysCards[3];
-            if (g_volOk) {
-                wchar_t big[16]; swprintf(big, 16, L"%d%%", g_volPercent);
-                D2DText(cv, kFontBig, big, (float)(c.left + 14), (float)(c.top + Scale(36, dpi)), (float)(c.right - c.left - 28), (float)Scale(48, dpi), th.primary, false);
-                RECT track = { c.left + 14, c.top + Scale(100, dpi), c.right - 14, c.top + Scale(108, dpi) };
-                DrawBarD2D(cv, track, g_volPercent);
-                int knobX = track.left + (track.right - track.left) * g_volPercent / 100;
-                int knobY = (track.top + track.bottom) / 2;
-                int kr = Scale(8, dpi);
-                cv->FillEllipse((float)knobX, (float)knobY, (float)kr, (float)kr, th.primary);
-            } else {
-                D2DText(cv, kFontTiny, L"Volume unavailable", (float)(c.left + 14), (float)(c.top + Scale(36, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.secondary, false);
-            }
-            // v8-continued: wave-out volume buttons. These change
-            // the SYSTEM wave volume, not a per-app volume.
-            cv->StrokeRounded(L.volMinusRect, th.muted, 1.0f, 4.0f);
-            D2DText(cv, kFontTiny, L"-", (float)L.volMinusRect.left, (float)L.volMinusRect.top, (float)(L.volMinusRect.right - L.volMinusRect.left), (float)(L.volMinusRect.bottom - L.volMinusRect.top), th.secondary, true);
-            cv->StrokeRounded(L.volPlusRect, th.muted, 1.0f, 4.0f);
-            D2DText(cv, kFontTiny, L"+", (float)L.volPlusRect.left, (float)L.volPlusRect.top, (float)(L.volPlusRect.right - L.volPlusRect.left), (float)(L.volPlusRect.bottom - L.volPlusRect.top), th.secondary, true);
-            cv->StrokeRounded(L.volMuteRect, th.muted, 1.0f, 4.0f);
-            D2DText(cv, kFontTiny, g_volMuted ? L"Unmute" : L"Mute", (float)L.volMuteRect.left, (float)L.volMuteRect.top, (float)(L.volMuteRect.right - L.volMuteRect.left), (float)(L.volMuteRect.bottom - L.volMuteRect.top), th.secondary, true);
-        }
-        // v8-continued BRIGHTNESS card (SYSTEM tab only).
-        // WMI for internal displays; if no controllable display
-        // is found the card says Unavailable instead of faking
-        // a slider. Bluetooth battery is deliberately absent:
-        // it was cut (see README), so no dead section is drawn.
-        DrawCardD2D(cv, L.sysExtraCard, L"BRIGHTNESS");
-        {
-            RECT c = L.sysExtraCard;
             if (g_brightOk) {
                 wchar_t big[16]; swprintf(big, 16, L"%d%%", g_brightPercent);
-                D2DText(cv, kFontBig, big, (float)(c.left + 14), (float)(c.top + Scale(30, dpi)), (float)(c.right - c.left - 28), (float)Scale(40, dpi), th.primary, false);
+                D2DText(cv, kFontBig, big, (float)(c.left + 14), (float)(c.top + Scale(36, dpi)), (float)(c.right - c.left - 28), (float)Scale(48, dpi), th.primary, false);
             } else {
-                D2DText(cv, kFontTiny, L"Brightness control unavailable on this display", (float)(c.left + 14), (float)(c.top + Scale(36, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.secondary, false);
+                D2DText(cv, kFontTiny, L"Brightness unavailable", (float)(c.left + 14), (float)(c.top + Scale(36, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.secondary, false);
+                D2DText(cv, kFontTiny, L"on this display", (float)(c.left + 14), (float)(c.top + Scale(62, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.secondary, false);
             }
             cv->StrokeRounded(L.brightMinusRect, th.muted, 1.0f, 4.0f);
             D2DText(cv, kFontTiny, L"-", (float)L.brightMinusRect.left, (float)L.brightMinusRect.top, (float)(L.brightMinusRect.right - L.brightMinusRect.left), (float)(L.brightMinusRect.bottom - L.brightMinusRect.top), th.secondary, true);
@@ -4893,6 +5157,75 @@ static void PaintNotchD2D(Notch* n, Canvas* cv)
             D2DText(cv, kFontTiny, L"No track", (float)(L.mediaCard.left + 14), (float)L.mediaTitleY, (float)(L.mediaCard.right - L.mediaCard.left - 28), (float)Scale(20, dpi), th.secondary, false);
         }
         DrawMediaButtonsRowD2D(cv, n, L, false);
+        // v8-sound: SOUND card (moved from SYSTEM), then MIC,
+        // then the per-app mixer. No output-device switching:
+        // there is no documented public API to set the default
+        // audio device (IPolicyConfig is undocumented), so the
+        // device name is shown, never switched.
+        DrawCardD2D(cv, L.mediaSoundCard, L"SOUND");
+        {
+            RECT c = L.mediaSoundCard;
+            if (g_volOk) {
+                wchar_t big[16]; swprintf(big, 16, L"%d%%", g_volPercent);
+                D2DText(cv, kFontBig, big, (float)(c.left + 14), (float)(c.top + Scale(30, dpi)), (float)(c.right - c.left - 28), (float)Scale(40, dpi), th.primary, false);
+            } else {
+                D2DText(cv, kFontTiny, L"Volume unavailable", (float)(c.left + 14), (float)(c.top + Scale(36, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.secondary, false);
+            }
+            if (g_outDeviceName[0] != L'\0') D2DTextEllipsis(cv, kFontTiny, g_outDeviceName, (float)(c.left + 14), (float)(c.top + Scale(72, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.secondary);
+            else D2DText(cv, kFontTiny, L"Output device unknown", (float)(c.left + 14), (float)(c.top + Scale(72, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.muted, false);
+            if (g_balOk) {
+                wchar_t bal[64]; swprintf(bal, 64, L"Balance  L %d%%  \x00B7  R %d%%", g_balLeft, g_balRight);
+                D2DText(cv, kFontTiny, bal, (float)(c.left + 14), (float)(c.top + Scale(94, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.muted, false);
+            }
+            RECT tb = L.volTrackRect;
+            int midY = (tb.top + tb.bottom) / 2;
+            RECT bar = { tb.left, midY - Scale(4, dpi), tb.right, midY + Scale(4, dpi) };
+            DrawBarD2D(cv, bar, g_volOk ? g_volPercent : 0);
+            int knobX = tb.left + (tb.right - tb.left) * (g_volOk ? g_volPercent : 0) / 100;
+            int kr = Scale(8, dpi);
+            cv->FillEllipse((float)knobX, (float)midY, (float)kr, (float)kr, th.primary);
+            cv->StrokeRounded(L.volMinusRect, th.muted, 1.0f, 4.0f);
+            D2DText(cv, kFontTiny, L"-", (float)L.volMinusRect.left, (float)L.volMinusRect.top, (float)(L.volMinusRect.right - L.volMinusRect.left), (float)(L.volMinusRect.bottom - L.volMinusRect.top), th.secondary, true);
+            cv->StrokeRounded(L.volPlusRect, th.muted, 1.0f, 4.0f);
+            D2DText(cv, kFontTiny, L"+", (float)L.volPlusRect.left, (float)L.volPlusRect.top, (float)(L.volPlusRect.right - L.volPlusRect.left), (float)(L.volPlusRect.bottom - L.volPlusRect.top), th.secondary, true);
+            cv->StrokeRounded(L.volMuteRect, th.muted, 1.0f, 4.0f);
+            D2DText(cv, kFontTiny, g_volMuted ? L"Unmute" : L"Mute", (float)L.volMuteRect.left, (float)L.volMuteRect.top, (float)(L.volMuteRect.right - L.volMuteRect.left), (float)(L.volMuteRect.bottom - L.volMuteRect.top), th.secondary, true);
+        }
+        DrawCardD2D(cv, L.micCard, L"MIC");
+        {
+            RECT c = L.micCard;
+            if (g_micOk) {
+                wchar_t big[16]; swprintf(big, 16, L"%d%%", g_micPercent);
+                D2DText(cv, kFontBig, big, (float)(c.left + 14), (float)(c.top + Scale(30, dpi)), (float)(c.right - c.left - 28), (float)Scale(40, dpi), th.primary, false);
+                cv->StrokeRounded(L.micMinusRect, th.muted, 1.0f, 4.0f);
+                D2DText(cv, kFontTiny, L"-", (float)L.micMinusRect.left, (float)L.micMinusRect.top, (float)(L.micMinusRect.right - L.micMinusRect.left), (float)(L.micMinusRect.bottom - L.micMinusRect.top), th.secondary, true);
+                cv->StrokeRounded(L.micPlusRect, th.muted, 1.0f, 4.0f);
+                D2DText(cv, kFontTiny, L"+", (float)L.micPlusRect.left, (float)L.micPlusRect.top, (float)(L.micPlusRect.right - L.micPlusRect.left), (float)(L.micPlusRect.bottom - L.micPlusRect.top), th.secondary, true);
+                cv->StrokeRounded(L.micMuteRect, th.muted, 1.0f, 4.0f);
+                D2DText(cv, kFontTiny, g_micMuted ? L"Unmute" : L"Mute", (float)L.micMuteRect.left, (float)L.micMuteRect.top, (float)(L.micMuteRect.right - L.micMuteRect.left), (float)(L.micMuteRect.bottom - L.micMuteRect.top), th.secondary, true);
+            } else {
+                D2DText(cv, kFontTiny, L"No microphone found", (float)(c.left + 14), (float)(c.top + Scale(36, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.secondary, false);
+            }
+        }
+        DrawCardD2D(cv, L.mixCard, L"MIXER");
+        cv->StrokeRounded(L.mixRefreshRect, th.muted, 1.0f, 4.0f);
+        D2DText(cv, kFontTiny, L"Refresh", (float)L.mixRefreshRect.left, (float)L.mixRefreshRect.top, (float)(L.mixRefreshRect.right - L.mixRefreshRect.left), (float)(L.mixRefreshRect.bottom - L.mixRefreshRect.top), th.secondary, true);
+        if (L.mixRowCount == 0) {
+            D2DText(cv, kFontTiny, L"No apps playing audio", (float)(L.mixCard.left + 14), (float)L.mixListY, (float)(L.mixCard.right - L.mixCard.left - 28), (float)Scale(20, dpi), th.secondary, false);
+        } else {
+            for (int i = 0; i < L.mixRowCount; i++) {
+                int y0 = L.mixListY + i * L.mixRowH;
+                D2DTextEllipsis(cv, kFontTiny, g_mixSessions[i].exe.c_str(), (float)(L.mixCard.left + 14), (float)y0, (float)(L.mixRowMinusRects[i].left - L.mixCard.left - 22), (float)Scale(20, dpi), th.primary);
+                wchar_t pct[16]; swprintf(pct, 16, L"%d%%", g_mixSessions[i].percent);
+                D2DText(cv, kFontTiny, pct, (float)(L.mixRowMinusRects[i].left - Scale(56, dpi)), (float)y0, (float)Scale(48, dpi), (float)Scale(20, dpi), th.secondary, true);
+                cv->StrokeRounded(L.mixRowMinusRects[i], th.muted, 1.0f, 4.0f);
+                D2DText(cv, kFontTiny, L"-", (float)L.mixRowMinusRects[i].left, (float)L.mixRowMinusRects[i].top, (float)(L.mixRowMinusRects[i].right - L.mixRowMinusRects[i].left), (float)(L.mixRowMinusRects[i].bottom - L.mixRowMinusRects[i].top), th.secondary, true);
+                cv->StrokeRounded(L.mixRowPlusRects[i], th.muted, 1.0f, 4.0f);
+                D2DText(cv, kFontTiny, L"+", (float)L.mixRowPlusRects[i].left, (float)L.mixRowPlusRects[i].top, (float)(L.mixRowPlusRects[i].right - L.mixRowPlusRects[i].left), (float)(L.mixRowPlusRects[i].bottom - L.mixRowPlusRects[i].top), th.secondary, true);
+                cv->StrokeRounded(L.mixRowMuteRects[i], th.muted, 1.0f, 4.0f);
+                D2DText(cv, kFontTiny, g_mixSessions[i].muted ? L"Unmute" : L"Mute", (float)L.mixRowMuteRects[i].left, (float)L.mixRowMuteRects[i].top, (float)(L.mixRowMuteRects[i].right - L.mixRowMuteRects[i].left), (float)(L.mixRowMuteRects[i].bottom - L.mixRowMuteRects[i].top), th.secondary, true);
+            }
+        }
     }
     {
         RECT shadow = L.dockPill; shadow.top += 2; shadow.bottom += 2;
@@ -5199,6 +5532,12 @@ static LRESULT CALLBACK NotchWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                 // per paint frame, so a slow WMI call cannot
                 // stall every frame).
                 if (dockTab == kTabSystem) RefreshBrightness();
+                if (dockTab == kTabMedia) {
+                    int beforeMix = (int)g_mixSessions.size();
+                    RefreshSoundDevices();
+                    RefreshMixer();
+                    if ((int)g_mixSessions.size() != beforeMix) ApplySizeToAll();
+                }
                 // v6-unified-size: the panel size is identical on
                 // every tab, so a switch only repaints content
                 // (into the double buffer). It must NOT run the
@@ -5379,6 +5718,21 @@ static LRESULT CALLBACK NotchWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         }
         if (EffectiveTab(n) == kTabSystem) {
             int part = -1;
+            if (BrightHitAt(n, pt.x, pt.y, false, part)) {
+                if (part == 2) {
+                    RefreshBrightness();
+                } else {
+                    RefreshBrightness();
+                    if (g_brightOk) SetBrightness(g_brightPercent + (part == 1 ? 10 : -10));
+                }
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 0;
+            }
+        }
+        // v8-sound: volume, mic and mixer clicks on MEDIA.
+        // Hit order stays gear > X > dock > tab content > pin.
+        if (EffectiveTab(n) == kTabMedia) {
+            int part = -1;
             if (VolHitAt(n, pt.x, pt.y, false, part)) {
                 if (part == 0 || part == 1) {
                     int cur = g_volOk ? g_volPercent : 50;
@@ -5399,16 +5753,52 @@ static LRESULT CALLBACK NotchWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                         waveOutSetVolume((HWAVEOUT)(UINT_PTR)WAVE_MAPPER, 0);
                         g_volMuted = true; g_volPercent = 0; g_volOk = true;
                     }
+                } else if (part == 3) {
+                    RECT rc2; GetClientRect(hwnd, &rc2);
+                    Layout Lc = ComputeLayout(n, rc2.right);
+                    RECT tr = Lc.volTrackRect;
+                    if (tr.right > tr.left) {
+                        int nv = (pt.x - tr.left) * 100 / (tr.right - tr.left);
+                        if (nv < 0) nv = 0;
+                        if (nv > 100) nv = 100;
+                        DWORD v = (DWORD)(nv * 65535 / 100);
+                        waveOutSetVolume((HWAVEOUT)(UINT_PTR)WAVE_MAPPER, v | (v << 16));
+                        g_volMuted = false; g_volPercent = nv; g_volOk = true;
+                    }
                 }
                 InvalidateRect(hwnd, NULL, FALSE);
                 return 0;
             }
-            if (BrightHitAt(n, pt.x, pt.y, false, part)) {
-                if (part == 2) {
-                    RefreshBrightness();
-                } else {
-                    RefreshBrightness();
-                    if (g_brightOk) SetBrightness(g_brightPercent + (part == 1 ? 10 : -10));
+            if (MicHitAt(n, pt.x, pt.y, false, part)) {
+                if (part == 0 || part == 1) {
+                    int nv = g_micPercent + (part == 1 ? 5 : -5);
+                    if (nv < 0) nv = 0;
+                    if (nv > 100) nv = 100;
+                    MicSet(nv, -1);
+                } else if (part == 2) {
+                    MicSet(-1, g_micMuted ? 0 : 1);
+                }
+                RefreshSoundDevices();
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 0;
+            }
+            int mixItem = -1, mixPart = -1;
+            if (MixHitAt(n, pt.x, pt.y, false, mixItem, mixPart)) {
+                if (mixPart == 3) {
+                    RefreshSoundDevices();
+                    RefreshMixer();
+                    ApplySizeToAll();
+                } else if (mixItem >= 0 && mixItem < (int)g_mixSessions.size()) {
+                    std::wstring exe = g_mixSessions[mixItem].exe;
+                    if (mixPart == 0 || mixPart == 1) {
+                        int nv = g_mixSessions[mixItem].percent + (mixPart == 1 ? 5 : -5);
+                        if (nv < 0) nv = 0;
+                        if (nv > 100) nv = 100;
+                        MixerSet(exe, nv, -1);
+                    } else if (mixPart == 2) {
+                        MixerSet(exe, -1, g_mixSessions[mixItem].muted ? 0 : 1);
+                    }
+                    RefreshMixer();
                 }
                 InvalidateRect(hwnd, NULL, FALSE);
                 return 0;
@@ -5791,6 +6181,7 @@ static LRESULT CALLBACK ManagerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             // never a height snap.
             g_smtcLayoutKey = SmtcLayoutKey();
             SampleStats();
+            SampleVolume();
             UpdateFullscreenAndVisibility();
             InvalidateAllNotches();
         }
@@ -5942,7 +6333,7 @@ static LRESULT CALLBACK ManagerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
         case ID_TRAY_MEDIA_NEXT: SendMediaKey(VK_MEDIA_NEXT_TRACK); break;
         case ID_TRAY_ABOUT:
             MessageBoxW(hwnd,
-                L"OnyxNotch v8 (clipboard history + file shelf)\nMac-style notch for Windows.\nNative Win32 C++, no runtime, low memory.\nDirect2D/DirectWrite rendering on a layered\nwindow with per-pixel alpha; spring animation;\nblur is an OFF-by-default experimental tray\ntoggle with an opaque fallback.\n\nv4: premium UI — gradient surface, lighter\ntypography, circular media buttons, battery glyph,\ncalendar pill — reorganized in place: compact\ntwo-column body (media beside system stats),\nsection headers, stats rows with bars.\n\nv5-SMTC: with Media controls on, the Media tab\nshows the current track title and artist from\nWindows SMTC (read-only), and Home shows a\ncompact title line. No track, no title — the\nmedia buttons still work via media keys.\n\nv5-settings: size and toggles are saved to\n%APPDATA%\\OnyxNotch\\settings.ini and restored\nat startup. Start with Windows (tray menu) writes\nthe Run registry value for this .exe.\n\nThemes: tray menu Themes submenu — Onyx, Midnight,\nGraphite — applies instantly to all notches and is\nsaved to settings.ini as theme=onyx|midnight|graphite.\n\nClick the notch header to pin it open;\nclick again to unpin. The gear button in the\nexpanded header opens this menu from the notch.\n\nv6: wide card dashboard with a header bar,\ncard grid and a bottom icon dock. Home is a\ncompact summary; System, Clock, Calendar\nand Media show full card versions. Click a\ndock icon to switch. Close X collapses only.\n\nv8: clipboard history + file shelf, both OFF by\ndefault in the tray menu. Clipboard history is\nin-memory by default (clears on quit unless the\nkeep-after-quit toggle is on), capped at 50, with a password-manager\nheuristic skip that is NOT a guarantee. Click an\nitem to copy it back; drag text/files out to\nanother app (images: drag/copy as thumbnails only). File shelf parks\nreferenced paths only; paths are saved in\n%APPDATA%\\OnyxNotch\\shelf.ini. No search box:\nthe notch must not steal keyboard focus, so\nfilters are mouse-click chips only.\n\nHome page: tray or gear menu, Customize Home page,\nopens an edit list on HOME (mouse clicks only):\ncheck up to 6 of the 11 cards (System, Calendar,\nClock, Media, Battery, Network, Clipboard, Shelf,\nTimer, Notes, Screen),\narrows reorder them, Done exits. Edit mode itself\nis not saved; the selection and order are saved in\nsettings.ini as home_cards= and home_order=.\n\nv8-continued: TIMER tab (stopwatch, countdown, focus;\npresets and steps, mouse only, in-memory, no sound),\nNOTES tab (local notes.ini; blank or from clipboard;\nedited in Notepad, never typed in the notch), SCREEN\ntab (exe names only, screentime.ini, OFF by default),\nSYSTEM volume buttons (wave-out) and WMI brightness\n(unavailable on displays WMI cannot control), clipboard\npersistence (OFF by default, text only, DPAPI file\nclipboard.dat), image drag-out (thumbnails only).\nPrivacy dots and Bluetooth battery were CUT: no\nreliable public native signal exists for either, and\nfaking them would be worse than omitting them.",
+                L"OnyxNotch v8 (clipboard history + file shelf)\nMac-style notch for Windows.\nNative Win32 C++, no runtime, low memory.\nDirect2D/DirectWrite rendering on a layered\nwindow with per-pixel alpha; spring animation;\nblur is an OFF-by-default experimental tray\ntoggle with an opaque fallback.\n\nv4: premium UI — gradient surface, lighter\ntypography, circular media buttons, battery glyph,\ncalendar pill — reorganized in place: compact\ntwo-column body (media beside system stats),\nsection headers, stats rows with bars.\n\nv5-SMTC: with Media controls on, the Media tab\nshows the current track title and artist from\nWindows SMTC (read-only), and Home shows a\ncompact title line. No track, no title — the\nmedia buttons still work via media keys.\n\nv5-settings: size and toggles are saved to\n%APPDATA%\\OnyxNotch\\settings.ini and restored\nat startup. Start with Windows (tray menu) writes\nthe Run registry value for this .exe.\n\nThemes: tray menu Themes submenu — Onyx, Midnight,\nGraphite — applies instantly to all notches and is\nsaved to settings.ini as theme=onyx|midnight|graphite.\n\nClick the notch header to pin it open;\nclick again to unpin. The gear button in the\nexpanded header opens this menu from the notch.\n\nv6: wide card dashboard with a header bar,\ncard grid and a bottom icon dock. Home is a\ncompact summary; System, Clock, Calendar\nand Media show full card versions. Click a\ndock icon to switch. Close X collapses only.\n\nv8: clipboard history + file shelf, both OFF by\ndefault in the tray menu. Clipboard history is\nin-memory by default (clears on quit unless the\nkeep-after-quit toggle is on), capped at 50, with a password-manager\nheuristic skip that is NOT a guarantee. Click an\nitem to copy it back; drag text/files out to\nanother app (images: drag/copy as thumbnails only). File shelf parks\nreferenced paths only; paths are saved in\n%APPDATA%\\OnyxNotch\\shelf.ini. No search box:\nthe notch must not steal keyboard focus, so\nfilters are mouse-click chips only.\n\nHome page: tray or gear menu, Customize Home page,\nopens an edit list on HOME (mouse clicks only):\ncheck up to 6 of the 11 cards (System, Calendar,\nClock, Media, Battery, Network, Clipboard, Shelf,\nTimer, Notes, Screen),\narrows reorder them, Done exits. Edit mode itself\nis not saved; the selection and order are saved in\nsettings.ini as home_cards= and home_order=.\n\nv8-continued: TIMER tab (stopwatch, countdown, focus;\npresets and steps, mouse only, in-memory, no sound),\nNOTES tab (local notes.ini; blank or from clipboard;\nedited in Notepad, never typed in the notch), SCREEN\ntab (exe names only, screentime.ini, OFF by default),\nMEDIA sound card (wave-out volume, slider, device name, mic, per-app mixer) and SYSTEM brightness (WMI)\n(unavailable on displays WMI cannot control), clipboard\npersistence (OFF by default, text only, DPAPI file\nclipboard.dat), image drag-out (thumbnails only).\nPrivacy dots and Bluetooth battery were CUT: no\nreliable public native signal exists for either, and\nfaking them would be worse than omitting them.",
                 L"OnyxNotch", MB_OK | MB_ICONINFORMATION);
             break;
         }
