@@ -1,7 +1,16 @@
-# OnyxNotch v4
+# OnyxNotch v5 — SMTC titles + saved settings / auto-start + themes (features 1, 2 and 3 of v5)
 
 Mac-style notch for Windows, in native C++ Win32. One source file, one
 `.exe`, no Electron, no Python, no .NET runtime.
+
+**Scope of this folder:** v5 features 1 (SMTC track titles, below),
+2 (saved settings + auto-start, below) and 3 (themes, below) are
+implemented here. Everything from tabbed v4 is otherwise unchanged.
+
+**Superseded note:** the v2 section below says no track title/artist
+is shown. That was true for v2–v4 and is superseded by the v5-SMTC
+section below: with Media controls on, titles/artists are now shown
+when SMTC reports them.
 
 ## What it does (v1, unchanged)
 
@@ -362,9 +371,291 @@ tab's feature is toggled off while that tab is selected
 (from the tray menu or the gear menu), the notch falls
 back to HOME rather than showing a dead tab.
 
-## Build (Windows) — unchanged from v2
+## What's new in v5 — SMTC track titles (feature 1 only)
 
-## Build (Windows)
+No new tray toggle, no new timer, no new thread, no network. SMTC
+here is read-only and local: it reads the current Windows System
+Media Transport Controls session; it never plays, pauses, seeks,
+or sends anything anywhere. Media keys remain the only control
+path, exactly as in v2–v4.
+
+### 1. Where the title and artist appear
+Media controls must be on (tray **Media controls**, off by default,
+as before). Nothing changes when it is off — the SMTC code is not
+even called then.
+
+- **MEDIA tab:** below the MEDIA header, the track **title on one
+  line** (near-white, small font) and the **artist on the next line**
+  (muted grey, tiny font), then the three circular media buttons
+  below them. The artist line appears only when SMTC actually
+  reports an artist string; a track with no artist shows the title
+  line only, never a blank second line.
+- **HOME tab:** one compact **title line only** (near-white, tiny
+  font) above the small media buttons in the HOME media summary.
+  No artist line on HOME, by design — the full title + artist
+  live on the MEDIA tab.
+- No title/artist anywhere else: not in the collapsed notch
+  (clock only, unchanged), not in the header, not on the SYSTEM
+  or CALENDAR tabs, and not in the tray menu.
+
+### 2. Truncation rule
+Long titles/artists are truncated **by pixels, not by character
+count**: GDI `DrawTextW` with `DT_END_ELLIPSIS` cuts the text to
+the section width at the current font and DPI and appends an
+ellipsis (…). The width is the full body width (MEDIA tab) or the
+body width (HOME title line). Separately, the cached strings are
+capped at 255 characters, so a pathological player string cannot
+grow memory. If a title fits, it is shown whole — no truncation
+is faked for short titles.
+
+### 3. Play/pause glyph now reflects playback status
+When SMTC reports a clear status, the middle media button's glyph
+changes (on both HOME and MEDIA, same glyph code):
+- **Playing → pause bars** (two bars: clicking pauses).
+- **Paused → play triangle** (clicking plays).
+- **Anything else** (Stopped, Changing, Closed, Opened, unknown,
+  or no session) → the old combined play-triangle + pause-bars
+  glyph, unchanged. The button still always sends the same
+  `VK_MEDIA_PLAY_PAUSE` key; only what is drawn changes, and
+  only when the status is known.
+
+### 4. Fallback — exactly v4 when SMTC has nothing
+If there is no SMTC session, no properties, an empty title, or
+any WinRT call fails (all wrapped in try/catch, so a failure
+cannot crash the app), the title/artist lines are simply not
+drawn and the glyph stays combined — the expanded heights shrink
+back to the v4 sizes and the media buttons work via media keys
+as before. There is no blank hole: a missing artist costs no
+line, a missing track costs no lines at all. Track changes are
+picked up on the existing 1-second clock timer, so a new track
+(or a track ending) can take up to a second to appear, and a
+height change animates through the existing ~220 ms animation
+path (or snaps instantly when Animations is off).
+
+### 5. Heights (standard size, 96 DPI, arithmetic, not measured)
+Tab bar / header geometry is unchanged; only the body grows:
+- MEDIA tab: 220 px with no track (v4), 242 px title only,
+  262 px title + artist.
+- HOME with all features on: 246 px with no track (v4),
+  270 px with a track title line.
+- SYSTEM, CALENDAR, header-only, and collapsed heights are
+  unchanged. Hit-test order is unchanged (gear first, then
+  tabs, then media buttons, then pin), and the media-button
+  circles move with the layout because hit tests and painting
+  share `ComputeLayout` — a title line never becomes clickable
+  and never shifts a button away from its drawn circle.
+
+## What's new in v5 — Saved settings + auto-start (feature 2 only)
+
+No new window, no new timer, no network, no theme system. This is
+only persistence for the toggles that already existed, plus one
+new tray toggle for starting at login. SMTC titles, tabs, the
+gear menu, animations, and every default below are unchanged —
+except that the toggles below now survive a restart instead of
+resetting, which is the whole point of this feature.
+
+### 1. Settings file — where it is, what is in it
+On startup the app loads, before the first notch is drawn:
+
+`%APPDATA%\OnyxNotch\settings.ini`
+
+That is a plain `key=value` text file (no JSON library, no
+registry for these keys). The app creates the `OnyxNotch`
+folder under `%APPDATA%` if it is missing. A typical file the
+app writes looks like this (values shown are the defaults):
+
+```ini
+; OnyxNotch settings - rewritten on every change and on clean quit.
+; Unknown keys are ignored on load; values are 0 = off, 1 = on.
+size=1
+hide_on_fullscreen=0
+media=0
+widget_stats=0
+widget_calendar=0
+animations=1
+theme=onyx
+```
+
+Exact keys and defaults:
+
+- `size` — `0` = Small, `1` = Medium (default), `2` = Large.
+- `hide_on_fullscreen` — `0` = off (default), `1` = on.
+- `media` — Media controls, `0` = off (default), `1` = on.
+- `widget_stats` — System stats widget, `0` = off (default),
+  `1` = on.
+- `widget_calendar` — Calendar widget, `0` = off (default),
+  `1` = on.
+- `animations` — `1` = on (default), `0` = off.
+- `theme` — `onyx` (default), `midnight`, or `graphite` (see the
+  themes section below). The value is matched case-insensitively;
+  an unknown or corrupt value (for example `theme=blue`) is
+  ignored and Onyx stands, exactly like a bad boolean above.
+
+### 2. When it is saved
+The file is saved whenever a size or toggle changes (tray menu
+or gear menu — they are the same menu, so either path saves)
+and again on clean quit (tray Quit, and the manager-window
+shutdown path as a second save, so a quit by any clean path
+saves). Saving is a **full rewrite of the known keys only**:
+that is the documented trade-off — any unrelated lines you
+hand-added to the file are NOT preserved across a save. If you
+edit the file by hand, edit the values of the known keys only,
+while the app is not running, or your edits may be overwritten
+by the next toggle change or quit. A failed save is ignored
+silently: it never shows an error, never blocks a toggle, and
+never blocks quitting.
+
+### 3. Corrupt or missing file — old defaults, never a failure
+A missing file is normal on first run: the app just uses the
+defaults above and writes the file on the first change or quit.
+A corrupt file also never stops the app: blank lines, comment
+lines (`;` or `#`), lines without `=`, unknown keys, and values
+that do not parse (for example `size=9`, `size=big`, or
+`media=maybe`) are all ignored line by line, and only the
+keys that parse cleanly override their defaults. Boolean values
+accept `1`/`0`, `true`/`false`, `yes`/`no`, `on`/`off`
+(case-insensitive). Nothing in this path can crash the app or
+refuse to start — if the file cannot be read at all, every
+default stands.
+
+### 4. Start with Windows — tray toggle, registry, default OFF
+Right-click the tray icon (or click the gear in the expanded
+notch) and tick **Start with Windows**. It is **OFF by
+default**. Ticking it on writes this registry value:
+
+- Key: `HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run`
+- Value name: `OnyxNotch`
+- Value type: `REG_SZ`
+- Value: the current `.exe` path, quoted, for example
+  `"C:\Path\To\OnyxNotch.exe"`
+
+Unticking it removes that value. At startup the app reads that
+registry value to set the toggle: a present, non-empty value
+means ON, an absent value means OFF. **The registry is the
+source of truth for auto-start; the settings file is the source
+of truth for everything else** — auto-start is never written
+to `settings.ini`, and the settings file never overrides the
+registry for auto-start. If the registry write fails (for
+example, policy blocks it), the toggle is left unchanged, so
+the menu never shows a state Windows will not actually do.
+Two consequences worth knowing: if you move the `.exe` after
+enabling auto-start, Windows will still try the old path —
+toggle Start with Windows off and on again to rewrite it to
+the current path; and if you delete the `.exe`, remove the
+Run value by unticking (or delete it in `regedit`) rather than
+assuming the toggle cleans itself up.
+
+### 5. What did not change
+No settings window (the gear still opens the existing tray
+menu), no new tray items except Start with Windows and the
+Themes submenu (feature 3, see the themes section), no change
+to SMTC title/artist/status logic, tabs,
+hit-test order (gear, then tabs, then media buttons, then
+pin), animation timing, or any default above. The v3 note that
+toggles "reset at each start" is superseded by this section:
+they no longer do.
+
+## What's new in v5 — Themes (feature 3 only)
+
+No new window, no new timer, no network, no position/size
+customisation beyond the existing Size menu, no weather, no
+calendar events, no installer. This is only a colour system for
+the notch surface, plus a submenu to switch it. SMTC titles,
+saved settings, auto-start, tabs, hit-test order (gear, then
+tabs, then media buttons, then pin), animation timing, and
+every default below are unchanged — except that the theme now
+survives a restart like the other toggles, which is the point
+of saving it.
+
+### 1. The three themes — what each changes
+Every theme defines the same slots: gradient top/bottom,
+border (normal and hover), top highlight, primary text,
+secondary text, muted text (section headers, inactive tabs),
+tab hover, accent, divider/bar track, media-button
+backgrounds (normal/hover/pressed), media glyph, gear colours,
+today-pill text, and battery glyph colours. Painting reads
+the current theme for every element — no element keeps a
+hardcoded v4 colour — so switching themes recolours the
+whole notch at once: collapsed clock, expanded header
+(clock, date, battery + glyph), divider, tab bar, HOME
+summaries, MEDIA / SYSTEM / CALENDAR tabs, media buttons,
+gear, and the calendar today pill.
+
+- **Onyx (default)** — the v4 look, exactly. Gradient
+  `32,32,36` (top) → `10,10,12` (bottom); border `58,58,62`
+  (`104,104,110` on hover), highlight `78,78,84`; primary
+  `248,248,250`, secondary `165,165,170`, muted `140,140,140`;
+  accent `248,248,250`; divider/track `52,52,56`; media
+  buttons `44,44,48` / hover `66,66,70` / pressed `94,94,98`;
+  gear `165,165,170` / hover `210,210,214` / pressed
+  `240,240,242`. Choosing Onyx after another theme restores
+  the v4 appearance exactly.
+- **Midnight** — deep blue gradient. Gradient `28,38,66` →
+  `10,16,32`; border `64,84,128` (`110,140,190` on hover),
+  highlight `88,110,160`; primary `240,244,252`, secondary
+  `165,178,205`, muted `130,145,175`; accent `96,165,250`
+  (blue — so the today pill, the CPU/RAM bar fills, and the
+  active tab underline all turn blue, with dark-navy pill
+  text `10,16,32` for contrast); divider/track `45,58,88`;
+  media buttons `38,52,84` / hover `58,74,112` / pressed
+  `84,102,142`; gear `165,178,205` / hover `205,218,240` /
+  pressed `240,244,252`.
+- **Graphite** — lighter grey gradient, still dark.
+  Gradient `72,72,78` → `38,38,42`; border `110,110,116`
+  (`150,150,158` on hover), highlight `130,130,138`;
+  primary `250,250,252`, secondary `200,200,205`, muted
+  `170,170,176`; accent `230,230,235` (light grey — pill,
+  bar fills, and active tab underline); divider/track
+  `88,88,94`; media buttons `84,84,90` / hover `106,106,112`
+  / pressed `134,134,142`; gear `200,200,205` / hover
+  `225,225,230` / pressed `250,250,252`.
+
+What a theme does NOT change: notch size, position, layout,
+fonts, tab order, or any behaviour. A theme is colours only.
+
+### 2. How to switch
+Right-click the tray icon, open the **Themes** submenu, and
+pick Onyx, Midnight, or Graphite. The current theme has a
+tick. The gear button in the expanded notch opens the same
+tray menu, so the Themes submenu is there too — no separate
+settings panel was built. Switching applies instantly to
+every visible notch (all monitors repaint at once); a notch
+hidden by fullscreen repaints when it returns. There is no
+restart, no rebuild, and no animation for the colour change
+itself — the next expand/collapse still animates as before
+when Animations is on.
+
+### 3. Settings key, load order, and fallback
+The theme is saved through the existing settings mechanism
+in `%APPDATA%\OnyxNotch\settings.ini` as:
+
+```ini
+theme=onyx
+```
+
+(`midnight` or `graphite` for the other themes.) It is
+written whenever the theme is switched, like any other
+toggle, and again on clean quit as part of the full rewrite
+of the known keys — so the same hand-edit warning applies:
+edit only the values of known keys, while the app is not
+running. It is loaded at startup, in `LoadSettings`, before
+the first notch is drawn, so the first notch already opens
+in the saved theme. An unknown or corrupt value
+(`theme=blue`, `theme=`, a missing key) is ignored line by
+line like any other bad value, and Onyx — the default —
+stands; a bad theme line never stops startup and never
+changes any other setting. Auto-start is unaffected: it
+still lives only in the Run registry value, never in the
+settings file.
+
+### 4. What did not change
+No new library, so `build.bat` is unchanged (same command as
+v5-settings). SMTC title/artist/status logic, the settings
+file format for the other keys, the registry auto-start
+behaviour, and the tray-menu structure outside the new
+Themes submenu are all untouched.
+
+## Build (Windows) — v5-SMTC changes the command
 
 1. Install Visual Studio with "Desktop development with C++"
    (the free Community edition is fine).
@@ -378,26 +669,38 @@ build.bat
 That compiles `onyxnotch.rc` (icon) and then `main.cpp`, and
 produces `OnyxNotch.exe` in this folder.
 
+New build requirement for v5-SMTC: MSVC with **C++17** and the
+Windows SDK **C++/WinRT headers**, plus **`windowsapp.lib`**.
+v5-settings adds only **`advapi32.lib`**, for the `Reg*`
+auto-start calls; the settings file uses Win32 file APIs that
+need no new library.
+The only changes to the v2–v4 command are `/std:c++17` and
+`windowsapp.lib`; everything else is identical.
+
 Exact command `build.bat` runs (MSVC):
 
 ```bat
 rc /nologo onyxnotch.rc
-cl /nologo /O2 /MT /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS main.cpp onyxnotch.res user32.lib gdi32.lib shell32.lib /link /SUBSYSTEM:WINDOWS /OUT:OnyxNotch.exe
+cl /nologo /std:c++17 /O2 /MT /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS main.cpp onyxnotch.res user32.lib gdi32.lib shell32.lib windowsapp.lib advapi32.lib /link /SUBSYSTEM:WINDOWS /OUT:OnyxNotch.exe
 ```
 
-MinGW alternative (also on Windows, if you have it):
-
-```bat
-windres onyxnotch.rc -O coff -o onyxnotch.o
-x86_64-w64-mingw32-g++ -O2 -mwindows -municode main.cpp onyxnotch.o -o OnyxNotch.exe
-```
+MinGW alternative: **none for v5-SMTC.** MinGW cannot build the
+C++/WinRT (SMTC) part — its headers/toolchain do not provide
+C++/WinRT — so the old MinGW command from v2–v4 is removed for
+this version and MSVC is the only supported path. If the build
+fails mentioning `winrt` headers, install a current Windows SDK
+with C++/WinRT headers; that is a toolchain install, not a code
+change.
 
 ## Run
 
 Double-click `OnyxNotch.exe`. To stop it, right-click its tray icon
-and choose Quit. There is no installer and no auto-start in v2 — if
-you want it at login, put a shortcut to the `.exe` in the Startup
-folder (`Win + R`, type `shell:startup`).
+and choose Quit. There is no installer. For auto-start, use the
+tray **Start with Windows** toggle (v5 feature 2, off by default;
+see the saved-settings section) — it supersedes the old v2 advice
+of putting a shortcut in the Startup folder (`Win + R`, type
+`shell:startup`), which still works if you prefer it but is no
+longer the documented path.
 
 ## Tray menu (v2, also opened by the v4 gear button)
 
@@ -412,6 +715,11 @@ before.
 - Widget: System stats (off by default)
 - Widget: Calendar (off by default)
 - Animations (ON by default)
+- Start with Windows (OFF by default; writes the Run registry
+  value — see the saved-settings section)
+- Themes submenu: Onyx / Midnight / Graphite, tick on the
+  current theme (see the themes section; also opened by the
+  gear button, since it opens this same menu)
 - When media controls are on: Media: Previous track / Play / Pause /
   Next track
 - About, Quit
@@ -526,6 +834,175 @@ Everything under "v4 additions" above still applies, plus:
   month (294 px for 4 rows, 334 px for 6 rows), header
   only 138 px — until a Windows run confirms them.
 
+## Honest limits — v5-SMTC (not verified on Windows)
+
+Everything under the earlier honest-limits sections still applies,
+plus the SMTC-specific unknowns. This Linux VM has no Windows
+toolchain, so **none of the v5-SMTC code has been compiled or run
+on Windows** — treat every behaviour below as untested until
+Kumar builds it with `build.bat` on Windows and runs it:
+
+- **Not compiled on Windows — especially the WinRT code.** The
+  C++/WinRT calls (`GlobalSystemMediaTransportControlsSessionManager::RequestAsync`,
+  `GetCurrentSession`, `GetPlaybackInfo`, `TryGetMediaPropertiesAsync`),
+  the `winrt::init_apartment(multi_threaded)` call, the
+  `/std:c++17` flag, and the `windowsapp.lib` link are all written
+  from the C++/WinRT API shape, not from a successful build. A
+  header, namespace, enum-name, or link error is possible and
+  would only show up at that first Windows build. The brace/paren
+  balance and symbol ordering were checked here, but that is not
+  a compile.
+- **SMTC against real players untested.** Whether Spotify, a
+  browser, or another player actually exposes a session, title,
+  artist, and a reliable Playing/Paused status to this code has
+  not been tried. Some players expose no SMTC session, report a
+  session with an empty title, or lag status changes — all of
+  those fall back to the v4 look by design, but which players do
+  what is unknown until tried. The status glyph is therefore
+  "reflects SMTC when it reports clearly", not "always correct":
+  if a player reports status late or wrong, the glyph will too.
+- **Blocking `.get()` on the 1-second timer untested.** The refresh
+  uses synchronous `.get()` on the WinRT async calls, on the
+  manager's timer tick, in a multi-threaded apartment chosen so
+  it does not need STA message pumping. If a player's SMTC
+  broker is slow or hangs, that tick could stall the UI thread
+  for that second; no timeout is applied, because adding one
+  would need a thread, which this design deliberately avoids.
+  Watch for a one-second UI hitch when a track changes.
+- **DPI behaviour of the new lines untested.** Title/artist rows
+  scale with `Scale()` like everything else, and ellipsis
+  truncation is measured at the current font/DPI, but per-monitor
+  DPI title layout, very long titles at high DPI, and non-Latin
+  scripts have not been seen on a real display.
+- **Animation interplay untested.** A track appearing or ending
+  while the notch is expanded resizes it through the existing
+  animation path, and a track change mid-expand/collapse has not
+  been observed; flicker or a clipped title during the ~220 ms
+  resize is possible — the Animations tray tick remains the
+  instant fallback, and collapsing hides the lines entirely.
+- **Heights are arithmetic, not measurements** (standard size,
+  96 DPI): MEDIA 242 px title-only / 262 px title+artist (220 px
+  with no track), HOME all-features 270 px with a title (246 px
+  without) — until a Windows run confirms them.
+- **Idle memory under 10 MB is still a target, not a measurement.**
+  The SMTC cache is two 256-character buffers plus a few globals;
+  WinRT initialisation happens once, only while Media controls
+  are on, but the runtime cost of the WinRT/SMTC broker itself
+  has not been measured in Task Manager.
+
+## Honest limits — v5-settings (not verified on Windows)
+
+Everything under the earlier honest-limits sections still applies,
+plus the settings-specific unknowns. This Linux VM has no Windows
+toolchain, so **none of the v5-settings code has been compiled or
+run on Windows** — treat every behaviour below as untested until
+Kumar builds it with `build.bat` on Windows and runs it:
+
+- **Not compiled on Windows.** The new code uses only Win32
+  file APIs (`CreateFileW`, `ReadFile`, `WriteFile`,
+  `CreateDirectoryW`, `GetEnvironmentVariableW`) and registry
+  APIs (`RegOpenKeyExW`, `RegCreateKeyExW`, `RegQueryValueExW`,
+  `RegSetValueExW`, `RegDeleteValueW`), plus `sprintf_s`,
+  `strlen`/`strcmp` and `wcscpy_s`/`wcscat_s` — but `cl` was
+  never run on it here, so a declaration, calling-convention,
+  or link error (including a missing `advapi32.lib`) is still
+  possible until the first Windows build. Brace/paren balance
+  was checked here; that is not a compile.
+- **Settings load/save round-trip untested.** That the first
+  notch really opens at the saved size with the saved toggles,
+  that a toggle change really lands in `settings.ini`, and
+  that a quit really saves, have not been observed. In
+  particular, whether the file is written with the expected
+  line endings/values and re-read identically has not been
+  tried — check the file contents after one toggle change
+  and one restart before trusting persistence.
+- **Auto-start registry behaviour untested.** That ticking
+  Start with Windows really creates the quoted-path Run value,
+  that unticking really removes it, that the toggle really
+  reflects an existing value at startup, and that Windows
+  really launches the app at login from that value, have not
+  been tried. A stale path after moving the `.exe` is a
+  known case (see the saved-settings section), not a tested
+  one. Check the value in `regedit` after toggling, and test
+  one real login, before relying on it.
+- **Interaction with SMTC/tabs untested.** The settings code
+  does not touch SMTC title/artist/status logic, tab layout,
+  or hit-test order, and it loads before the first notch is
+  created — but the combination (saved Media on + SMTC title
+  on first expand, saved tab state is NOT persisted so every
+  expand still starts on HOME, saved Animations off + saved
+  size) has not been run together on Windows.
+- **DPI and animation interplay untested.** Settings load
+  happens before DPI-aware notch creation, and saving happens
+  on toggle regardless of DPI, but per-monitor DPI restores
+  and animated resizes after a settings restore have not been
+  observed; the Animations toggle itself is persisted, so a
+  saved Animations-off state should snap on first expand —
+  that too is untested until run.
+- **Failure paths untested by observation.** Missing file,
+  corrupt file, unknown keys, out-of-range values, a missing
+  `%APPDATA%`, and a denied registry write are all handled
+  in code by falling back or leaving the toggle unchanged —
+  but none of those paths has been exercised on a real
+  machine, so treat "never crashes on a bad file" as a design
+  claim, not a test result, until a deliberately corrupt
+  `settings.ini` is tried.
+
+## Honest limits — v5-themes (not verified on Windows)
+
+Everything under the earlier honest-limits sections still applies,
+plus the theme-specific unknowns. This Linux VM has no Windows
+toolchain, so **none of the v5-themes code has been compiled or
+run on Windows** — treat every behaviour below as untested until
+Kumar builds it with `build.bat` on Windows and runs it:
+
+- **Not compiled on Windows.** The theme code uses only the
+  same Win32/GDI APIs as before (`CreateSolidBrush`,
+  `CreatePen`, `GetRValue`/`GetGValue`/`GetBValue`, `AppendMenuW`
+  with `MF_POPUP`, `InvalidateRect`), plus a plain struct table
+  — but `cl` was never run on it here, so a declaration or
+  initialiser error is still possible until the first Windows
+  build. Brace/paren balance was checked here; that is not a
+  compile.
+- **Theme appearance on a real display untested.** The
+  Midnight blue and Graphite grey values are chosen on paper
+  (see the themes section); whether Midnight reads as deep blue
+  rather than black, whether Graphite still reads as dark, and
+  whether the blue accent pill keeps dark-navy text readable
+  have not been seen on a real display and may need tuning.
+  Onyx is the v4 values exactly, so it should match v4 — but
+  even that "should" is untested until run, since the painting
+  code paths changed from literals to table lookups.
+- **Instant-switch repaint untested.** Switching calls the
+  existing `InvalidateAllNotches`, which skips notches hidden
+  by fullscreen (they repaint on restore) — whether every
+  visible notch on every monitor actually repaints at once,
+  with no stale-colour frame, has not been observed. The
+  submenu itself (tick position, dismissal, opening from the
+  gear at the gear's screen position) is likewise untested on
+  Windows, as the gear menu path was already untested.
+- **Settings round-trip for theme untested.** That a switch
+  really lands as `theme=midnight` (or `graphite`) in
+  `settings.ini`, that the next start really opens in that
+  theme, and that a corrupt value really falls back to Onyx
+  without touching other keys, have not been tried — check
+  the file contents after one switch and one restart before
+  trusting persistence.
+- **DPI behaviour untested**, as in v3/v4: theme colours do not
+  scale with DPI (only geometry does), so no DPI-specific
+  theme failure is expected — but per-monitor DPI repaint
+  after a theme switch has not been run.
+- **Animation interplay untested.** A theme switch is a
+  repaint, not a resize, so it does not run the ~220 ms
+  animation path — but a switch mid-expand/collapse has not
+  been observed; a frame painted with mixed theme colours
+  during animation is possible, and the Animations tray tick
+  remains the instant fallback for animation issues generally.
+- **Idle memory under 10 MB is still a target, not a
+  measurement.** The theme table is three small structs and
+  switching allocates nothing retained, so no idle-cost change
+  is expected — measure it in Task Manager to confirm.
+
 ## Honest limits — v4 additions (not verified on Windows)
 
 - **Not compiled on Windows.** This Linux VM has no Windows
@@ -579,7 +1056,9 @@ Everything under "v4 additions" above still applies, plus:
 
 - No notifications, calendar sync, or other networked widgets.
   The calendar widget is a local month view only.
-- No auto-start, no installer.
+- No installer. (Auto-start exists since v5 feature 2 — see the
+  saved-settings section — so the old "no auto-start" line no
+  longer applies.)
 
 ## Files
 
@@ -609,6 +1088,30 @@ Everything under "v4 additions" above still applies, plus:
   before media buttons and pin), height animates via the
   existing path, and the tab resets to HOME on the next
   expand after a collapse.
+  v5-SMTC (feature 1 only): C++/WinRT read of the local SMTC
+  session on the existing 1-second timer (cached title/artist/
+  status, no new timer/thread/network), MEDIA title+artist lines
+  and a HOME compact title line with GDI ellipsis truncation,
+  a status-aware play/pause glyph, exact v4 fallback on any
+  failure, and heights grown via the shared `ComputeLayout`.
+  No themes.
+  v5-settings (feature 2 only): plain key=value settings file
+  at `%APPDATA%\OnyxNotch\settings.ini`, loaded before the
+  first notch is drawn and saved on every size/toggle change
+  and on clean quit (full rewrite of the known keys, corrupt
+  or missing file falls back to defaults), plus a Start with
+  Windows tray toggle backed by the HKCU Run registry value
+  (registry is the source of truth for auto-start, the file
+  for everything else). SMTC code is untouched by this change.
+  v5-themes (feature 3 only): theme table (Onyx / Midnight /
+  Graphite) with every painted colour read from the current
+  theme, a Themes submenu in the shared tray/gear menu with a
+  tick on the current theme, instant repaint of all notches on
+  switch, and a `theme` key in `settings.ini` loaded before the
+  first notch is drawn (unknown values fall back to Onyx). No
+  new library, so `build.bat` is unchanged.
+  `settings.ini` is a runtime file created on the user's
+  machine, not a source file in this folder.
 - `build.bat` — MSVC build script (resource compile + compile/link).
 - `onyxnotch.rc` — resource script binding the icon (ID 100).
 - `onyxnotch.ico` — custom black-pill icon, 16/32/48 px, 32-bit.

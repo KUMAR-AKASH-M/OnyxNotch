@@ -1,3 +1,73 @@
+// OnyxNotch v5 (features 1 + 2 + 3: SMTC track titles, saved
+// settings + auto-start, themes) - Mac-style notch for Windows,
+// native Win32 C++.
+// v5-themes changes over v5-settings (feature 3 only, nothing
+// else is added here: no position/size customisation beyond
+// the existing Size menu, no weather, no calendar events, no
+// installer):
+//  1. Theme system: three themes (Onyx = the v4 look, default;
+//     Midnight = deep blue; Graphite = lighter grey, still dark),
+//     each defining gradient top/bottom, border, primary and
+//     secondary text, and an accent (today pill, progress-bar
+//     fill, active tab underline). Painting reads the current
+//     theme everywhere — no element keeps a hardcoded v4 colour.
+//  2. Themes submenu in the tray menu (shared with the gear
+//     menu, which opens the same menu): tick on the current
+//     theme, instant repaint of all notches on switch, saved
+//     via the existing settings file mechanism (theme key).
+//  3. SMTC behaviour and settings/auto-start behaviour are
+//     untouched except for the added theme key; build.bat is
+//     unchanged (themes need no new library).
+// v5-settings changes over v5-SMTC:
+//  1. Saved settings: a plain key=value file at
+//     %APPDATA%\OnyxNotch\settings.ini (no JSON library), loaded
+//     in wWinMain BEFORE the manager window creates the first
+//     notch, and saved whenever a size/toggle changes and again
+//     on clean quit. Persisted keys: size, hide_on_fullscreen,
+//     media, widget_stats, widget_calendar, animations, theme
+//     (theme=onyx|midnight|graphite; an unknown value falls back
+//     to Onyx on load, see LoadSettings).
+//  2. Auto-start: a tray toggle "Start with Windows" (default
+//     OFF, in the same tray menu the gear opens) that writes or
+//     removes HKCU\Software\Microsoft\Windows\CurrentVersion\Run
+//     \OnyxNotch with the quoted current .exe path. At startup
+//     the registry value is read to initialise the toggle; the
+//     registry is the source of truth for auto-start, the file
+//     for everything else. Auto-start is never written to the
+//     settings file.
+//  3. Robustness: a missing or corrupt settings file falls back
+//     to the old defaults and never prevents startup; unknown
+//     keys and malformed lines are ignored, and out-of-range
+//     values are ignored. The settings directory is created if
+//     missing. Saving is a full rewrite of the known keys only
+//     (see SaveSettings); a failed save is silently ignored so
+//     it can never block a toggle or a quit. Registry calls need
+//     advapi32.lib (see build.bat); file calls need no new lib.
+// v5-SMTC changes over tabbed v4 (themes are feature 3, added
+// after settings — see the v5-themes note at the top):
+//  1. When Media controls are on, the current SMTC session's track
+//     title/artist are read on the existing 1-second timer (no new
+//     timer, thread, or polling) via C++/WinRT
+//     (GlobalSystemMediaTransportControlsSessionManager) and shown
+//     in the MEDIA tab (title line, artist line) and as one compact
+//     title line in the HOME media summary. Text that does not fit
+//     the notch width is truncated with an ellipsis by GDI.
+//  2. The play/pause glyph now reflects SMTC playback status when
+//     it is known: playing shows pause bars, paused shows a play
+//     triangle. Any other/unknown status keeps the old combined
+//     play+pause glyph, so nothing is claimed that is not known.
+//  3. Failure fallback is exact v4 behaviour: no session, no
+//     properties, or any WinRT failure means no title/artist lines
+//     and no glyph change, no crash, no blank hole — the expanded
+//     heights shrink back to the v4 sizes. Media keys remain the
+//     only control path; SMTC is read-only here, never used to
+//     play/pause/seek. No network: SMTC is the local media
+//     session broker only.
+//  4. Build requirement (new): MSVC with C++17 and the Windows SDK
+//     C++/WinRT headers, linked against windowsapp.lib. MinGW
+//     cannot build the WinRT part, so MSVC is the supported path
+//     for v5-SMTC (see README). When Media controls are off, the
+//     SMTC code is never called, so idle cost is unchanged.
 // OnyxNotch v4 - Mac-style notch for Windows, native Win32 C++.
 // v4 changes over v3 (UI ONLY: no new features, no behaviour changes):
 //  1. Premium surface: vertical near-black gradient, subtle light
@@ -62,9 +132,9 @@
 // No Electron, no Python, no .NET runtime. One .exe, one source file
 // (plus a small .rc/.ico for the custom tray/app icon).
 // Build on Windows: run build.bat in a Visual Studio Developer Command Prompt.
-//   cl /O2 /MT main.cpp onyxnotch.res user32.lib gdi32.lib shell32.lib
-// Or with MinGW: windres onyxnotch.rc -O coff -o onyxnotch.o, then
-//   x86_64-w64-mingw32-g++ -O2 -mwindows -municode main.cpp onyxnotch.o -o OnyxNotch.exe
+//   cl /std:c++17 /O2 /MT main.cpp onyxnotch.res user32.lib gdi32.lib shell32.lib windowsapp.lib
+// MinGW cannot build the WinRT (SMTC) part; MSVC is the supported
+// path for v5-SMTC (see README). No MinGW command is given for v5.
 //
 // v2 changes over v1 (v1 behaviour is otherwise intact):
 //  1. Multi-monitor: one notch per monitor, top-centre of each monitor's
@@ -105,10 +175,20 @@
 #include <vector>
 #include <algorithm>
 #include <cmath>
+#include <stdio.h> // v5-settings: sprintf_s in SaveSettings
+#include <string.h> // v5-settings: strlen/strcmp in LoadSettings
+// v5-SMTC: C++/WinRT headers for the local SMTC session manager.
+// These need the Windows SDK with C++/WinRT and /std:c++17 (see
+// build.bat). No other WinRT API is used; there is no network use.
+#include <winrt/base.h>
+#include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Media.Control.h>
 
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "windowsapp.lib")
+#pragma comment(lib, "advapi32.lib") // v5-settings: Reg* calls for auto-start
 
 #define ID_TRAY_ICON            1
 #define WM_TRAY                 (WM_APP + 1)
@@ -128,6 +208,10 @@
 #define ID_TRAY_MEDIA_PREV      1010
 #define ID_TRAY_MEDIA_PLAYPAUSE 1011
 #define ID_TRAY_MEDIA_NEXT      1012
+#define ID_TRAY_AUTOSTART       1014
+#define ID_TRAY_THEME_ONYX      1015
+#define ID_TRAY_THEME_MIDNIGHT  1016
+#define ID_TRAY_THEME_GRAPHITE  1017
 #define IDI_ONYXNOTCH_ICON      100
 
 static const wchar_t kNotchClass[] = L"OnyxNotch";
@@ -143,6 +227,317 @@ static bool g_mediaEnabled = false;     // opt-in
 static bool g_widgetStats = false;      // opt-in
 static bool g_widgetCalendar = false;   // opt-in
 static bool g_animations = true;        // v3: ON by default, tray tick
+// v5-settings: auto-start is NOT stored in the settings file.
+// The registry (see below) is its only source of truth, so this
+// starts OFF and is overwritten by LoadAutoStart() at startup.
+static bool g_startWithWindows = false; // v5-settings: OFF by default
+
+// ---------------------------------------------------------------------------
+// v5-themes: theme table. Onyx reproduces the v4 colours exactly
+// (gradient 32,32,36 -> 10,10,12; border 58 normal / 104 hover;
+// primary 248,248,250; secondary 165,165,170; muted 140,140,140;
+// buttons 44 / hover 66 / pressed 94; gear 165 / 210 / 240),
+// so Onyx is pixel-identical to v4. Midnight is a deep blue
+// gradient with a blue accent; Graphite is a lighter grey
+// gradient that is still dark, with a light-grey accent.
+// accent = today pill fill, progress-bar fill, active tab
+// underline (all three share it, per theme). pillText is the
+// dark text drawn on an accent pill; glyph is the media glyph
+// colour; batteryFill is the battery fill (primary in all
+// themes); gearHole is the gear's dark centre hole. Painting
+// functions read CurrentTheme() — they hold no colour literals.
+// ---------------------------------------------------------------------------
+struct Theme {
+    COLORREF gradTop, gradBottom;
+    COLORREF border, borderHover, highlight;
+    COLORREF primary, secondary, muted, tabHover;
+    COLORREF accent;
+    COLORREF divider;
+    COLORREF btnBg, btnHover, btnPressed;
+    COLORREF glyph;
+    COLORREF gear, gearHover, gearPressed, gearHole;
+    COLORREF pillText;
+    COLORREF batteryOutline, batteryFill, batteryBolt;
+};
+
+static const Theme kThemes[3] = {
+    // Onyx (default): the v4 look, exactly.
+    { RGB(32, 32, 36), RGB(10, 10, 12),
+      RGB(58, 58, 62), RGB(104, 104, 110), RGB(78, 78, 84),
+      RGB(248, 248, 250), RGB(165, 165, 170), RGB(140, 140, 140), RGB(210, 210, 214),
+      RGB(248, 248, 250),
+      RGB(52, 52, 56),
+      RGB(44, 44, 48), RGB(66, 66, 70), RGB(94, 94, 98),
+      RGB(255, 255, 255),
+      RGB(165, 165, 170), RGB(210, 210, 214), RGB(240, 240, 242), RGB(18, 18, 20),
+      RGB(18, 18, 20),
+      RGB(220, 220, 224), RGB(248, 248, 250), RGB(24, 24, 26) },
+    // Midnight: deep blue gradient, blue accent.
+    { RGB(28, 38, 66), RGB(10, 16, 32),
+      RGB(64, 84, 128), RGB(110, 140, 190), RGB(88, 110, 160),
+      RGB(240, 244, 252), RGB(165, 178, 205), RGB(130, 145, 175), RGB(205, 218, 240),
+      RGB(96, 165, 250),
+      RGB(45, 58, 88),
+      RGB(38, 52, 84), RGB(58, 74, 112), RGB(84, 102, 142),
+      RGB(240, 244, 252),
+      RGB(165, 178, 205), RGB(205, 218, 240), RGB(240, 244, 252), RGB(12, 18, 34),
+      RGB(10, 16, 32),
+      RGB(200, 212, 235), RGB(240, 244, 252), RGB(10, 16, 32) },
+    // Graphite: lighter grey gradient, still dark, light-grey accent.
+    { RGB(72, 72, 78), RGB(38, 38, 42),
+      RGB(110, 110, 116), RGB(150, 150, 158), RGB(130, 130, 138),
+      RGB(250, 250, 252), RGB(200, 200, 205), RGB(170, 170, 176), RGB(225, 225, 230),
+      RGB(230, 230, 235),
+      RGB(88, 88, 94),
+      RGB(84, 84, 90), RGB(106, 106, 112), RGB(134, 134, 142),
+      RGB(250, 250, 252),
+      RGB(200, 200, 205), RGB(225, 225, 230), RGB(250, 250, 252), RGB(30, 30, 34),
+      RGB(30, 30, 34),
+      RGB(235, 235, 240), RGB(250, 250, 252), RGB(38, 38, 42) },
+};
+
+static int g_theme = 0; // 0 = Onyx (default), 1 = Midnight, 2 = Graphite
+
+static const Theme& CurrentTheme()
+{
+    if (g_theme < 0 || g_theme > 2) return kThemes[0];
+    return kThemes[g_theme];
+}
+
+static const char* ThemeKey(int t)
+{
+    if (t == 1) return "midnight";
+    if (t == 2) return "graphite";
+    return "onyx";
+}
+
+// ---------------------------------------------------------------------------
+// v5-settings: saved settings file + auto-start registry value.
+// File: %APPDATA%\OnyxNotch\settings.ini, plain key=value, no
+// JSON library. Auto-start: HKCU\Software\Microsoft\Windows\
+// CurrentVersion\Run, value name "OnyxNotch", REG_SZ quoted exe
+// path. Registry is the source of truth for auto-start; the file
+// is the source of truth for everything else, including the theme.
+// All failures here are silent by design: a settings problem must
+// never stop the app starting, break a toggle, or block a quit.
+// ---------------------------------------------------------------------------
+static bool GetOnyxSettingsDir(wchar_t* out, size_t count)
+{
+    wchar_t appData[MAX_PATH] = { 0 };
+    DWORD len = GetEnvironmentVariableW(L"APPDATA", appData, MAX_PATH);
+    if (len == 0 || len >= MAX_PATH) return false;
+    if (wcscpy_s(out, count, appData) != 0) return false;
+    if (wcscat_s(out, count, L"\\OnyxNotch") != 0) return false;
+    return true;
+}
+
+static bool GetSettingsPath(wchar_t* out, size_t count)
+{
+    if (!GetOnyxSettingsDir(out, count)) return false;
+    if (wcscat_s(out, count, L"\\settings.ini") != 0) return false;
+    return true;
+}
+
+static bool StrEqualsIgnoreCase(const char* a, const char* b)
+{
+    while (*a && *b) {
+        char ca = *a, cb = *b;
+        if (ca >= 'A' && ca <= 'Z') ca = (char)(ca + 32);
+        if (cb >= 'A' && cb <= 'Z') cb = (char)(cb + 32);
+        if (ca != cb) return false;
+        a++; b++;
+    }
+    return *a == *b;
+}
+
+// Parses a boolean value. Returns false (caller keeps the old
+// value) for anything that is not recognisably true/false, so a
+// corrupt value cannot flip a toggle to a surprising state.
+static bool ParseBoolValue(const char* v, bool& out)
+{
+    if (StrEqualsIgnoreCase(v, "1") || StrEqualsIgnoreCase(v, "true") ||
+        StrEqualsIgnoreCase(v, "yes") || StrEqualsIgnoreCase(v, "on")) {
+        out = true; return true;
+    }
+    if (StrEqualsIgnoreCase(v, "0") || StrEqualsIgnoreCase(v, "false") ||
+        StrEqualsIgnoreCase(v, "no") || StrEqualsIgnoreCase(v, "off")) {
+        out = false; return true;
+    }
+    return false;
+}
+
+static void LoadSettings()
+{
+    // Globals already hold the old defaults; this only overrides
+    // them for keys that parse cleanly. Missing file, unreadable
+    // file, unknown keys, malformed lines and out-of-range values
+    // all leave the corresponding default untouched.
+    wchar_t path[MAX_PATH] = { 0 };
+    if (!GetSettingsPath(path, MAX_PATH)) return;
+    HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return; // missing = defaults
+    char buf[4096];
+    DWORD read = 0;
+    BOOL ok = ReadFile(h, buf, (DWORD)sizeof(buf) - 1, &read, NULL);
+    CloseHandle(h);
+    if (!ok) return;
+    buf[read] = '\0';
+    char* p = buf;
+    while (*p) {
+        char* lineEnd = p;
+        while (*lineEnd && *lineEnd != '\n') lineEnd++;
+        char saved = *lineEnd;
+        *lineEnd = '\0';
+        // Trim leading whitespace; skip blank / comment lines.
+        char* line = p;
+        while (*line == ' ' || *line == '\t' || *line == '\r') line++;
+        if (*line && *line != ';' && *line != '#' && *line != '[') {
+            char* eq = line;
+            while (*eq && *eq != '=') eq++;
+            if (*eq == '=') {
+                *eq = '\0';
+                char* key = line;
+                // Trim trailing whitespace from the key.
+                char* kend = key + strlen(key);
+                while (kend > key && (kend[-1] == ' ' || kend[-1] == '\t' || kend[-1] == '\r')) { kend--; *kend = '\0'; }
+                char* val = eq + 1;
+                while (*val == ' ' || *val == '\t') val++;
+                char* vend = val + strlen(val);
+                while (vend > val && (vend[-1] == ' ' || vend[-1] == '\t' || vend[-1] == '\r')) { vend--; *vend = '\0'; }
+                bool b = false;
+                if (StrEqualsIgnoreCase(key, "size")) {
+                    if (strcmp(val, "0") == 0) g_size = 0;
+                    else if (strcmp(val, "1") == 0) g_size = 1;
+                    else if (strcmp(val, "2") == 0) g_size = 2;
+                    // Any other value is ignored (default kept).
+                } else if (StrEqualsIgnoreCase(key, "hide_on_fullscreen")) {
+                    if (ParseBoolValue(val, b)) g_hideOnFullscreen = b;
+                } else if (StrEqualsIgnoreCase(key, "media")) {
+                    if (ParseBoolValue(val, b)) g_mediaEnabled = b;
+                } else if (StrEqualsIgnoreCase(key, "widget_stats")) {
+                    if (ParseBoolValue(val, b)) g_widgetStats = b;
+                } else if (StrEqualsIgnoreCase(key, "widget_calendar")) {
+                    if (ParseBoolValue(val, b)) g_widgetCalendar = b;
+                } else if (StrEqualsIgnoreCase(key, "animations")) {
+                    if (ParseBoolValue(val, b)) g_animations = b;
+                } else if (StrEqualsIgnoreCase(key, "theme")) {
+                    // v5-themes: unknown/corrupt values are ignored,
+                    // so the current value (Onyx by default) stands.
+                    if (StrEqualsIgnoreCase(val, "onyx")) g_theme = 0;
+                    else if (StrEqualsIgnoreCase(val, "midnight")) g_theme = 1;
+                    else if (StrEqualsIgnoreCase(val, "graphite")) g_theme = 2;
+                }
+                // Unknown keys are ignored.
+            }
+        }
+        if (saved == '\0') break;
+        p = lineEnd + 1;
+    }
+}
+
+static void SaveSettings()
+{
+    // Full rewrite of the known keys only. That is the documented
+    // trade-off: any unrelated lines a user hand-added to the
+    // file are NOT preserved across a save. The file this app
+    // writes is tiny (under 300 bytes), so the rewrite is atomic
+    // enough in practice; a failed save is ignored silently.
+    wchar_t dir[MAX_PATH] = { 0 };
+    wchar_t path[MAX_PATH] = { 0 };
+    if (!GetOnyxSettingsDir(dir, MAX_PATH)) return;
+    if (!GetSettingsPath(path, MAX_PATH)) return;
+    CreateDirectoryW(dir, NULL); // already-exists is fine
+    HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, NULL,
+                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return;
+    char buf[512];
+    int len = sprintf_s(buf, sizeof(buf),
+        "; OnyxNotch settings - rewritten on every change and on clean quit.\r\n"
+        "; Unknown keys are ignored on load; values are 0 = off, 1 = on.\r\n"
+        "size=%d\r\n"
+        "hide_on_fullscreen=%d\r\n"
+        "media=%d\r\n"
+        "widget_stats=%d\r\n"
+        "widget_calendar=%d\r\n"
+        "animations=%d\r\n"
+        "theme=%s\r\n",
+        g_size,
+        g_hideOnFullscreen ? 1 : 0,
+        g_mediaEnabled ? 1 : 0,
+        g_widgetStats ? 1 : 0,
+        g_widgetCalendar ? 1 : 0,
+        g_animations ? 1 : 0,
+        ThemeKey(g_theme));
+    if (len > 0) {
+        DWORD written = 0;
+        WriteFile(h, buf, (DWORD)len, &written, NULL);
+    }
+    CloseHandle(h);
+}
+
+static const wchar_t kRunKeyPath[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+static const wchar_t kRunValueName[] = L"OnyxNotch";
+
+static void LoadAutoStart()
+{
+    // Registry is the source of truth: a present, non-empty REG_SZ
+    // value means ON, whatever path it holds. If the .exe has
+    // moved since the value was written, toggling off and on
+    // again rewrites it to the current path (see SetAutoStart).
+    g_startWithWindows = false;
+    HKEY key = NULL;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kRunKeyPath, 0, KEY_QUERY_VALUE, &key) != ERROR_SUCCESS) return;
+    wchar_t value[MAX_PATH] = { 0 };
+    DWORD size = sizeof(value);
+    DWORD type = 0;
+    LONG rc = RegQueryValueExW(key, kRunValueName, NULL, &type, (LPBYTE)value, &size);
+    RegCloseKey(key);
+    if (rc == ERROR_SUCCESS && type == REG_SZ && size > 0 && value[0] != L'\0') {
+        g_startWithWindows = true;
+    }
+}
+
+static bool SetAutoStart(bool on)
+{
+    if (!on) {
+        HKEY key = NULL;
+        LONG rc = RegOpenKeyExW(HKEY_CURRENT_USER, kRunKeyPath, 0, KEY_SET_VALUE, &key);
+        if (rc == ERROR_FILE_NOT_FOUND) return true; // already gone = desired state
+        if (rc != ERROR_SUCCESS) return false;
+        rc = RegDeleteValueW(key, kRunValueName);
+        RegCloseKey(key);
+        if (rc == ERROR_SUCCESS || rc == ERROR_FILE_NOT_FOUND) return true;
+        return false;
+    }
+    wchar_t exePath[MAX_PATH] = { 0 };
+    DWORD len = GetModuleFileNameW(NULL, exePath, MAX_PATH);
+    if (len == 0 || len >= MAX_PATH) return false;
+    wchar_t quoted[MAX_PATH + 2] = { 0 };
+    if (wcscpy_s(quoted, MAX_PATH + 2, L"\"") != 0) return false;
+    if (wcscat_s(quoted, MAX_PATH + 2, exePath) != 0) return false;
+    if (wcscat_s(quoted, MAX_PATH + 2, L"\"") != 0) return false;
+    HKEY key = NULL;
+    LONG rc = RegCreateKeyExW(HKEY_CURRENT_USER, kRunKeyPath, 0, NULL, 0,
+                              KEY_SET_VALUE, NULL, &key, NULL);
+    if (rc != ERROR_SUCCESS) return false;
+    DWORD bytes = (DWORD)((wcslen(quoted) + 1) * sizeof(wchar_t));
+    rc = RegSetValueExW(key, kRunValueName, 0, REG_SZ, (const BYTE*)quoted, bytes);
+    RegCloseKey(key);
+    return rc == ERROR_SUCCESS;
+}
+
+// v5-SMTC cached state. Declared here (before ComputeLayout,
+// which reads hasTrack/artist for heights) and filled only by
+// RefreshSmtc on the 1-second timer; painting only reads the cache.
+// Status: 0 = unknown/none, 1 = playing, 2 = paused.
+static bool g_smtcInitTried = false;
+static bool g_smtcInitOk = false;
+static bool g_smtcHasTrack = false;
+static wchar_t g_smtcTitle[256] = { 0 };
+static wchar_t g_smtcArtist[256] = { 0 };
+static int g_smtcStatus = 0;
+static int g_smtcLayoutKey = 0;
 
 static HWND g_managerHwnd = NULL;
 static NOTIFYICONDATAW g_nid = { 0 };
@@ -233,6 +628,9 @@ struct Layout {
     // Detailed sections (full width on their own tab).
     int mediaX = 0, mediaW = 0;
     int mediaLabelY = 0;
+    // v5-SMTC: title/artist lines between the MEDIA label and the
+    // buttons. -1 = line not shown (no track, or no artist).
+    int mediaTitleY = -1, mediaArtistY = -1;
     int mediaButtonY = 0;
     int mediaButtonH = 0;
     RECT btnPrev = { 0, 0, 0, 0 };
@@ -245,6 +643,9 @@ struct Layout {
     int calendarY = 0;
     int calendarH = 0;
     // HOME summaries (compact, stacked).
+    // v5-SMTC: one compact title line above the HOME media buttons.
+    // -1 = not shown (no track).
+    int homeMediaTitleY = -1;
     int homeMediaButtonY = 0, homeMediaButtonH = 0;
     RECT homeBtnPrev = { 0, 0, 0, 0 };
     RECT homeBtnPlay = { 0, 0, 0, 0 };
@@ -330,6 +731,14 @@ static Layout ComputeLayout(Notch* n, int clientW)
         int y = L.bodyY;
         int lastBottom = y;
         if (g_mediaEnabled) {
+            // v5-SMTC: compact title line above the mini buttons,
+            // only when a track is known. It costs one 20 px row
+            // plus a 4 px gap; with no track the layout is exactly
+            // the v4 HOME layout.
+            if (g_smtcHasTrack) {
+                L.homeMediaTitleY = y;
+                y += Scale(20, dpi) + Scale(4, dpi);
+            }
             L.homeMediaButtonY = y;
             L.homeMediaButtonH = Scale(20, dpi);
             int bw = (bodyW - 2 * btnGap) / 3;
@@ -358,7 +767,22 @@ static Layout ComputeLayout(Notch* n, int clientW)
         L.mediaX = margin;
         L.mediaW = bodyW;
         L.mediaLabelY = L.bodyY;
-        L.mediaButtonY = L.bodyY + Scale(22, dpi);
+        // v5-SMTC: title line, then artist line (only if an
+        // artist string exists), then the buttons. Each line is
+        // 20 px plus a 4 px gap before the buttons; with no track
+        // the buttons sit at the old v4 offset, unchanged.
+        if (g_smtcHasTrack) {
+            int y = L.bodyY + Scale(20, dpi);
+            L.mediaTitleY = y;
+            y += Scale(20, dpi);
+            if (g_smtcArtist[0] != L'\0') {
+                L.mediaArtistY = y;
+                y += Scale(20, dpi);
+            }
+            L.mediaButtonY = y + Scale(4, dpi);
+        } else {
+            L.mediaButtonY = L.bodyY + Scale(22, dpi);
+        }
         L.mediaButtonH = Scale(28, dpi);
         int bw = (bodyW - 2 * btnGap) / 3;
         if (bw < 20) bw = 20;
@@ -603,6 +1027,17 @@ static void ShowTrayMenuAt(POINT pt, UINT alignFlags)
     AppendCheck(menu, ID_TRAY_WIDGET_STATS, L"Widget: System stats", g_widgetStats);
     AppendCheck(menu, ID_TRAY_WIDGET_CALENDAR, L"Widget: Calendar", g_widgetCalendar);
     AppendCheck(menu, ID_TRAY_ANIMATIONS, L"Animations", g_animations);
+    AppendCheck(menu, ID_TRAY_AUTOSTART, L"Start with Windows", g_startWithWindows);
+    // v5-themes: submenu, so it appears in both the tray menu and
+    // the gear menu (the gear opens this same menu). Tick marks
+    // the current theme; switching is handled in ManagerWndProc.
+    {
+        HMENU themeMenu = CreatePopupMenu();
+        AppendCheck(themeMenu, ID_TRAY_THEME_ONYX, L"Onyx", g_theme == 0);
+        AppendCheck(themeMenu, ID_TRAY_THEME_MIDNIGHT, L"Midnight", g_theme == 1);
+        AppendCheck(themeMenu, ID_TRAY_THEME_GRAPHITE, L"Graphite", g_theme == 2);
+        AppendMenuW(menu, MF_POPUP, (UINT_PTR)themeMenu, L"Themes");
+    }
     if (g_mediaEnabled) {
         AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
         AppendMenuW(menu, MF_STRING, ID_TRAY_MEDIA_PREV, L"Media: Previous track");
@@ -681,6 +1116,23 @@ static void DrawLeftText(HDC hdc, HFONT font, const wchar_t* text,
     SelectObject(hdc, old);
 }
 
+// v5-SMTC: same as DrawLeftText, but text longer than the given
+// width is truncated with an ellipsis by GDI (DT_END_ELLIPSIS)
+// instead of being clipped silently. The width passed in is the
+// section width, so truncation is by pixels at the current font
+// and DPI, not by a character count; the stored strings are
+// additionally capped at 255 characters (see RefreshSmtc).
+static void DrawLeftEllipsisText(HDC hdc, HFONT font, const wchar_t* text,
+                                 int x, int y, int w, int h, COLORREF color)
+{
+    HFONT old = (HFONT)SelectObject(hdc, font);
+    SetTextColor(hdc, color);
+    SetBkMode(hdc, TRANSPARENT);
+    RECT rc = { x, y, x + w, y + h };
+    DrawTextW(hdc, text, -1, &rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+    SelectObject(hdc, old);
+}
+
 // ---------------------------------------------------------------------------
 // Media keys (plain Win32, no SMTC/WinRT dependency). The active player
 // receives the key, exactly as if a media key on the keyboard was pressed.
@@ -693,6 +1145,127 @@ static void SendMediaKey(WORD vk)
     SendInput(1, &input, sizeof(input));
     input.ki.dwFlags = KEYEVENTF_KEYUP;
     SendInput(1, &input, sizeof(input));
+}
+
+// ---------------------------------------------------------------------------
+// v5-SMTC: read-only track title/artist + playback status from the
+// local System Media Transport Controls session. Called only from
+// the existing 1-second manager timer, and only while Media
+// controls are on (off = never called, zero cost). The last good
+// title/artist/status are cached in globals; painting only reads
+// the cache, never calls WinRT. Every WinRT call is inside
+// try/catch, so a failure degrades to "no track" instead of a
+// crash. Media keys above stay the only control path.
+// Status values: 0 = unknown/none (old combined glyph),
+// 1 = playing (show pause bars), 2 = paused (show play triangle).
+// Other statuses (Stopped, Changing, Closed, Opened) stay 0, so
+// the glyph never claims a state SMTC did not report clearly.
+// (The cache globals live with the other settings above, because
+// ComputeLayout reads them; see there.)
+// Layout key: 0 = no track lines, 1 = title only, 2 = title+artist.
+// The manager timer compares this after each refresh and resizes
+// expanded notches only when the key changes, so a track change
+// that keeps the same line count is just a repaint.
+
+static int SmtcLayoutKey()
+{
+    if (!g_smtcHasTrack) return 0;
+    return (g_smtcArtist[0] != L'\0') ? 2 : 1;
+}
+
+static void RefreshSmtc()
+{
+    if (!g_mediaEnabled) {
+        g_smtcHasTrack = false;
+        g_smtcTitle[0] = L'\0';
+        g_smtcArtist[0] = L'\0';
+        g_smtcStatus = 0;
+        return;
+    }
+    try {
+        // MTA on purpose: the timer thread is the UI/message thread,
+        // and blocking .get() calls below must not wait on STA
+        // message pumping to complete. No other COM use exists in
+        // this app, so this is the only apartment initialisation.
+        if (!g_smtcInitTried) {
+            g_smtcInitTried = true;
+            try {
+                winrt::init_apartment(winrt::apartment_type::multi_threaded);
+                g_smtcInitOk = true;
+            } catch (...) {
+                g_smtcInitOk = false;
+            }
+        }
+        if (!g_smtcInitOk) {
+            g_smtcHasTrack = false;
+            g_smtcStatus = 0;
+            return;
+        }
+        namespace smtc = winrt::Windows::Media::Control;
+        auto manager = smtc::GlobalSystemMediaTransportControlsSessionManager::RequestAsync().get();
+        if (!manager) {
+            g_smtcHasTrack = false;
+            g_smtcStatus = 0;
+            return;
+        }
+        auto session = manager.GetCurrentSession();
+        if (!session) {
+            g_smtcHasTrack = false;
+            g_smtcStatus = 0;
+            return;
+        }
+        // Playback status first: it stays meaningful even if the
+        // properties call below fails, so the glyph can still
+        // reflect it while the title lines fall back to hidden.
+        try {
+            auto info = session.GetPlaybackInfo();
+            if (info) {
+                auto st = info.PlaybackStatus();
+                if (st == smtc::GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing) g_smtcStatus = 1;
+                else if (st == smtc::GlobalSystemMediaTransportControlsSessionPlaybackStatus::Paused) g_smtcStatus = 2;
+                else g_smtcStatus = 0;
+            } else {
+                g_smtcStatus = 0;
+            }
+        } catch (...) {
+            g_smtcStatus = 0;
+        }
+        auto props = session.TryGetMediaPropertiesAsync().get();
+        if (!props) {
+            g_smtcHasTrack = false;
+            return;
+        }
+        winrt::hstring title = props.Title();
+        winrt::hstring artist = props.Artist();
+        if (title.empty()) {
+            // No usable title: hide both lines rather than showing
+            // a lone artist or a blank line.
+            g_smtcHasTrack = false;
+            g_smtcTitle[0] = L'\0';
+            g_smtcArtist[0] = L'\0';
+            return;
+        }
+        wcsncpy_s(g_smtcTitle, 256, title.c_str(), _TRUNCATE);
+        if (!artist.empty()) wcsncpy_s(g_smtcArtist, 256, artist.c_str(), _TRUNCATE);
+        else g_smtcArtist[0] = L'\0';
+        g_smtcHasTrack = true;
+    } catch (...) {
+        // Any WinRT failure (no session broker, player error, COM
+        // error): fall back to v4 behaviour, never crash.
+        g_smtcHasTrack = false;
+        g_smtcTitle[0] = L'\0';
+        g_smtcArtist[0] = L'\0';
+        g_smtcStatus = 0;
+    }
+}
+
+// Play/pause glyph mode for DrawMediaGlyph: 0 = old combined
+// glyph, 1 = pause bars only, 2 = play triangle only.
+static int SmtcPlayPauseGlyphMode()
+{
+    if (g_smtcStatus == 1) return 1;
+    if (g_smtcStatus == 2) return 2;
+    return 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -985,9 +1558,10 @@ static bool GearHitAt(Notch* n, int px, int py, bool usePaint)
 }
 
 // v4 reorg: plain-GDI gear — 8 teeth, a solid ring, a dark centre
-// hole. No font glyph, no image asset. Colour is a restrained
-// light grey that brightens on hover/press, matching the media
-// buttons' hover language (normal 165, hover 210, pressed 240).
+// hole. No font glyph, no image asset. Colour follows the
+// current theme (gear / gearHover / gearPressed, gearHole
+// for the centre hole), matching the media buttons' hover
+// language in that theme.
 static void DrawGear(HDC hdc, int cx, int cy, int r, COLORREF color)
 {
     HBRUSH brush = CreateSolidBrush(color);
@@ -1016,7 +1590,7 @@ static void DrawGear(HDC hdc, int cx, int cy, int r, COLORREF color)
     }
     // Ring, then the dark centre hole (dark = notch background tone).
     Ellipse(hdc, cx - r, cy - r, cx + r, cy + r);
-    HBRUSH holeBrush = CreateSolidBrush(RGB(18, 18, 20));
+    HBRUSH holeBrush = CreateSolidBrush(CurrentTheme().gearHole);
     HBRUSH prevBrush = (HBRUSH)SelectObject(hdc, holeBrush);
     int hr = r * 2 / 5; if (hr < 2) hr = 2;
     Ellipse(hdc, cx - hr, cy - hr, cx + hr, cy + hr);
@@ -1031,7 +1605,11 @@ static void DrawGear(HDC hdc, int cx, int cy, int r, COLORREF color)
 // by the full-size buttons on the MEDIA tab and the smaller
 // buttons on the HOME tab. The glyph brush must already be
 // selected into the DC by the caller.
-static void DrawMediaGlyph(HDC hdc, int idx, int cx, int cy, int r, HBRUSH glyphBrush)
+// v5-SMTC: playPauseMode (from SmtcPlayPauseGlyphMode) applies
+// only to idx 1: 0 = old combined triangle+bars, 1 = pause bars
+// only (currently playing, so the button pauses), 2 = play
+// triangle only (currently paused, so the button plays).
+static void DrawMediaGlyph(HDC hdc, int idx, int cx, int cy, int r, HBRUSH glyphBrush, int playPauseMode)
 {
     int h = (2 * r) * 11 / 20; // glyph height, as in v3
     int half = h / 2;
@@ -1060,6 +1638,22 @@ static void DrawMediaGlyph(HDC hdc, int idx, int cx, int cy, int r, HBRUSH glyph
             Polygon(hdc, t2, 3);
             FillRect(hdc, &bar, glyphBrush);
         }
+    } else if (playPauseMode == 1) {
+        // v5-SMTC, playing: pause bars only, centred.
+        int barW = h / 6; if (barW < 2) barW = 2;
+        int gap = h / 8; if (gap < 2) gap = 2;
+        int totalW = 2 * barW + gap;
+        int x0 = cx - totalW / 2;
+        RECT b1 = { x0, cy - half, x0 + barW, cy + half };
+        RECT b2 = { x0 + barW + gap, cy - half, x0 + 2 * barW + gap, cy + half };
+        FillRect(hdc, &b1, glyphBrush);
+        FillRect(hdc, &b2, glyphBrush);
+    } else if (playPauseMode == 2) {
+        // v5-SMTC, paused: play triangle only, centred.
+        int triW = h / 2;
+        int x0 = cx - triW / 2;
+        POINT tri[3] = { { x0, cy - half }, { x0, cy + half }, { x0 + triW, cy } };
+        Polygon(hdc, tri, 3);
     } else {
         // Play/Pause: a play triangle on the left, pause bars
         // on the right, so one button reads as the toggle.
@@ -1077,21 +1671,25 @@ static void DrawMediaGlyph(HDC hdc, int idx, int cx, int cy, int r, HBRUSH glyph
     }
 }
 
-// v4 premium surface helpers. No new allocations, no new timers:
-// the gradient is drawn row by row with plain GDI (the window
-// region already clips it to the pill shape), and the border and
-// top highlight are single strokes drawn over the content.
+// v4 premium surface helpers, now theme-driven (v5-themes). No
+// new allocations, no new timers: the gradient is drawn row by
+// row with plain GDI (the window region already clips it to the
+// pill shape), and the border and top highlight are single
+// strokes drawn over the content. All colours come from the
+// current theme; nothing here is hardcoded.
 static void PaintPremiumSurface(HDC hdc, const RECT& rc)
 {
-    // Vertical near-black gradient: slightly lighter at the top,
-    // darker at the bottom. Pure GDI, no GradientFill/msimg32 lib.
+    // Vertical theme gradient: top colour at the top, bottom
+    // colour at the bottom, interpolated per row. Pure GDI, no
+    // GradientFill/msimg32 lib.
     int h = rc.bottom - rc.top;
     if (h < 1) h = 1;
+    const Theme& th = CurrentTheme();
     for (int y = 0; y < rc.bottom; y++) {
         int t = y * 100 / h; // 0 at top, 100 at bottom
-        int r = 32 + (10 - 32) * t / 100;
-        int g = 32 + (10 - 32) * t / 100;
-        int b = 36 + (12 - 36) * t / 100;
+        int r = GetRValue(th.gradTop) + (GetRValue(th.gradBottom) - GetRValue(th.gradTop)) * t / 100;
+        int g = GetGValue(th.gradTop) + (GetGValue(th.gradBottom) - GetGValue(th.gradTop)) * t / 100;
+        int b = GetBValue(th.gradTop) + (GetBValue(th.gradBottom) - GetBValue(th.gradTop)) * t / 100;
         HBRUSH rowBrush = CreateSolidBrush(RGB(r, g, b));
         RECT row = { rc.left, y, rc.right, y + 1 };
         FillRect(hdc, &row, rowBrush);
@@ -1103,7 +1701,7 @@ static void PaintPremiumBorder(HDC hdc, const RECT& rc, int dpi, bool hover)
 {
     // Subtle 1 px light border, a touch brighter on hover (the v3
     // hover outline, restyled as the permanent premium border).
-    COLORREF border = hover ? RGB(104, 104, 110) : RGB(58, 58, 62);
+    COLORREF border = hover ? CurrentTheme().borderHover : CurrentTheme().border;
     HPEN pen = CreatePen(PS_SOLID, 1, border);
     HPEN oldPen = (HPEN)SelectObject(hdc, pen);
     HBRUSH nullBrush = (HBRUSH)GetStockObject(NULL_BRUSH);
@@ -1115,7 +1713,7 @@ static void PaintPremiumBorder(HDC hdc, const RECT& rc, int dpi, bool hover)
     // Soft inner top highlight: a 1 px light line, inset so it
     // never touches the rounded corners.
     int inset = Scale(20, dpi);
-    HBRUSH hl = CreateSolidBrush(RGB(78, 78, 84));
+    HBRUSH hl = CreateSolidBrush(CurrentTheme().highlight);
     RECT line = { inset, Scale(1, dpi), rc.right - inset, Scale(2, dpi) };
     if (line.right > line.left) FillRect(hdc, &line, hl);
     DeleteObject(hl);
@@ -1135,7 +1733,7 @@ static bool BatteryInfo(int& pct, bool& charging)
 
 static void DrawBatteryGlyph(HDC hdc, int x, int y, int w, int h, int pct, bool charging, bool known)
 {
-    HPEN pen = CreatePen(PS_SOLID, 1, RGB(220, 220, 224));
+    HPEN pen = CreatePen(PS_SOLID, 1, CurrentTheme().batteryOutline);
     HPEN oldPen = (HPEN)SelectObject(hdc, pen);
     HBRUSH nullBrush = (HBRUSH)GetStockObject(NULL_BRUSH);
     HBRUSH oldBrush = (HBRUSH)SelectObject(hdc, nullBrush);
@@ -1146,7 +1744,7 @@ static void DrawBatteryGlyph(HDC hdc, int x, int y, int w, int h, int pct, bool 
     // Tip nub on the right.
     int tipW = (w / 8 < 2) ? 2 : w / 8;
     int tipH = h / 2;
-    HBRUSH tipBrush = CreateSolidBrush(RGB(220, 220, 224));
+    HBRUSH tipBrush = CreateSolidBrush(CurrentTheme().batteryOutline);
     RECT tip = { x + w, y + (h - tipH) / 2, x + w + tipW, y + (h + tipH) / 2 };
     FillRect(hdc, &tip, tipBrush);
     DeleteObject(tipBrush);
@@ -1157,7 +1755,7 @@ static void DrawBatteryGlyph(HDC hdc, int x, int y, int w, int h, int pct, bool 
     if (innerW > 0 && innerH > 0) {
         int fillW = innerW * pct / 100;
         if (fillW > 0) {
-            HBRUSH fillBrush = CreateSolidBrush(RGB(248, 248, 250));
+            HBRUSH fillBrush = CreateSolidBrush(CurrentTheme().batteryFill);
             RECT fill = { innerX, innerY, innerX + fillW, innerY + innerH };
             FillRect(hdc, &fill, fillBrush);
             DeleteObject(fillBrush);
@@ -1171,7 +1769,7 @@ static void DrawBatteryGlyph(HDC hdc, int x, int y, int w, int h, int pct, bool 
             { cx, cy + 1 }, { cx - bw / 2, cy + bh / 2 },
             { cx + bw / 2, cy - 1 }, { cx, cy - 1 }
         };
-        HBRUSH boltBrush = CreateSolidBrush(RGB(24, 24, 26));
+        HBRUSH boltBrush = CreateSolidBrush(CurrentTheme().batteryBolt);
         HBRUSH oldB = (HBRUSH)SelectObject(hdc, boltBrush);
         HPEN nullP = (HPEN)GetStockObject(NULL_PEN);
         HPEN oldP = (HPEN)SelectObject(hdc, nullP);
@@ -1193,16 +1791,16 @@ static void PaintNotch(Notch* n, HDC hdc)
     // animation keeps drawing expanded content until it finishes
     // instead of popping to the collapsed clock on the first frame.
     if (!n->paintExpanded) {
-        DrawCenteredText(hdc, n->hFontClock, clockText, 0, 0, rc.right, rc.bottom, RGB(248, 248, 250));
+        DrawCenteredText(hdc, n->hFontClock, clockText, 0, 0, rc.right, rc.bottom, CurrentTheme().primary);
         PaintPremiumBorder(hdc, rc, dpi, n->hoverNotch);
         return;
     }
 
     Layout L = ComputeLayout(n, rc.right);
     int effTab = EffectiveTab(n);
-    DrawCenteredText(hdc, n->hFontBig, clockText, 0, Scale(12, dpi), rc.right, Scale(48, dpi), RGB(248, 248, 250));
+    DrawCenteredText(hdc, n->hFontBig, clockText, 0, Scale(12, dpi), rc.right, Scale(48, dpi), CurrentTheme().primary);
     wchar_t dateText[64]; FormatDate(dateText, 64);
-    DrawCenteredText(hdc, n->hFontSmall, dateText, 0, Scale(64, dpi), rc.right, Scale(22, dpi), RGB(165, 165, 170));
+    DrawCenteredText(hdc, n->hFontSmall, dateText, 0, Scale(64, dpi), rc.right, Scale(22, dpi), CurrentTheme().secondary);
     // v4 battery row: drawn glyph + text, centred as a pair, so the
     // row reads as one unit instead of text alone.
     wchar_t batteryText[64]; FormatBattery(batteryText, 64);
@@ -1220,13 +1818,13 @@ static void PaintNotch(Notch* n, HDC hdc)
         DrawBatteryGlyph(hdc, startX, glyphY, glyphW, glyphH, pct, charging, known);
         DrawCenteredText(hdc, n->hFontSmall, batteryText,
                          startX + glyphW + gap, Scale(88, dpi), sz.cx, Scale(22, dpi),
-                         RGB(165, 165, 170));
+                         CurrentTheme().secondary);
     }
     // v4 divider: a thin line between the clock/date/battery block
     // and whatever sections follow (media and/or widgets).
     if (g_mediaEnabled || g_widgetStats || g_widgetCalendar) {
         int margin = Scale(20, dpi);
-        HBRUSH divBrush = CreateSolidBrush(RGB(52, 52, 56));
+        HBRUSH divBrush = CreateSolidBrush(CurrentTheme().divider);
         RECT div = { margin, Scale(118, dpi), rc.right - margin, Scale(119, dpi) };
         if (div.right > div.left) FillRect(hdc, &div, divBrush);
         DeleteObject(divBrush);
@@ -1240,12 +1838,12 @@ static void PaintNotch(Notch* n, HDC hdc)
         for (int i = 0; i < L.tabCount; i++) {
             int id = L.tabIds[i];
             RECT tr = L.tabRects[i];
-            COLORREF tc = (id == effTab) ? RGB(248, 248, 250)
-                : (id == n->hoverTab ? RGB(210, 210, 214) : RGB(140, 140, 140));
+            COLORREF tc = (id == effTab) ? CurrentTheme().primary
+                : (id == n->hoverTab ? CurrentTheme().tabHover : CurrentTheme().muted);
             DrawCenteredText(hdc, n->hFontTiny, kTabNames[id],
                              tr.left, tr.top, tr.right - tr.left, Scale(20, dpi), tc);
             if (id == effTab) {
-                HBRUSH ulBrush = CreateSolidBrush(RGB(248, 248, 250));
+                HBRUSH ulBrush = CreateSolidBrush(CurrentTheme().accent);
                 int pad = Scale(12, dpi);
                 RECT ul = { tr.left + pad, tr.top + Scale(20, dpi), tr.right - pad, tr.top + Scale(22, dpi) };
                 if (ul.right > ul.left) FillRect(hdc, &ul, ulBrush);
@@ -1260,16 +1858,27 @@ static void PaintNotch(Notch* n, HDC hdc)
     // evident, and headers would cost the height HOME saves.
     if (L.showTabs && effTab == kTabHome) {
         if (g_mediaEnabled) {
-            HBRUSH glyphBrush = CreateSolidBrush(RGB(255, 255, 255));
+            // v5-SMTC: compact title line above the mini buttons,
+            // left-aligned in the body, ellipsis-truncated to the
+            // body width. Only when a track is known; otherwise
+            // this row does not exist and the layout is v4.
+            if (g_smtcHasTrack && L.homeMediaTitleY >= 0) {
+                int margin = Scale(16, dpi);
+                DrawLeftEllipsisText(hdc, n->hFontTiny, g_smtcTitle,
+                                     margin, L.homeMediaTitleY,
+                                     rc.right - 2 * margin, Scale(20, dpi),
+                                     CurrentTheme().primary);
+            }
+            HBRUSH glyphBrush = CreateSolidBrush(CurrentTheme().glyph);
             HPEN nullPen = (HPEN)GetStockObject(NULL_PEN);
             HPEN oldPen = (HPEN)SelectObject(hdc, nullPen);
             HBRUSH oldBrush = (HBRUSH)GetCurrentObject(hdc, OBJ_BRUSH);
             for (int i = 0; i < 3; i++) {
                 int cx, cy, r;
                 HomeMediaButtonCircle(L, i, cx, cy, r);
-                COLORREF bg = RGB(44, 44, 48);
-                if (i == n->pressedBtn) bg = RGB(94, 94, 98);
-                else if (i == n->hoverBtn) bg = RGB(66, 66, 70);
+                COLORREF bg = CurrentTheme().btnBg;
+                if (i == n->pressedBtn) bg = CurrentTheme().btnPressed;
+                else if (i == n->hoverBtn) bg = CurrentTheme().btnHover;
                 HBRUSH btnBrush = CreateSolidBrush(bg);
                 HBRUSH prevBrush = (HBRUSH)SelectObject(hdc, btnBrush);
                 Ellipse(hdc, cx - r, cy - r, cx + r, cy + r);
@@ -1280,7 +1889,7 @@ static void PaintNotch(Notch* n, HDC hdc)
             for (int i = 0; i < 3; i++) {
                 int cx, cy, r;
                 HomeMediaButtonCircle(L, i, cx, cy, r);
-                DrawMediaGlyph(hdc, i, cx, cy, r, glyphBrush);
+                DrawMediaGlyph(hdc, i, cx, cy, r, glyphBrush, SmtcPlayPauseGlyphMode());
             }
             SelectObject(hdc, oldPen);
             SelectObject(hdc, oldBrush);
@@ -1291,7 +1900,7 @@ static void PaintNotch(Notch* n, HDC hdc)
             swprintf(homeStats, 128, L"CPU %d%%  \x00B7  RAM %d%%", g_cpuPercent, g_memPercent);
             DrawCenteredText(hdc, n->hFontTiny, homeStats,
                              Scale(16, dpi), L.homeStatsY, rc.right - Scale(32, dpi), Scale(20, dpi),
-                             RGB(165, 165, 170));
+                             CurrentTheme().secondary);
         }
         if (g_widgetCalendar) {
             SYSTEMTIME st; GetLocalTime(&st);
@@ -1313,7 +1922,7 @@ static void PaintNotch(Notch* n, HDC hdc)
                 if (isToday) {
                     HPEN nullP = (HPEN)GetStockObject(NULL_PEN);
                     HPEN oldP = (HPEN)SelectObject(hdc, nullP);
-                    HBRUSH pill = CreateSolidBrush(RGB(248, 248, 250));
+                    HBRUSH pill = CreateSolidBrush(CurrentTheme().accent);
                     HBRUSH oldB = (HBRUSH)SelectObject(hdc, pill);
                     RoundRect(hdc, x + Scale(2, dpi), y + Scale(1, dpi),
                               x + cellW - Scale(2, dpi), y + cellH - Scale(1, dpi),
@@ -1324,7 +1933,7 @@ static void PaintNotch(Notch* n, HDC hdc)
                 }
                 wchar_t dayText[8]; swprintf(dayText, 8, L"%d", cst.wDay);
                 DrawCenteredText(hdc, n->hFontTiny, dayText, x, y, cellW, cellH,
-                                 isToday ? RGB(18, 18, 20) : RGB(165, 165, 170));
+                                 isToday ? CurrentTheme().pillText : CurrentTheme().secondary);
             }
         }
     }
@@ -1334,23 +1943,38 @@ static void PaintNotch(Notch* n, HDC hdc)
         // v4 reorg: MEDIA section header, left-aligned in its column
         // (the "media keys" explanation lives in the README/About).
         DrawLeftText(hdc, n->hFontTiny, L"MEDIA",
-                     L.mediaX, L.mediaLabelY, L.mediaW, Scale(16, dpi), RGB(140, 140, 140));
+                     L.mediaX, L.mediaLabelY, L.mediaW, Scale(16, dpi), CurrentTheme().muted);
+        // v5-SMTC: title on one line, artist on the next, both
+        // left-aligned in the media section and ellipsis-truncated
+        // to the section width. Artist line only when an artist
+        // string exists; with no track, neither line is drawn and
+        // the buttons sit at the v4 position.
+        if (g_smtcHasTrack && L.mediaTitleY >= 0) {
+            DrawLeftEllipsisText(hdc, n->hFontSmall, g_smtcTitle,
+                                 L.mediaX, L.mediaTitleY, L.mediaW, Scale(20, dpi),
+                                 CurrentTheme().primary);
+            if (g_smtcArtist[0] != L'\0' && L.mediaArtistY >= 0) {
+                DrawLeftEllipsisText(hdc, n->hFontTiny, g_smtcArtist,
+                                     L.mediaX, L.mediaArtistY, L.mediaW, Scale(20, dpi),
+                                     CurrentTheme().secondary);
+            }
+        }
         // v4 buttons: circles, not rectangles. Diameter = media-row
         // height, centred on the old button rects, so the row stays
         // centred and balanced. The hit test (MediaButtonIndexAt)
         // uses these same circles, so drawing and clicking agree.
         // Hover/pressed states are the v3 idea, restrained: a
         // lighter circle on hover, lighter still on press.
-        HBRUSH glyphBrush = CreateSolidBrush(RGB(255, 255, 255));
+        HBRUSH glyphBrush = CreateSolidBrush(CurrentTheme().glyph);
         HPEN nullPen = (HPEN)GetStockObject(NULL_PEN);
         HPEN oldPen = (HPEN)SelectObject(hdc, nullPen);
         HBRUSH oldBrush = (HBRUSH)GetCurrentObject(hdc, OBJ_BRUSH);
         for (int i = 0; i < 3; i++) {
             int cx, cy, r;
             MediaButtonCircle(L, i, cx, cy, r);
-            COLORREF bg = RGB(44, 44, 48);
-            if (i == n->pressedBtn) bg = RGB(94, 94, 98);
-            else if (i == n->hoverBtn) bg = RGB(66, 66, 70);
+            COLORREF bg = CurrentTheme().btnBg;
+            if (i == n->pressedBtn) bg = CurrentTheme().btnPressed;
+            else if (i == n->hoverBtn) bg = CurrentTheme().btnHover;
             HBRUSH btnBrush = CreateSolidBrush(bg);
             HBRUSH prevBrush = (HBRUSH)SelectObject(hdc, btnBrush);
             Ellipse(hdc, cx - r, cy - r, cx + r, cy + r);
@@ -1361,7 +1985,7 @@ static void PaintNotch(Notch* n, HDC hdc)
         for (int i = 0; i < 3; i++) {
             int cx, cy, r;
             MediaButtonCircle(L, i, cx, cy, r);
-            DrawMediaGlyph(hdc, i, cx, cy, r, glyphBrush);
+            DrawMediaGlyph(hdc, i, cx, cy, r, glyphBrush, SmtcPlayPauseGlyphMode());
         }
         SelectObject(hdc, oldPen);
         SelectObject(hdc, oldBrush);
@@ -1374,18 +1998,18 @@ static void PaintNotch(Notch* n, HDC hdc)
         // near-white). Same CPU/RAM values as before, just split
         // out of the old single dense line so they scan at a glance.
         DrawLeftText(hdc, n->hFontTiny, L"SYSTEM",
-                     L.statsX, L.statsLabelY, L.statsW, Scale(16, dpi), RGB(140, 140, 140));
+                     L.statsX, L.statsLabelY, L.statsW, Scale(16, dpi), CurrentTheme().muted);
         wchar_t cpuText[32];
         swprintf(cpuText, 32, L"CPU  %d%%", g_cpuPercent);
         DrawLeftText(hdc, n->hFontTiny, cpuText,
-                     L.statsX, L.cpuLabelY, L.statsW, Scale(18, dpi), RGB(165, 165, 170));
+                     L.statsX, L.cpuLabelY, L.statsW, Scale(18, dpi), CurrentTheme().secondary);
         wchar_t ramText[64];
         swprintf(ramText, 64, L"RAM  %d%%  \x00B7  %.1f/%.1f GB", g_memPercent, g_memUsedGB, g_memTotalGB);
         DrawLeftText(hdc, n->hFontTiny, ramText,
-                     L.statsX, L.ramLabelY, L.statsW, Scale(18, dpi), RGB(165, 165, 170));
+                     L.statsX, L.ramLabelY, L.statsW, Scale(18, dpi), CurrentTheme().secondary);
         int barH = Scale(6, dpi);
-        HBRUSH trackBrush = CreateSolidBrush(RGB(52, 52, 56));
-        HBRUSH fillBrush = CreateSolidBrush(RGB(248, 248, 250));
+        HBRUSH trackBrush = CreateSolidBrush(CurrentTheme().divider);
+        HBRUSH fillBrush = CreateSolidBrush(CurrentTheme().accent);
         RECT cpuTrack = { L.statsX, L.cpuBarY, L.statsX + L.statsW, L.cpuBarY + barH };
         FillRect(hdc, &cpuTrack, trackBrush);
         RECT cpuFill = { L.statsX, L.cpuBarY, L.statsX + L.statsW * g_cpuPercent / 100, L.cpuBarY + barH };
@@ -1407,15 +2031,15 @@ static void PaintNotch(Notch* n, HDC hdc)
         // v4 reorg: CALENDAR header shares the month row — label on
         // the left, month centred — so it costs no extra height.
         DrawLeftText(hdc, n->hFontTiny, L"CALENDAR",
-                     Scale(16, dpi), L.calendarY, Scale(100, dpi), Scale(24, dpi), RGB(140, 140, 140));
-        DrawCenteredText(hdc, n->hFontSmall, monthText, 0, L.calendarY, rc.right, Scale(24, dpi), RGB(248, 248, 250));
+                     Scale(16, dpi), L.calendarY, Scale(100, dpi), Scale(24, dpi), CurrentTheme().muted);
+        DrawCenteredText(hdc, n->hFontSmall, monthText, 0, L.calendarY, rc.right, Scale(24, dpi), CurrentTheme().primary);
         int margin = Scale(16, dpi);
         int cellW = (rc.right - 2 * margin) / 7;
         int cellH = Scale(20, dpi);
         int weekY = L.calendarY + Scale(24, dpi);
         static const wchar_t* kWeek[] = { L"S", L"M", L"T", L"W", L"T", L"F", L"S" };
         for (int c = 0; c < 7; c++) {
-            DrawCenteredText(hdc, n->hFontTiny, kWeek[c], margin + c * cellW, weekY, cellW, cellH, RGB(140, 140, 140));
+            DrawCenteredText(hdc, n->hFontTiny, kWeek[c], margin + c * cellW, weekY, cellW, cellH, CurrentTheme().muted);
         }
         int firstWeekday = (int)((st.wDayOfWeek - (st.wDay - 1) % 7) % 7);
         if (firstWeekday < 0) firstWeekday += 7;
@@ -1431,7 +2055,7 @@ static void PaintNotch(Notch* n, HDC hdc)
             if (isToday) {
                 HPEN nullP = (HPEN)GetStockObject(NULL_PEN);
                 HPEN oldP = (HPEN)SelectObject(hdc, nullP);
-                HBRUSH pill = CreateSolidBrush(RGB(248, 248, 250));
+                HBRUSH pill = CreateSolidBrush(CurrentTheme().accent);
                 HBRUSH oldB = (HBRUSH)SelectObject(hdc, pill);
                 RoundRect(hdc, x + Scale(2, dpi), y + Scale(1, dpi),
                           x + cellW - Scale(2, dpi), y + cellH - Scale(1, dpi),
@@ -1442,7 +2066,7 @@ static void PaintNotch(Notch* n, HDC hdc)
             }
             wchar_t dayText[8]; swprintf(dayText, 8, L"%d", d);
             DrawCenteredText(hdc, n->hFontTiny, dayText, x, y, cellW, cellH,
-                             isToday ? RGB(18, 18, 20) : RGB(165, 165, 170));
+                             isToday ? CurrentTheme().pillText : CurrentTheme().secondary);
         }
     }
 
@@ -1452,9 +2076,9 @@ static void PaintNotch(Notch* n, HDC hdc)
     // Settings gear, top-right of the header: drawn before the
     // border so the border stroke never covers it.
     {
-        COLORREF gearColor = RGB(165, 165, 170);
-        if (n->pressedGear) gearColor = RGB(240, 240, 242);
-        else if (n->hoverGear) gearColor = RGB(210, 210, 214);
+        COLORREF gearColor = CurrentTheme().gear;
+        if (n->pressedGear) gearColor = CurrentTheme().gearPressed;
+        else if (n->hoverGear) gearColor = CurrentTheme().gearHover;
         DrawGear(hdc, L.gearCX, L.gearCY, L.gearR, gearColor);
     }
     // v4 border (drawn last, over the content): subtle always, a
@@ -1635,6 +2259,18 @@ static LRESULT CALLBACK ManagerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
     }
     case WM_TIMER:
         if (wParam == ID_TIMER_CLOCK) {
+            // v5-SMTC: refresh the cached track/status on the
+            // existing 1-second timer (no new timer). If the line
+            // count changed (track appeared/disappeared, artist
+            // gained/lost), resize expanded notches through the
+            // existing animation path; a title-text-only change
+            // keeps the same height and is just a repaint below.
+            RefreshSmtc();
+            int newKey = SmtcLayoutKey();
+            if (newKey != g_smtcLayoutKey) {
+                g_smtcLayoutKey = newKey;
+                ApplySizeToAll();
+            }
             SampleStats();
             UpdateFullscreenAndVisibility();
             InvalidateAllNotches();
@@ -1656,6 +2292,10 @@ static LRESULT CALLBACK ManagerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
     case WM_COMMAND:
         switch (LOWORD(wParam)) {
         case ID_TRAY_QUIT: {
+            // v5-settings: save on clean quit, before any window
+            // is destroyed (WM_DESTROY below saves again as a
+            // belt-and-braces step, so a quit via any path saves).
+            SaveSettings();
             // Destroy notch windows first, then the manager (which quits).
             std::vector<HWND> hwnds;
             for (size_t i = 0; i < g_notches.size(); i++) hwnds.push_back(g_notches[i]->hwnd);
@@ -1663,28 +2303,41 @@ static LRESULT CALLBACK ManagerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             DestroyWindow(hwnd);
             break;
         }
-        case ID_TRAY_SIZE_S: g_size = 0; ApplySizeToAll(); break;
-        case ID_TRAY_SIZE_M: g_size = 1; ApplySizeToAll(); break;
-        case ID_TRAY_SIZE_L: g_size = 2; ApplySizeToAll(); break;
+        case ID_TRAY_SIZE_S: g_size = 0; SaveSettings(); ApplySizeToAll(); break;
+        case ID_TRAY_SIZE_M: g_size = 1; SaveSettings(); ApplySizeToAll(); break;
+        case ID_TRAY_SIZE_L: g_size = 2; SaveSettings(); ApplySizeToAll(); break;
         case ID_TRAY_HIDE_FULLSCREEN:
             g_hideOnFullscreen = !g_hideOnFullscreen;
+            SaveSettings();
             UpdateFullscreenAndVisibility();
             break;
         case ID_TRAY_MEDIA:
             g_mediaEnabled = !g_mediaEnabled;
+            SaveSettings();
             ApplySizeToAll();
             break;
         case ID_TRAY_WIDGET_STATS:
             g_widgetStats = !g_widgetStats;
             if (!g_widgetStats) g_havePrevTimes = false;
+            SaveSettings();
             ApplySizeToAll();
             break;
         case ID_TRAY_WIDGET_CALENDAR:
             g_widgetCalendar = !g_widgetCalendar;
+            SaveSettings();
             ApplySizeToAll();
             break;
+        case ID_TRAY_AUTOSTART: {
+            // v5-settings: registry only, never the settings file.
+            // On registry failure the toggle is left unchanged,
+            // so the menu never shows a state Windows will not do.
+            bool want = !g_startWithWindows;
+            if (SetAutoStart(want)) g_startWithWindows = want;
+            break;
+        }
         case ID_TRAY_ANIMATIONS:
             g_animations = !g_animations;
+            SaveSettings();
             if (!g_animations) {
                 // Stop every in-progress animation instantly and
                 // snap each notch to its final v2 size at once.
@@ -1702,17 +2355,28 @@ static LRESULT CALLBACK ManagerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
                 }
             }
             break;
+        // v5-themes: switch, persist via the existing settings
+        // mechanism, and repaint every notch at once. Hidden-by-
+        // fullscreen notches are skipped by InvalidateAllNotches
+        // (they are not visible) and repaint on restore.
+        case ID_TRAY_THEME_ONYX: g_theme = 0; SaveSettings(); InvalidateAllNotches(); break;
+        case ID_TRAY_THEME_MIDNIGHT: g_theme = 1; SaveSettings(); InvalidateAllNotches(); break;
+        case ID_TRAY_THEME_GRAPHITE: g_theme = 2; SaveSettings(); InvalidateAllNotches(); break;
         case ID_TRAY_MEDIA_PREV: SendMediaKey(VK_MEDIA_PREV_TRACK); break;
         case ID_TRAY_MEDIA_PLAYPAUSE: SendMediaKey(VK_MEDIA_PLAY_PAUSE); break;
         case ID_TRAY_MEDIA_NEXT: SendMediaKey(VK_MEDIA_NEXT_TRACK); break;
         case ID_TRAY_ABOUT:
             MessageBoxW(hwnd,
-                L"OnyxNotch v4\nMac-style notch for Windows.\nNative Win32 C++, no runtime, low memory.\n\nv4: premium UI — gradient surface, lighter\ntypography, circular media buttons, battery glyph,\ncalendar pill — reorganized in place: compact\ntwo-column body (media beside system stats),\nsection headers, stats rows with bars.\n\nClick the notch header to pin it open;\nclick again to unpin. The gear button in the\nexpanded header opens this menu from the notch.\n\nTabs: Home is a compact summary of every\ntab; Media, System and Calendar show the\nfull versions. Click a tab to switch.",
+                L"OnyxNotch v5 (SMTC titles + saved settings + themes)\nMac-style notch for Windows.\nNative Win32 C++, no runtime, low memory.\n\nv4: premium UI — gradient surface, lighter\ntypography, circular media buttons, battery glyph,\ncalendar pill — reorganized in place: compact\ntwo-column body (media beside system stats),\nsection headers, stats rows with bars.\n\nv5-SMTC: with Media controls on, the Media tab\nshows the current track title and artist from\nWindows SMTC (read-only), and Home shows a\ncompact title line. No track, no title — the\nmedia buttons still work via media keys.\n\nv5-settings: size and toggles are saved to\n%APPDATA%\\OnyxNotch\\settings.ini and restored\nat startup. Start with Windows (tray menu) writes\nthe Run registry value for this .exe.\n\nThemes: tray menu Themes submenu — Onyx, Midnight,\nGraphite — applies instantly to all notches and is\nsaved to settings.ini as theme=onyx|midnight|graphite.\n\nClick the notch header to pin it open;\nclick again to unpin. The gear button in the\nexpanded header opens this menu from the notch.\n\nTabs: Home is a compact summary of every\ntab; Media, System and Calendar show the\nfull versions. Click a tab to switch.",
                 L"OnyxNotch", MB_OK | MB_ICONINFORMATION);
             break;
         }
         return 0;
     case WM_DESTROY:
+        // v5-settings: save on clean quit even if the quit did not
+        // come through the tray Quit command. SaveSettings never
+        // blocks or shows UI, so this cannot delay shutdown.
+        SaveSettings();
         KillTimer(hwnd, ID_TIMER_CLOCK);
         Shell_NotifyIconW(NIM_DELETE, &g_nid);
         PostQuitMessage(0);
@@ -1752,6 +2416,15 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/,
     wcMgr.hInstance = hInstance;
     wcMgr.lpszClassName = kManagerClass;
     RegisterClassExW(&wcMgr);
+
+    // v5-settings: load BEFORE the first notch is drawn. The
+    // manager window below creates the notch windows in its
+    // WM_CREATE (via RebuildNotches), so loading here means the
+    // first notch already uses the saved size/toggles. Load
+    // failures fall back to the defaults silently (see LoadSettings
+    // / LoadAutoStart); startup never depends on them.
+    LoadSettings();
+    LoadAutoStart();
 
     // Hidden manager window: owns the tray icon and the 1-second timer,
     // and creates one notch window per monitor in WM_CREATE.
