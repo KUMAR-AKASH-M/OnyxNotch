@@ -15,6 +15,25 @@
 //     Windows test, so the gradient version is the shipped look.
 //  6. No new timers, threads, polling, or dependencies; animation
 //     timing and the 1-second clock timer are exactly as in v3.
+// v4 reorganization (in place, after the v4 push — no v5):
+//  1. Compact two-column body: below the full-width header (big
+//     clock, date, battery, divider), media and system-stats sit
+//     side by side when both are on, each about half the notch
+//     width; a lone section spans the full body width. Calendar
+//     stays full-width below the two-column row. Total expanded
+//     height drops whenever media + stats are both on, versus
+//     the old stacked layout, and the always-visible footer is
+//     gone (pinning is unchanged; its explanation moves to the
+//     About box and the README).
+//  2. Grouped section headers: MEDIA, SYSTEM, CALENDAR — small
+//     uppercase muted-grey labels, left-aligned in each section.
+//     Stats is split from one dense line into two labelled rows
+//     (CPU %, RAM % with GB used/total), each with a thin bar.
+//  3. Settings gear button in the expanded header, top-right:
+//     plain-GDI gear (teeth + centre hole, no image/font glyph).
+//     Clicking it opens the existing tray menu at the gear's
+//     screen position; it is hit-tested before the pin click, so
+//     it never pins/unpins. No new settings window is built.
 // v3 changes over v2 (v2 behaviour is otherwise intact):
 //  1. Smooth expand/collapse animation (~220 ms, ease-out cubic),
 //     driven by a short-lived per-notch timer that stops when the
@@ -73,6 +92,7 @@
 #include <tchar.h>
 #include <vector>
 #include <algorithm>
+#include <cmath>
 
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
@@ -150,6 +170,9 @@ struct Notch {
     bool hoverNotch = false;
     int hoverBtn = -1;
     int pressedBtn = -1;
+    // v4 reorg: settings-gear hover/pressed state (gear only).
+    bool hoverGear = false;
+    bool pressedGear = false;
     bool animActive = false;
     ULONGLONG animStartTick = 0;
     int animFromW = 0, animFromH = 0;
@@ -183,16 +206,25 @@ static int CollapsedWidth(int dpi)
 // ---------------------------------------------------------------------------
 struct Layout {
     int totalH = 0;
+    // v4 reorg: gear button (header, top-right) and two-column body.
+    // mediaX/mediaW and statsX/statsW are the column rects; when
+    // only one body section is on, its column spans the full body
+    // width. Calendar stays full-width below the body row.
+    int gearCX = 0, gearCY = 0, gearR = 0;
+    int bodyY = 0;
+    int mediaX = 0, mediaW = 0;
     int mediaLabelY = 0;
     int mediaButtonY = 0;
     int mediaButtonH = 0;
     RECT btnPrev = { 0, 0, 0, 0 };
     RECT btnPlay = { 0, 0, 0, 0 };
     RECT btnNext = { 0, 0, 0, 0 };
-    int statsY = 0;
+    int statsX = 0, statsW = 0;
+    int statsLabelY = 0;
+    int cpuLabelY = 0, cpuBarY = 0;
+    int ramLabelY = 0, ramBarY = 0;
     int calendarY = 0;
     int calendarH = 0;
-    int footerY = 0;
 };
 
 static int DaysInMonth(int year, int month)
@@ -209,35 +241,72 @@ static Layout ComputeLayout(Notch* n, int clientW)
 {
     Layout L;
     int dpi = n->dpi;
-    // v4 rhythm: big clock, date, battery, then a divider, then the
-    // media/widgets sections. The extra breathing room over v3 is
-    // deliberate premium spacing, not a layout change in content.
-    int y = Scale(126, dpi); // after big clock, date, battery, divider
+    // v4 reorg geometry. Header (big clock, date, battery) ends at
+    // the divider (y 118); the body starts at y 126. The gear sits
+    // in the header's top-right corner, clear of the centred clock.
+    L.gearR = Scale(11, dpi);
+    L.gearCX = clientW - Scale(16, dpi) - L.gearR;
+    L.gearCY = Scale(24, dpi);
+    L.bodyY = Scale(126, dpi);
+    int margin = Scale(16, dpi), colGap = Scale(12, dpi), btnGap = Scale(8, dpi);
+    int bodyW = clientW - 2 * margin;
+    if (bodyW < 40) bodyW = 40;
+    int colW = (bodyW - colGap) / 2;
+    if (colW < 40) colW = 40;
+    bool twoCol = g_mediaEnabled && g_widgetStats;
     if (g_mediaEnabled) {
-        L.mediaLabelY = y; y += Scale(20, dpi);
-        L.mediaButtonY = y; L.mediaButtonH = Scale(28, dpi); y += L.mediaButtonH + Scale(8, dpi);
-        int margin = Scale(16, dpi), gap = Scale(8, dpi);
-        int bw = (clientW - 2 * margin - 2 * gap) / 3;
-        if (bw < 20) bw = 20;
-        L.btnPrev = { margin, L.mediaButtonY, margin + bw, L.mediaButtonY + L.mediaButtonH };
-        L.btnPlay = { margin + bw + gap, L.mediaButtonY, margin + 2 * bw + gap, L.mediaButtonY + L.mediaButtonH };
-        L.btnNext = { margin + 2 * bw + 2 * gap, L.mediaButtonY, margin + 3 * bw + 2 * gap, L.mediaButtonY + L.mediaButtonH };
+        L.mediaX = margin;
+        L.mediaW = twoCol ? colW : bodyW;
     }
     if (g_widgetStats) {
-        L.statsY = y; y += Scale(24, dpi);
+        L.statsX = twoCol ? margin + colW + colGap : margin;
+        L.statsW = twoCol ? colW : bodyW;
     }
+    // Body row height: media is header (16) + gap (6) + buttons
+    // (28) = 50; stats is header (16) + gap (4) + CPU label (18)
+    // + bar (6) + gap (4) + RAM label (18) + bar (6) = 72. The row
+    // is the taller of the two, so media + stats together take
+    // 72 px of body instead of the old stacked 56 + 24 = 80 px.
+    int bodyBottom = L.bodyY;
+    if (g_mediaEnabled) {
+        L.mediaLabelY = L.bodyY;
+        L.mediaButtonY = L.bodyY + Scale(22, dpi);
+        L.mediaButtonH = Scale(28, dpi);
+        int bw = (L.mediaW - 2 * btnGap) / 3;
+        if (bw < 20) bw = 20;
+        L.btnPrev = { L.mediaX, L.mediaButtonY, L.mediaX + bw, L.mediaButtonY + L.mediaButtonH };
+        L.btnPlay = { L.mediaX + bw + btnGap, L.mediaButtonY, L.mediaX + 2 * bw + btnGap, L.mediaButtonY + L.mediaButtonH };
+        L.btnNext = { L.mediaX + 2 * bw + 2 * btnGap, L.mediaButtonY, L.mediaX + 3 * bw + 2 * btnGap, L.mediaButtonY + L.mediaButtonH };
+        int mediaBottom = L.mediaButtonY + L.mediaButtonH;
+        if (mediaBottom > bodyBottom) bodyBottom = mediaBottom;
+    }
+    if (g_widgetStats) {
+        L.statsLabelY = L.bodyY;
+        L.cpuLabelY = L.bodyY + Scale(20, dpi);
+        L.cpuBarY = L.cpuLabelY + Scale(18, dpi);
+        L.ramLabelY = L.cpuBarY + Scale(10, dpi);
+        L.ramBarY = L.ramLabelY + Scale(18, dpi);
+        int statsBottom = L.ramBarY + Scale(6, dpi);
+        if (statsBottom > bodyBottom) bodyBottom = statsBottom;
+    }
+    int y = bodyBottom;
     if (g_widgetCalendar) {
+        if (g_mediaEnabled || g_widgetStats) y += Scale(10, dpi);
         SYSTEMTIME st; GetLocalTime(&st);
         int firstWeekday = (int)((st.wDayOfWeek - (st.wDay - 1) % 7) % 7);
         if (firstWeekday < 0) firstWeekday += 7;
         int cells = firstWeekday + DaysInMonth(st.wYear, st.wMonth);
         int rows = (cells + 6) / 7;
         L.calendarY = y;
+        // Calendar header shares the month row (CALENDAR label on
+        // the left, month centred), so no extra height is added.
         L.calendarH = Scale(24 + 20 + rows * 20, dpi);
-        y += L.calendarH + Scale(8, dpi);
+        y += L.calendarH;
     }
-    L.footerY = y; y += Scale(20 + 10, dpi);
-    L.totalH = y;
+    // Bottom padding only (12 px): the old footer row (20 px text
+    // + 10 px padding) is gone, which is where the remaining
+    // height saving comes from in every expanded configuration.
+    L.totalH = y + Scale(12, dpi);
     return L;
 }
 
@@ -430,9 +499,13 @@ static void AppendCheck(HMENU menu, UINT id, const wchar_t* text, bool checked)
     AppendMenuW(menu, MF_STRING | (checked ? MF_CHECKED : MF_UNCHECKED), id, text);
 }
 
-static void ShowTrayMenu(HWND hwnd)
+// v4 reorg: the tray menu is shared by two entry points — the
+// tray icon (at the cursor) and the notch gear button (at the
+// gear's screen position). Commands always go to the manager
+// window, which owns the tray icon and handles WM_COMMAND, even
+// when the menu was opened from a notch window.
+static void ShowTrayMenuAt(POINT pt, UINT alignFlags)
 {
-    POINT pt; GetCursorPos(&pt);
     HMENU menu = CreatePopupMenu();
     AppendCheck(menu, ID_TRAY_SIZE_S, L"Size: Small", g_size == 0);
     AppendCheck(menu, ID_TRAY_SIZE_M, L"Size: Medium", g_size == 1);
@@ -453,10 +526,17 @@ static void ShowTrayMenu(HWND hwnd)
     AppendMenuW(menu, MF_STRING, ID_TRAY_ABOUT, L"About OnyxNotch");
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(menu, MF_STRING, ID_TRAY_QUIT, L"Quit");
-    SetForegroundWindow(hwnd);
-    TrackPopupMenu(menu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, NULL);
-    PostMessage(hwnd, WM_NULL, 0, 0);
+    HWND owner = g_managerHwnd ? g_managerHwnd : GetDesktopWindow();
+    SetForegroundWindow(owner);
+    TrackPopupMenu(menu, TPM_RIGHTBUTTON | alignFlags, pt.x, pt.y, 0, owner, NULL);
+    PostMessage(owner, WM_NULL, 0, 0);
     DestroyMenu(menu);
+}
+
+static void ShowTrayMenu(HWND /*hwnd*/)
+{
+    POINT pt; GetCursorPos(&pt);
+    ShowTrayMenuAt(pt, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -499,6 +579,18 @@ static void DrawCenteredText(HDC hdc, HFONT font, const wchar_t* text,
     SetBkMode(hdc, TRANSPARENT);
     RECT rc = { x, y, x + w, y + h };
     DrawTextW(hdc, text, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    SelectObject(hdc, old);
+}
+
+// v4 reorg: left-aligned section headers (MEDIA / SYSTEM / CALENDAR).
+static void DrawLeftText(HDC hdc, HFONT font, const wchar_t* text,
+                         int x, int y, int w, int h, COLORREF color)
+{
+    HFONT old = (HFONT)SelectObject(hdc, font);
+    SetTextColor(hdc, color);
+    SetBkMode(hdc, TRANSPARENT);
+    RECT rc = { x, y, x + w, y + h };
+    DrawTextW(hdc, text, -1, &rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     SelectObject(hdc, old);
 }
 
@@ -746,6 +838,64 @@ static bool MediaButtonHit(Notch* n, int px, int py, WORD& vkOut)
     return true;
 }
 
+// v4 reorg: settings-gear hit test. Same paint-vs-click split as
+// media buttons: hover may use what is drawn (paintExpanded),
+// a click only counts while truly expanded, so a click during a
+// collapse cannot open the menu. A 2 px tolerance ring makes the
+// small gear forgiving to hit without enlarging its drawing.
+static bool GearHitAt(Notch* n, int px, int py, bool usePaint)
+{
+    if (usePaint ? !n->paintExpanded : !n->expanded) return false;
+    RECT rc; GetClientRect(n->hwnd, &rc);
+    Layout L = ComputeLayout(n, rc.right);
+    int dx = px - L.gearCX, dy = py - L.gearCY;
+    int r = L.gearR + 2;
+    return dx * dx + dy * dy <= r * r;
+}
+
+// v4 reorg: plain-GDI gear — 8 teeth, a solid ring, a dark centre
+// hole. No font glyph, no image asset. Colour is a restrained
+// light grey that brightens on hover/press, matching the media
+// buttons' hover language (normal 165, hover 210, pressed 240).
+static void DrawGear(HDC hdc, int cx, int cy, int r, COLORREF color)
+{
+    HBRUSH brush = CreateSolidBrush(color);
+    HBRUSH oldBrush = (HBRUSH)SelectObject(hdc, brush);
+    HPEN nullPen = (HPEN)GetStockObject(NULL_PEN);
+    HPEN oldPen = (HPEN)SelectObject(hdc, nullPen);
+    // Teeth: 8 small rectangles rotated around the centre, drawn
+    // first so the ring below covers their inner ends.
+    const double kPi = 3.141592653589793;
+    int toothW = r * 2 / 5; if (toothW < 3) toothW = 3;
+    int toothH = r / 3; if (toothH < 2) toothH = 2;
+    for (int i = 0; i < 8; i++) {
+        double a = (double)i * kPi / 4.0;
+        double ca = cos(a), sa = sin(a);
+        // Tooth rectangle, centred on the ring, long axis radial.
+        double hx = (double)r, hy = 0.0; // centre offset, unrotated
+        double hw = (double)toothH / 2.0, hh = (double)toothW / 2.0;
+        POINT pts[4];
+        double corners[4][2] = { { hx - hh, -hw }, { hx + hh, -hw }, { hx + hh, hw }, { hx - hh, hw } };
+        for (int c = 0; c < 4; c++) {
+            double x = corners[c][0], y = corners[c][1];
+            pts[c].x = (LONG)(cx + x * ca - y * sa + 0.5);
+            pts[c].y = (LONG)(cy + x * sa + y * ca + 0.5);
+        }
+        Polygon(hdc, pts, 4);
+    }
+    // Ring, then the dark centre hole (dark = notch background tone).
+    Ellipse(hdc, cx - r, cy - r, cx + r, cy + r);
+    HBRUSH holeBrush = CreateSolidBrush(RGB(18, 18, 20));
+    HBRUSH prevBrush = (HBRUSH)SelectObject(hdc, holeBrush);
+    int hr = r * 2 / 5; if (hr < 2) hr = 2;
+    Ellipse(hdc, cx - hr, cy - hr, cx + hr, cy + hr);
+    SelectObject(hdc, prevBrush);
+    DeleteObject(holeBrush);
+    SelectObject(hdc, oldPen);
+    SelectObject(hdc, oldBrush);
+    DeleteObject(brush);
+}
+
 // v4 premium surface helpers. No new allocations, no new timers:
 // the gradient is drawn row by row with plain GDI (the window
 // region already clips it to the pill shape), and the border and
@@ -901,8 +1051,10 @@ static void PaintNotch(Notch* n, HDC hdc)
     }
 
     if (g_mediaEnabled) {
-        DrawCenteredText(hdc, n->hFontSmall, L"Media controls (media keys)",
-                         0, L.mediaLabelY, rc.right, Scale(20, dpi), RGB(150, 150, 155));
+        // v4 reorg: MEDIA section header, left-aligned in its column
+        // (the "media keys" explanation lives in the README/About).
+        DrawLeftText(hdc, n->hFontTiny, L"MEDIA",
+                     L.mediaX, L.mediaLabelY, L.mediaW, Scale(16, dpi), RGB(140, 140, 140));
         // v4 buttons: circles, not rectangles. Diameter = media-row
         // height, centred on the old button rects, so the row stays
         // centred and balanced. The hit test (MediaButtonIndexAt)
@@ -978,10 +1130,33 @@ static void PaintNotch(Notch* n, HDC hdc)
     }
 
     if (g_widgetStats) {
-        wchar_t statsText[128];
-        swprintf(statsText, 128, L"CPU: %d%%   RAM: %d%%  (%.1f / %.1f GB)",
-                 g_cpuPercent, g_memPercent, g_memUsedGB, g_memTotalGB);
-        DrawCenteredText(hdc, n->hFontSmall, statsText, 0, L.statsY, rc.right, Scale(24, dpi), RGB(165, 165, 170));
+        // v4 reorg: SYSTEM header, then two labelled rows, each
+        // with a thin progress bar underneath (track dark, fill
+        // near-white). Same CPU/RAM values as before, just split
+        // out of the old single dense line so they scan at a glance.
+        DrawLeftText(hdc, n->hFontTiny, L"SYSTEM",
+                     L.statsX, L.statsLabelY, L.statsW, Scale(16, dpi), RGB(140, 140, 140));
+        wchar_t cpuText[32];
+        swprintf(cpuText, 32, L"CPU  %d%%", g_cpuPercent);
+        DrawLeftText(hdc, n->hFontTiny, cpuText,
+                     L.statsX, L.cpuLabelY, L.statsW, Scale(18, dpi), RGB(165, 165, 170));
+        wchar_t ramText[64];
+        swprintf(ramText, 64, L"RAM  %d%%  \x00B7  %.1f/%.1f GB", g_memPercent, g_memUsedGB, g_memTotalGB);
+        DrawLeftText(hdc, n->hFontTiny, ramText,
+                     L.statsX, L.ramLabelY, L.statsW, Scale(18, dpi), RGB(165, 165, 170));
+        int barH = Scale(6, dpi);
+        HBRUSH trackBrush = CreateSolidBrush(RGB(52, 52, 56));
+        HBRUSH fillBrush = CreateSolidBrush(RGB(248, 248, 250));
+        RECT cpuTrack = { L.statsX, L.cpuBarY, L.statsX + L.statsW, L.cpuBarY + barH };
+        FillRect(hdc, &cpuTrack, trackBrush);
+        RECT cpuFill = { L.statsX, L.cpuBarY, L.statsX + L.statsW * g_cpuPercent / 100, L.cpuBarY + barH };
+        if (cpuFill.right > cpuFill.left) FillRect(hdc, &cpuFill, fillBrush);
+        RECT ramTrack = { L.statsX, L.ramBarY, L.statsX + L.statsW, L.ramBarY + barH };
+        FillRect(hdc, &ramTrack, trackBrush);
+        RECT ramFill = { L.statsX, L.ramBarY, L.statsX + L.statsW * g_memPercent / 100, L.ramBarY + barH };
+        if (ramFill.right > ramFill.left) FillRect(hdc, &ramFill, fillBrush);
+        DeleteObject(trackBrush);
+        DeleteObject(fillBrush);
     }
 
     if (g_widgetCalendar) {
@@ -990,6 +1165,10 @@ static void PaintNotch(Notch* n, HDC hdc)
             L"July", L"August", L"September", L"October", L"November", L"December" };
         wchar_t monthText[64];
         swprintf(monthText, 64, L"%s %d", kMonths[(st.wMonth - 1) % 12], st.wYear);
+        // v4 reorg: CALENDAR header shares the month row — label on
+        // the left, month centred — so it costs no extra height.
+        DrawLeftText(hdc, n->hFontTiny, L"CALENDAR",
+                     Scale(16, dpi), L.calendarY, Scale(100, dpi), Scale(24, dpi), RGB(140, 140, 140));
         DrawCenteredText(hdc, n->hFontSmall, monthText, 0, L.calendarY, rc.right, Scale(24, dpi), RGB(248, 248, 250));
         int margin = Scale(16, dpi);
         int cellW = (rc.right - 2 * margin) / 7;
@@ -1028,8 +1207,17 @@ static void PaintNotch(Notch* n, HDC hdc)
         }
     }
 
-    DrawCenteredText(hdc, n->hFontSmall, L"OnyxNotch v4  |  Click to pin",
-                     0, L.footerY, rc.right, Scale(20, dpi), RGB(140, 140, 140));
+    // v4 reorg: the footer ("OnyxNotch v4 | Click to pin") is gone
+    // — pinning still works by clicking the header, and the pin
+    // explanation now lives in the About box and the README.
+    // Settings gear, top-right of the header: drawn before the
+    // border so the border stroke never covers it.
+    {
+        COLORREF gearColor = RGB(165, 165, 170);
+        if (n->pressedGear) gearColor = RGB(240, 240, 242);
+        else if (n->hoverGear) gearColor = RGB(210, 210, 214);
+        DrawGear(hdc, L.gearCX, L.gearCY, L.gearR, gearColor);
+    }
     // v4 border (drawn last, over the content): subtle always, a
     // touch brighter on hover. This replaces the v3 hover-only
     // outline; the hover state is now part of the border itself.
@@ -1080,6 +1268,11 @@ static LRESULT CALLBACK NotchWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                 n->hoverBtn = idx;
                 InvalidateRect(hwnd, NULL, FALSE);
             }
+            bool gear = GearHitAt(n, pt.x, pt.y, true);
+            if (gear != n->hoverGear) {
+                n->hoverGear = gear;
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
         }
         if (n && !n->expanded) SetNotchExpanded(n, true);
         if (n && !n->trackingLeave) {
@@ -1098,12 +1291,30 @@ static LRESULT CALLBACK NotchWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             n->hoverNotch = false;
             n->hoverBtn = -1;
             n->pressedBtn = -1;
+            n->hoverGear = false;
+            n->pressedGear = false;
             if (n->expanded && !n->pinned) SetNotchExpanded(n, false);
         }
         return 0;
     case WM_LBUTTONDOWN: {
         if (!n) return 0;
         POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        // v4 reorg: gear is hit-tested FIRST, before media buttons
+        // and before the pin toggle, so a gear click opens the
+        // settings menu and never pins/unpins the notch.
+        if (GearHitAt(n, pt.x, pt.y, false)) {
+            n->pressedGear = true;
+            InvalidateRect(hwnd, NULL, FALSE);
+            RECT wr; GetWindowRect(hwnd, &wr);
+            Layout L = ComputeLayout(n, wr.right - wr.left);
+            POINT menuPt;
+            menuPt.x = wr.left + L.gearCX + L.gearR;
+            menuPt.y = wr.top + L.gearCY + L.gearR;
+            ShowTrayMenuAt(menuPt, TPM_RIGHTALIGN);
+            n->pressedGear = false;
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
+        }
         WORD vk = 0;
         if (MediaButtonHit(n, pt.x, pt.y, vk)) {
             n->pressedBtn = MediaButtonIndexAt(n, pt.x, pt.y, false);
@@ -1116,8 +1327,9 @@ static LRESULT CALLBACK NotchWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         return 0;
     }
     case WM_LBUTTONUP:
-        if (n && n->pressedBtn >= 0) {
+        if (n && (n->pressedBtn >= 0 || n->pressedGear)) {
             n->pressedBtn = -1;
+            n->pressedGear = false;
             InvalidateRect(hwnd, NULL, FALSE);
         }
         return 0;
@@ -1235,7 +1447,7 @@ static LRESULT CALLBACK ManagerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
         case ID_TRAY_MEDIA_NEXT: SendMediaKey(VK_MEDIA_NEXT_TRACK); break;
         case ID_TRAY_ABOUT:
             MessageBoxW(hwnd,
-                L"OnyxNotch v4\nMac-style notch for Windows.\nNative Win32 C++, no runtime, low memory.\n\nv4: premium UI only — gradient surface, lighter\ntypography, circular media buttons, battery glyph,\ncalendar pill. No behaviour changes from v3.",
+                L"OnyxNotch v4\nMac-style notch for Windows.\nNative Win32 C++, no runtime, low memory.\n\nv4: premium UI — gradient surface, lighter\ntypography, circular media buttons, battery glyph,\ncalendar pill — reorganized in place: compact\ntwo-column body (media beside system stats),\nsection headers, stats rows with bars.\n\nClick the notch header to pin it open;\nclick again to unpin. The gear button in the\nexpanded header opens this menu from the notch.",
                 L"OnyxNotch", MB_OK | MB_ICONINFORMATION);
             break;
         }

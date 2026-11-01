@@ -216,6 +216,84 @@ timer still runs only during a ~220 ms size change, and the
 clock timer is still 1 second. Idle cost should be identical
 to v3 — measure it in Task Manager to confirm.
 
+## What's new in v4 — Reorganization (in place, after the v4 push)
+
+No new version number, no new features, no changed defaults,
+no settings file. The v4 premium look (gradient, border,
+typography, circular media buttons, battery glyph, calendar
+pill) is unchanged; only how the expanded view is organized
+changed, plus one new button.
+
+### 1. Compact two-column body
+The expanded header stays full-width: big clock, date, battery
+with glyph, then the divider. Below the divider, media and
+system-stats now sit **side by side** when both are on — each
+about half the notch width (at the standard 340 px expanded
+width: 16 px outer margins, 12 px column gap, 148 px columns).
+If only one of them is on, that section spans the full body
+width (media buttons spread across it, as before; stats rows
+stretch across it). Calendar, when on, stays full-width below
+the two-column row.
+
+Height effect (standard size, 5-row month where a calendar is
+shown; measured from the layout arithmetic, not from a run):
+- Media + stats, no calendar: 210 px, down from 236 px.
+- Media + stats + calendar: 364 px, down from 388 px.
+- Media only: 188 px, down from 212 px. Header only: 138 px,
+  down from 156 px (the footer row is gone, see below).
+- Stats only is the one exception that grows: 210 px, up from
+  180 px — because stats is now two labelled rows with bars
+  instead of one dense line (see section 2). That is a
+  deliberate trade for readability; the both-on case, which is
+  the tall one users actually hit, still gets shorter.
+
+### 2. Grouped section headers, and stats split into rows
+Each body section now has a small uppercase muted-grey header,
+left-aligned in its column: **MEDIA**, **SYSTEM**,
+**CALENDAR**. The calendar header shares the month row (label
+on the left, month centred), so it costs no extra height.
+Stats is no longer one dense line (`CPU: x%   RAM: y%
+(used / total GB)`). It is now two labelled rows, each with a
+thin progress bar underneath (dark track, near-white fill,
+same CPU/RAM values as before):
+- `CPU  x%` with a CPU % bar.
+- `RAM  y%  ·  used/total GB` with a RAM % bar.
+The media header replaces the old "Media controls (media
+keys)" centred label; the media-keys explanation is in the
+About box and in the v2 media section above.
+
+### 3. Settings gear button in the expanded header
+A small gear button now sits in the expanded header's
+top-right corner (centre about 24 px down, 16 px + gear radius
+in from the right edge; gear radius 11 px at 96 DPI, DPI-scaled).
+It is drawn in plain GDI — 8 teeth, a solid ring, a dark
+centre hole — with no font glyph and no image asset. Colours
+follow the media buttons' hover language: muted grey normally
+(165), brighter on hover (210), brightest on press (240).
+Clicking it opens the **existing tray menu** (Size, toggles,
+About, Quit) at the gear's screen position, right-aligned
+under the gear, so settings are reachable from the notch
+without going to the tray. No new settings window or panel
+was built, and no settings file was added: toggles still reset
+at restart, as before.
+
+### 4. Footer removed, pinning unchanged
+The always-visible expanded footer ("OnyxNotch v4 | Click to
+pin") is gone — it cost a full row in every expanded view
+for information you only need once. Pinning works exactly as
+before: click the notch header to pin it open, click again to
+unpin, move away to collapse when unpinned. The pin
+explanation now lives in the About box text and in this file
+only. The gear click is hit-tested **before** the pin click,
+so clicking the gear opens the menu and never pins or unpins.
+Media-button hit testing is unchanged in spirit: circles are
+still computed from the shared layout, now from the column
+rects, so a visible circle is exactly what is clickable.
+Collapsed behaviour is unchanged (clock only), and the
+animation path is unchanged: animated sizes interpolate to
+the new total height, and expanded content still paints until
+a collapse finishes, so nothing pops mid-collapse.
+
 ## Build (Windows) — unchanged from v2
 
 ## Build (Windows)
@@ -253,7 +331,12 @@ and choose Quit. There is no installer and no auto-start in v2 — if
 you want it at login, put a shortcut to the `.exe` in the Startup
 folder (`Win + R`, type `shell:startup`).
 
-## Tray menu (v2)
+## Tray menu (v2, also opened by the v4 gear button)
+
+Click the gear button in the expanded notch header to open
+this same menu from the notch — it is not a separate settings
+panel. Right-clicking the tray icon opens it at the cursor, as
+before.
 
 - Size: Small / Medium / Large
 - Hide on fullscreen (off by default)
@@ -299,6 +382,42 @@ with `build.bat` on Windows and runs it:
 - The `.exe` built here is unsigned, so Windows SmartScreen may
   warn on first run. That is normal for a self-built unsigned app;
   code-signing is a paid certificate, not a code change.
+
+## Honest limits — v4 reorganization (not verified on Windows)
+
+Everything under "v4 additions" above still applies, plus:
+- **Not compiled on Windows.** The reorganization uses only
+  the same Win32/GDI APIs as before (`Ellipse`, `Polygon`,
+  `FillRect`, `TrackPopupMenu`, `GetClientRect`), plus
+  `cos`/`sin` from `<cmath>` for the gear teeth, but `cl`/`rc`
+  were never run on it here, so a compile error is still
+  possible until the first Windows build.
+- **Two-column balance untested on screen.** Column widths
+  (148 px each at 96 DPI), the media circles inside a narrow
+  column, and the stats bars at that width have not been seen
+  on a real display; they may look cramped or unbalanced and
+  need tuning.
+- **Gear legibility untested at small size.** The gear is
+  22 px across at 96 DPI (11 px radius, 8 teeth); on a real
+  display its teeth and centre hole may read as a blob, and
+  the 2 px hit tolerance may feel too tight or too loose.
+  Check it at 100% and at higher DPI before judging it.
+- **Menu-from-gear untested.** The tray menu is now opened
+  with the manager window as owner while the click came from
+  a notch window; the menu items, toggle behaviour, and
+  dismissal (including clicking away) have not been exercised
+  on Windows, and the gear-must-not-pin rule has not been
+  clicked through on a real screen.
+- **Animation interplay untested.** Animated sizes now
+  interpolate to the new (shorter) total heights, and the gear
+  moves with the notch width during animation; flicker,
+  clipping, or a gear drawn outside the region mid-animation
+  has not been observed — the Animations tray tick remains
+  the instant fallback.
+- **Stats-only height grows** (180 px to 210 px, see the
+  reorganization section) — that is arithmetic from the new
+  layout, not a measurement, and the both-on saving (236 px
+  to 210 px) is arithmetic too until a Windows run confirms it.
 
 ## Honest limits — v4 additions (not verified on Windows)
 
@@ -370,6 +489,13 @@ with `build.bat` on Windows and runs it:
   buttons with a matching circular hit test, a section
   divider, a drawn battery glyph, and a white-pill calendar
   today highlight. No acrylic, no new timers or dependencies.
+  v4 reorganization (in place): compact two-column body
+  (media beside system stats, calendar full-width below),
+  MEDIA / SYSTEM / CALENDAR section headers, stats split
+  into two labelled rows with progress bars, footer removed,
+  and a GDI settings gear in the expanded header that opens
+  the existing tray menu (hit-tested before the pin click).
+  No new settings window, no settings file.
 - `build.bat` — MSVC build script (resource compile + compile/link).
 - `onyxnotch.rc` — resource script binding the icon (ID 100).
 - `onyxnotch.ico` — custom black-pill icon, 16/32/48 px, 32-bit.
