@@ -1,3 +1,12 @@
+// OnyxNotch v8 - clipboard history + file shelf, Vayli-style (see README v8 section).
+// v8 adds ONLY those two features, both OFF by default, on top of v7:
+// clipboard history (in-memory only, AddClipboardFormatListener on the
+// manager window, password-manager heuristic skip, click-to-copy-back,
+// OLE drag-out for text/files) and a file shelf (referenced paths
+// only, persisted in shelf.ini, drag-out via CF_HDROP). No search
+// box anywhere: the notch is WS_EX_NOACTIVATE and must not steal
+// keyboard focus, so filters are mouse-click chips, not typing.
+// No network, no accounts, no telemetry, no new runtime.
 // OnyxNotch v7 - Direct2D rewrite of v6 (see README v7 section).
 // Every v6 feature and behaviour is preserved; only the rendering
 // layer changed: GDI painting is replaced by Direct2D/DirectWrite
@@ -231,6 +240,7 @@
 #include <mmsystem.h> // v6: waveOutGetVolume for system volume
 #include <d2d1.h> // v7: Direct2D rendering
 #include <dwrite.h> // v7: DirectWrite text
+#include <ole2.h> // v8: DoDragDrop / IDataObject for drag-out
 // v5-SMTC: C++/WinRT headers for the local SMTC session manager.
 // These need the Windows SDK with C++/WinRT and /std:c++17 (see
 // build.bat). No other WinRT API is used; there is no network use.
@@ -253,6 +263,7 @@
 #pragma comment(lib, "winmm.lib") // v6: waveOutGetVolume
 #pragma comment(lib, "d2d1.lib") // v7: Direct2D rendering
 #pragma comment(lib, "dwrite.lib") // v7: DirectWrite text
+#pragma comment(lib, "ole32.lib") // v8: DoDragDrop
 
 #define ID_TRAY_ICON            1
 #define WM_TRAY                 (WM_APP + 1)
@@ -277,6 +288,8 @@
 #define ID_TRAY_THEME_MIDNIGHT  1016
 #define ID_TRAY_THEME_GRAPHITE  1017
 #define ID_TRAY_BLUR            1018
+#define ID_TRAY_CLIPBOARD       1019
+#define ID_TRAY_SHELF           1020
 #define IDI_ONYXNOTCH_ICON      100
 
 static const wchar_t kNotchClass[] = L"OnyxNotch";
@@ -300,6 +313,45 @@ static bool g_startWithWindows = false; // v5-settings: OFF by default
 // blur=0/1 in settings.ini. Never the default: an opaque panel
 // is the safe look, and blur on a layered window is untested.
 static bool g_blurEnabled = false;
+// v8: clipboard history + file shelf, BOTH OFF by default (privacy:
+// clipboard history must not start recording until the user turns
+// it on). Saved in settings.ini as clipboard= / shelf=.
+static bool g_clipEnabled = false;
+static bool g_shelfEnabled = false;
+
+// v8 clipboard item. Text is capped at 4096 chars stored (longer
+// items are truncated, flagged, and never silently cut to a
+// misleading prefix without the note). Images store a THUMBNAIL
+// bitmap only (max 256 px on the long side), never the full
+// clipboard bitmap, to bound memory; copy-back pastes the
+// thumbnail, not the original full image (documented cut).
+// Files store paths only, never file contents. History is
+// in-memory only in v8 and is cleared on quit — a privacy
+// choice, not a bug. Pinned items stay at the top of the
+// display order and are never evicted by the 50-item cap.
+struct ClipItem {
+    int type = 0; // 0 text, 1 image, 2 files, 3 link
+    std::wstring text;
+    std::vector<std::wstring> files;
+    HBITMAP thumb = NULL;
+    int thumbW = 0, thumbH = 0, origW = 0, origH = 0;
+    bool truncated = false;
+    bool pinned = false;
+};
+static std::vector<ClipItem> g_clipItems;
+static bool g_clipIgnoreNext = false;
+static const int kClipCap = 50;
+static const int kClipTextCap = 4096;
+
+// v8 shelf item: a REFERENCED path only, never a copy. Missing
+// files stay in the list, greyed, as Missing — they are never
+// silently deleted, and no path is invented.
+struct ShelfItem { std::wstring path; bool missing = false; };
+static std::vector<ShelfItem> g_shelfItems;
+static const int kShelfCap = 50;
+static bool GetShelfPath(wchar_t* out, size_t count);
+static void SaveShelf();
+static void LoadShelf();
 
 // ---------------------------------------------------------------------------
 // v5-themes: theme table. Onyx reproduces the v4 colours exactly
@@ -492,6 +544,10 @@ static void LoadSettings()
                     if (ParseBoolValue(val, b)) g_animations = b;
                 } else if (StrEqualsIgnoreCase(key, "blur")) {
                     if (ParseBoolValue(val, b)) g_blurEnabled = b;
+                } else if (StrEqualsIgnoreCase(key, "clipboard")) {
+                    if (ParseBoolValue(val, b)) g_clipEnabled = b;
+                } else if (StrEqualsIgnoreCase(key, "shelf")) {
+                    if (ParseBoolValue(val, b)) g_shelfEnabled = b;
                 } else if (StrEqualsIgnoreCase(key, "theme")) {
                     // v5-themes: unknown/corrupt values are ignored,
                     // so the current value (Onyx by default) stands.
@@ -522,7 +578,7 @@ static void SaveSettings()
     HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, NULL,
                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h == INVALID_HANDLE_VALUE) return;
-    char buf[512];
+    char buf[640];
     int len = sprintf_s(buf, sizeof(buf),
         "; OnyxNotch settings - rewritten on every change and on clean quit.\r\n"
         "; Unknown keys are ignored on load; values are 0 = off, 1 = on.\r\n"
@@ -533,6 +589,8 @@ static void SaveSettings()
         "widget_calendar=%d\r\n"
         "animations=%d\r\n"
         "blur=%d\r\n"
+        "clipboard=%d\r\n"
+        "shelf=%d\r\n"
         "theme=%s\r\n",
         g_size,
         g_hideOnFullscreen ? 1 : 0,
@@ -541,6 +599,8 @@ static void SaveSettings()
         g_widgetCalendar ? 1 : 0,
         g_animations ? 1 : 0,
         g_blurEnabled ? 1 : 0,
+        g_clipEnabled ? 1 : 0,
+        g_shelfEnabled ? 1 : 0,
         ThemeKey(g_theme));
     if (len > 0) {
         DWORD written = 0;
@@ -676,6 +736,16 @@ struct Notch {
     int hoverCalArrow = 0; // v6-fix: -1 prev, 0 none, 1 next
     bool hoverCalToday = false;
     int hoverCalCell = -1; // v6-fix: 0..41 cell in the displayed grid, or -1
+    // v8: clipboard/shelf per-notch UI state (shared data lives in
+    // the globals above; scroll/filter are per-notch so two
+    // monitors do not fight over one scroll position).
+    int clipFilter = 0; // 0 All, 1 Text, 2 Images, 3 Links, 4 Files
+    int clipScroll = 0; // item offset into the filtered display list
+    int shelfScroll = 0;
+    int dragKind = 0; // 0 none, 1 clipboard row, 2 shelf row
+    int dragIndex = -1; // storage index of the drag candidate
+    int dragStartX = 0, dragStartY = 0;
+    bool dragStarted = false;
     bool animActive = false;
     ULONGLONG animStartTick = 0;
     int animFromW = 0, animFromH = 0;
@@ -719,6 +789,112 @@ static int ExpandedWidth(Notch* n)
 }
 
 // ---------------------------------------------------------------------------
+// v8 shelf persistence. shelf.ini is UTF-8, one path per line, in
+// %APPDATA%\OnyxNotch\shelf.ini. Missing/corrupt lines are
+// ignored on load; paths that no longer exist are kept and
+// shown as Missing. Only PATHS are saved, never file contents.
+static bool GetShelfPath(wchar_t* out, size_t count)
+{
+    if (!GetOnyxSettingsDir(out, count)) return false;
+    if (wcscat_s(out, count, L"\\shelf.ini") != 0) return false;
+    return true;
+}
+static void SaveShelf()
+{
+    wchar_t dir[MAX_PATH] = { 0 }, path[MAX_PATH] = { 0 };
+    if (!GetOnyxSettingsDir(dir, MAX_PATH)) return;
+    if (!GetShelfPath(path, MAX_PATH)) return;
+    CreateDirectoryW(dir, NULL);
+    HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return;
+    for (size_t i = 0; i < g_shelfItems.size(); i++) {
+        char mb[1024];
+        int n = WideCharToMultiByte(CP_UTF8, 0, g_shelfItems[i].path.c_str(), -1, mb, (int)sizeof(mb) - 3, NULL, NULL);
+        if (n <= 0) continue;
+        DWORD w = 0;
+        WriteFile(h, mb, (DWORD)strlen(mb), &w, NULL);
+        WriteFile(h, "\r\n", 2, &w, NULL);
+    }
+    CloseHandle(h);
+}
+static void LoadShelf()
+{
+    g_shelfItems.clear();
+    wchar_t path[MAX_PATH] = { 0 };
+    if (!GetShelfPath(path, MAX_PATH)) return;
+    HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return;
+    char buf[16384]; DWORD read = 0;
+    BOOL ok = ReadFile(h, buf, (DWORD)sizeof(buf) - 1, &read, NULL);
+    CloseHandle(h);
+    if (!ok) return;
+    buf[read] = '\0';
+    char* p = buf;
+    while (*p && g_shelfItems.size() < (size_t)kShelfCap) {
+        char* e = p; while (*e && *e != '\n') e++;
+        char saved = *e; *e = '\0';
+        while (*p == ' ' || *p == '\t' || *p == '\r') p++;
+        char* end = p + strlen(p);
+        while (end > p && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\r')) { end--; *end = '\0'; }
+        if (*p) {
+            wchar_t wp[MAX_PATH];
+            if (MultiByteToWideChar(CP_UTF8, 0, p, -1, wp, MAX_PATH) > 0) {
+                ShelfItem it; it.path = wp;
+                it.missing = (GetFileAttributesW(wp) == INVALID_FILE_ATTRIBUTES);
+                g_shelfItems.push_back(it);
+            }
+        }
+        if (saved == '\0') break;
+        p = e + 1;
+    }
+}
+static bool ShelfAddPath(const std::wstring& path)
+{
+    if (path.empty()) return false;
+    for (size_t i = 0; i < g_shelfItems.size(); i++) if (g_shelfItems[i].path == path) return false;
+    if ((int)g_shelfItems.size() >= kShelfCap) return false;
+    ShelfItem it; it.path = path;
+    it.missing = (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES);
+    g_shelfItems.push_back(it);
+    return true;
+}
+static std::wstring FileNameOf(const std::wstring& path)
+{
+    size_t pos = path.find_last_of(L"\\/");
+    return (pos == std::wstring::npos) ? path : path.substr(pos + 1);
+}
+static std::wstring ParentOf(const std::wstring& path)
+{
+    size_t pos = path.find_last_of(L"\\/");
+    return (pos == std::wstring::npos) ? std::wstring() : path.substr(0, pos);
+}
+// v8 display order for clipboard: pinned first (in storage
+// order), then unpinned, both newest-first within their group.
+// filter: 0 All, 1 Text, 2 Images, 3 Links, 4 Files. Returns
+// storage indices, in display order.
+static void DisplayClipIndices(int filter, std::vector<int>& out)
+{
+    out.clear();
+    for (int pass = 0; pass < 2; pass++) {
+        for (size_t i = 0; i < g_clipItems.size(); i++) {
+            bool pin = g_clipItems[i].pinned;
+            if ((pass == 0) != pin) continue;
+            int t = g_clipItems[i].type;
+            if (filter == 1 && t != 0) continue;
+            if (filter == 2 && t != 1) continue;
+            if (filter == 3 && t != 3) continue;
+            if (filter == 4 && t != 2) continue;
+            out.push_back((int)i);
+        }
+    }
+}
+static bool IsLinkText(const std::wstring& t)
+{
+    if (t.find(L" ") != std::wstring::npos || t.find(L"\n") != std::wstring::npos) return false;
+    return t.rfind(L"http://", 0) == 0 || t.rfind(L"https://", 0) == 0;
+}
+
+// ---------------------------------------------------------------------------
 // Expanded layout. One shared computation drives both painting and the
 // media-button hit test, so the clickable buttons match what is drawn.
 // ---------------------------------------------------------------------------
@@ -730,6 +906,8 @@ static const int kTabMedia = 1;
 static const int kTabSystem = 2;
 static const int kTabCalendar = 3;
 static const int kTabClock = 4;
+static const int kTabClipboard = 5;
+static const int kTabShelf = 6;
 
 struct Layout {
     int totalH = 0;
@@ -738,14 +916,22 @@ struct Layout {
     int closeCX = 0, closeCY = 0, closeR = 0;
     int bodyY = 0;
     int dockY = 0, dockH = 0, dockCount = 0;
-    int dockIds[5] = { 0, 0, 0, 0, 0 };
-    RECT dockRects[5] = { { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 } };
+    int dockIds[7] = { 0, 0, 0, 0, 0, 0, 0 };
+    RECT dockRects[7] = { { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 } };
     RECT dockPill = { 0, 0, 0, 0 };
     // HOME grid cards. homeCardIds: 0 System, 1 Calendar, 2 Clock,
-    // 3 Media, 4 Battery, 5 Network.
+    // 3 Media, 4 Battery, 5 Network, 6 Clipboard (v8, only if on).
     int homeCardCount = 0;
-    int homeCardIds[6] = { 0, 0, 0, 0, 0, 0 };
-    RECT homeCards[6] = { { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 } };
+    int homeCardIds[7] = { 0, 0, 0, 0, 0, 0, 0 };
+    RECT homeCards[7] = { { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 } };
+    // v8 clipboard/shelf cards (full-width body cards).
+    RECT clipCard = { 0, 0, 0, 0 };
+    RECT shelfCard = { 0, 0, 0, 0 };
+    RECT clipChipRects[5] = { { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 } };
+    int clipListY = 0, clipRowH = 0;
+    RECT clipClearRect = { 0, 0, 0, 0 };
+    int shelfListY = 0, shelfRowH = 0;
+    RECT shelfClearRect = { 0, 0, 0, 0 };
     int homeMediaTitleY = -1;
     int homeMediaButtonY = 0, homeMediaButtonH = 0;
     RECT homeBtnPrev = { 0, 0, 0, 0 };
@@ -807,7 +993,9 @@ static int EffectiveTab(Notch* n)
     if (t == kTabMedia && !g_mediaEnabled) return kTabHome;
     if (t == kTabSystem && !g_widgetStats) return kTabHome;
     if (t == kTabCalendar && !g_widgetCalendar) return kTabHome;
-    if (t != kTabHome && t != kTabMedia && t != kTabSystem && t != kTabCalendar && t != kTabClock) return kTabHome;
+    if (t == kTabClipboard && !g_clipEnabled) return kTabHome;
+    if (t == kTabShelf && !g_shelfEnabled) return kTabHome;
+    if (t != kTabHome && t != kTabMedia && t != kTabSystem && t != kTabCalendar && t != kTabClock && t != kTabClipboard && t != kTabShelf) return kTabHome;
     return t;
 }
 
@@ -820,6 +1008,8 @@ static int DockIds(int* out)
     if (g_mediaEnabled) out[c++] = kTabMedia;
     out[c++] = kTabClock;
     if (g_widgetCalendar) out[c++] = kTabCalendar;
+    if (g_clipEnabled) out[c++] = kTabClipboard;
+    if (g_shelfEnabled) out[c++] = kTabShelf;
     return c;
 }
 
@@ -844,10 +1034,10 @@ static Layout ComputeLayoutForTab(Notch* n, int clientW, int tab)
     int bodyH = 0;
     int btnGap = Scale(8, dpi);
     if (effTab == kTabHome) {
-        int ids[6] = { 0, 1, 2, 3, 4, 5 };
-        bool on[6] = { g_widgetStats, g_widgetCalendar, true, g_mediaEnabled, g_widgetStats, g_widgetStats };
+        int ids[7] = { 0, 1, 2, 3, 4, 5, 6 };
+        bool on[7] = { g_widgetStats, g_widgetCalendar, true, g_mediaEnabled, g_widgetStats, g_widgetStats, g_clipEnabled };
         int count = 0;
-        for (int i = 0; i < 6; i++) if (on[i]) { L.homeCardIds[count] = ids[i]; count++; }
+        for (int i = 0; i < 7; i++) if (on[i]) { L.homeCardIds[count] = ids[i]; count++; }
         L.homeCardCount = count;
         int cols = 3;
         int cardW = (bodyW - (cols - 1) * gap) / cols;
@@ -941,11 +1131,37 @@ static Layout ComputeLayoutForTab(Notch* n, int clientW, int tab)
         L.calTodayRect = { margin + (monthW - todayW) / 2, L.bodyY + Scale(230, dpi),
                            margin + (monthW + todayW) / 2, L.bodyY + Scale(252, dpi) };
         bodyH = monthH;
+    } else if (effTab == kTabClipboard) {
+        // v8 clipboard tab: chips row, 8 list rows, Clear all row.
+        int cardH = Scale(28, dpi) + Scale(30, dpi) + 8 * Scale(30, dpi) + Scale(34, dpi);
+        L.clipCard = { margin, L.bodyY, margin + bodyW, L.bodyY + cardH };
+        int chipY = L.bodyY + Scale(28, dpi);
+        int chipH = Scale(26, dpi);
+        int chipW[5] = { Scale(48, dpi), Scale(56, dpi), Scale(68, dpi), Scale(56, dpi), Scale(56, dpi) };
+        int cx = margin + Scale(14, dpi);
+        for (int i = 0; i < 5; i++) {
+            L.clipChipRects[i] = { cx, chipY, cx + chipW[i], chipY + chipH };
+            cx += chipW[i] + Scale(8, dpi);
+        }
+        L.clipListY = chipY + chipH + Scale(6, dpi);
+        L.clipRowH = Scale(30, dpi);
+        L.clipClearRect = { margin + Scale(14, dpi), L.clipCard.bottom - Scale(30, dpi),
+                            margin + Scale(110, dpi), L.clipCard.bottom - Scale(8, dpi) };
+        bodyH = cardH;
+    } else if (effTab == kTabShelf) {
+        // v8 shelf tab: 8 list rows, Clear all row.
+        int cardH = Scale(28, dpi) + 8 * Scale(30, dpi) + Scale(34, dpi);
+        L.shelfCard = { margin, L.bodyY, margin + bodyW, L.bodyY + cardH };
+        L.shelfListY = L.bodyY + Scale(28, dpi);
+        L.shelfRowH = Scale(30, dpi);
+        L.shelfClearRect = { margin + Scale(14, dpi), L.shelfCard.bottom - Scale(30, dpi),
+                             margin + Scale(110, dpi), L.shelfCard.bottom - Scale(8, dpi) };
+        bodyH = cardH;
     }
     // Bottom icon dock: centred pill, one icon per dock tab.
     L.dockH = Scale(56, dpi);
     L.dockY = L.bodyY + bodyH + Scale(8, dpi);
-    int dockIds[5];
+    int dockIds[7];
     int dc = DockIds(dockIds);
     L.dockCount = dc;
     int iconStep = Scale(48, dpi);
@@ -985,7 +1201,7 @@ static void ShiftRectY(RECT& r, int dy)
 static Layout ComputeLayout(Notch* n, int clientW)
 {
     Layout L = ComputeLayoutForTab(n, clientW, EffectiveTab(n));
-    int ids[5];
+    int ids[7];
     int dc = DockIds(ids);
     int maxTotal = L.totalH;
     for (int i = 0; i < dc; i++) {
@@ -1021,6 +1237,13 @@ static Layout ComputeLayout(Notch* n, int clientW)
     ShiftRectY(L.calPrevRect, shift);
     ShiftRectY(L.calNextRect, shift);
     ShiftRectY(L.calTodayRect, shift);
+    ShiftRectY(L.clipCard, shift);
+    for (int i = 0; i < 5; i++) ShiftRectY(L.clipChipRects[i], shift);
+    L.clipListY += shift;
+    ShiftRectY(L.clipClearRect, shift);
+    ShiftRectY(L.shelfCard, shift);
+    L.shelfListY += shift;
+    ShiftRectY(L.shelfClearRect, shift);
     L.dockY += delta;
     ShiftRectY(L.dockPill, delta);
     for (int i = 0; i < L.dockCount; i++) ShiftRectY(L.dockRects[i], delta);
@@ -1267,6 +1490,8 @@ static void ShowTrayMenuAt(POINT pt, UINT alignFlags)
     AppendCheck(menu, ID_TRAY_MEDIA, L"Media controls", g_mediaEnabled);
     AppendCheck(menu, ID_TRAY_WIDGET_STATS, L"Widget: System stats", g_widgetStats);
     AppendCheck(menu, ID_TRAY_WIDGET_CALENDAR, L"Widget: Calendar", g_widgetCalendar);
+    AppendCheck(menu, ID_TRAY_CLIPBOARD, L"Clipboard history", g_clipEnabled);
+    AppendCheck(menu, ID_TRAY_SHELF, L"File shelf", g_shelfEnabled);
     AppendCheck(menu, ID_TRAY_ANIMATIONS, L"Animations", g_animations);
     AppendCheck(menu, ID_TRAY_BLUR, L"Blur background (experimental)", g_blurEnabled);
     AppendCheck(menu, ID_TRAY_AUTOSTART, L"Start with Windows", g_startWithWindows);
@@ -2185,6 +2410,220 @@ static int CalDayHitAt(Notch* n, int px, int py, bool usePaint)
     return row * 7 + col;
 }
 
+// ---------- v8 clipboard/shelf hit tests (share ComputeLayout) ----------
+// part codes: clip: 0 row, 1 pin, 2 chip, 3 clear; shelf: 0 row, 1 open, 2 remove, 3 clear.
+static bool ClipChipHitAt(Notch* n, int px, int py, bool usePaint, int& chipOut)
+{
+    if (!g_clipEnabled) return false;
+    if (usePaint ? !n->paintExpanded : !n->expanded) return false;
+    if (EffectiveTab(n) != kTabClipboard) return false;
+    RECT rc; GetClientRect(n->hwnd, &rc);
+    Layout L = ComputeLayout(n, rc.right);
+    for (int i = 0; i < 5; i++) {
+        RECT r = L.clipChipRects[i];
+        if (px >= r.left && px < r.right && py >= r.top && py < r.bottom) { chipOut = i; return true; }
+    }
+    return false;
+}
+static bool ClipHitAt(Notch* n, int px, int py, bool usePaint, int& itemOut, int& partOut)
+{
+    if (!g_clipEnabled) return false;
+    if (usePaint ? !n->paintExpanded : !n->expanded) return false;
+    if (EffectiveTab(n) != kTabClipboard) return false;
+    RECT rc; GetClientRect(n->hwnd, &rc);
+    Layout L = ComputeLayout(n, rc.right);
+    if (px >= L.clipClearRect.left && px < L.clipClearRect.right &&
+        py >= L.clipClearRect.top && py < L.clipClearRect.bottom) { partOut = 3; itemOut = -1; return true; }
+    std::vector<int> disp; DisplayClipIndices(n->clipFilter, disp);
+    for (int row = 0; row < 8; row++) {
+        int di = n->clipScroll + row;
+        if (di < 0 || di >= (int)disp.size()) break;
+        int y0 = L.clipListY + row * L.clipRowH;
+        int y1 = y0 + L.clipRowH;
+        if (py < y0 || py >= y1) continue;
+        if (px < L.clipCard.left + 14 || px >= L.clipCard.right - 14) return false;
+        int pinL = L.clipCard.right - 14 - 44;
+        if (px >= pinL && px < L.clipCard.right - 14) { partOut = 1; itemOut = disp[di]; return true; }
+        partOut = 0; itemOut = disp[di]; return true;
+    }
+    return false;
+}
+static bool ShelfHitAt(Notch* n, int px, int py, bool usePaint, int& itemOut, int& partOut)
+{
+    if (!g_shelfEnabled) return false;
+    if (usePaint ? !n->paintExpanded : !n->expanded) return false;
+    if (EffectiveTab(n) != kTabShelf) return false;
+    RECT rc; GetClientRect(n->hwnd, &rc);
+    Layout L = ComputeLayout(n, rc.right);
+    if (px >= L.shelfClearRect.left && px < L.shelfClearRect.right &&
+        py >= L.shelfClearRect.top && py < L.shelfClearRect.bottom) { partOut = 3; itemOut = -1; return true; }
+    for (int row = 0; row < 8; row++) {
+        int di = n->shelfScroll + row;
+        if (di < 0 || di >= (int)g_shelfItems.size()) break;
+        int y0 = L.shelfListY + row * L.shelfRowH;
+        int y1 = y0 + L.shelfRowH;
+        if (py < y0 || py >= y1) continue;
+        if (px < L.shelfCard.left + 14 || px >= L.shelfCard.right - 14) return false;
+        int remL = L.shelfCard.right - 14 - 24;
+        int openL = remL - 6 - 48;
+        if (px >= remL) { partOut = 2; itemOut = di; return true; }
+        if (px >= openL) { partOut = 1; itemOut = di; return true; }
+        partOut = 0; itemOut = di; return true;
+    }
+    return false;
+}
+
+// ---------- v8 OLE drag-out (text + files only; images: click-to-copy) ----------
+// Minimal IDataObject/IDropSource. Drag-out is DoDragDrop with
+// DROPEFFECT_COPY only (the shelf/clipboard never moves the
+// source). If DoDragDrop fails on a real target, click-to-copy
+// remains the fallback — drag failure never deletes anything.
+class SimpleEnumFormatEtc : public IEnumFORMATETC {
+    LONG m_ref = 1;
+    std::vector<FORMATETC> m_fmts;
+    size_t m_idx = 0;
+public:
+    SimpleEnumFormatEtc(const std::vector<FORMATETC>& f) : m_fmts(f) {}
+    STDMETHODIMP QueryInterface(REFIID riid, void** ppv) {
+        if (!ppv) return E_POINTER;
+        if (riid == IID_IUnknown || riid == IID_IEnumFORMATETC) { *ppv = static_cast<IEnumFORMATETC*>(this); AddRef(); return S_OK; }
+        *ppv = NULL; return E_NOINTERFACE;
+    }
+    STDMETHODIMP_(ULONG) AddRef() { return (ULONG)InterlockedIncrement(&m_ref); }
+    STDMETHODIMP_(ULONG) Release() { LONG r = InterlockedDecrement(&m_ref); if (r == 0) delete this; return (ULONG)r; }
+    STDMETHODIMP Next(ULONG celt, FORMATETC* rgelt, ULONG* pceltFetched) {
+        if (!rgelt) return E_POINTER;
+        ULONG got = 0;
+        while (got < celt && m_idx < m_fmts.size()) { rgelt[got] = m_fmts[m_idx]; m_idx++; got++; }
+        if (pceltFetched) *pceltFetched = got;
+        return (got == celt) ? S_OK : S_FALSE;
+    }
+    STDMETHODIMP Skip(ULONG celt) { m_idx += celt; if (m_idx > m_fmts.size()) { m_idx = m_fmts.size(); return S_FALSE; } return S_OK; }
+    STDMETHODIMP Reset() { m_idx = 0; return S_OK; }
+    STDMETHODIMP Clone(IEnumFORMATETC** ppenum) {
+        if (!ppenum) return E_POINTER;
+        SimpleEnumFormatEtc* e = new SimpleEnumFormatEtc(m_fmts);
+        e->m_idx = m_idx;
+        *ppenum = e;
+        return S_OK;
+    }
+};
+class SimpleDataObject : public IDataObject {
+    LONG m_ref = 1;
+    std::vector<FORMATETC> m_fmts;
+    std::wstring m_text;
+    std::vector<std::wstring> m_files;
+    bool m_hasText = false, m_hasFiles = false;
+    static HGLOBAL MakeTextGlobal(const std::wstring& t) {
+        size_t bytes = (t.size() + 1) * sizeof(wchar_t);
+        HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, bytes);
+        if (!h) return NULL;
+        wchar_t* p = (wchar_t*)GlobalLock(h);
+        if (!p) { GlobalFree(h); return NULL; }
+        memcpy(p, t.c_str(), bytes);
+        GlobalUnlock(h);
+        return h;
+    }
+    static HGLOBAL MakeFilesGlobal(const std::vector<std::wstring>& files) {
+        size_t total = 0;
+        for (size_t i = 0; i < files.size(); i++) total += (files[i].size() + 1);
+        total += 1; // final double-null
+        size_t bytes = sizeof(DROPFILES) + total * sizeof(wchar_t);
+        HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, bytes);
+        if (!h) return NULL;
+        BYTE* base = (BYTE*)GlobalLock(h);
+        if (!base) { GlobalFree(h); return NULL; }
+        DROPFILES* df = (DROPFILES*)base;
+        df->pFiles = sizeof(DROPFILES);
+        df->pt.x = 0; df->pt.y = 0; df->fNC = FALSE; df->fWide = TRUE;
+        wchar_t* dst = (wchar_t*)(base + sizeof(DROPFILES));
+        for (size_t i = 0; i < files.size(); i++) {
+            wcscpy_s(dst, total, files[i].c_str());
+            dst += files[i].size() + 1;
+        }
+        *dst = L'\0';
+        GlobalUnlock(h);
+        return h;
+    }
+public:
+    SimpleDataObject(const std::wstring& text, const std::vector<std::wstring>& files) : m_text(text), m_files(files) {
+        if (!text.empty()) {
+            FORMATETC fe = { 0 }; fe.cfFormat = CF_UNICODETEXT; fe.dwAspect = DVASPECT_CONTENT; fe.lindex = -1; fe.tymed = TYMED_HGLOBAL;
+            m_fmts.push_back(fe); m_hasText = true;
+        }
+        if (!files.empty()) {
+            FORMATETC fe = { 0 }; fe.cfFormat = CF_HDROP; fe.dwAspect = DVASPECT_CONTENT; fe.lindex = -1; fe.tymed = TYMED_HGLOBAL;
+            m_fmts.push_back(fe); m_hasFiles = true;
+        }
+    }
+    STDMETHODIMP QueryInterface(REFIID riid, void** ppv) {
+        if (!ppv) return E_POINTER;
+        if (riid == IID_IUnknown || riid == IID_IDataObject) { *ppv = static_cast<IDataObject*>(this); AddRef(); return S_OK; }
+        *ppv = NULL; return E_NOINTERFACE;
+    }
+    STDMETHODIMP_(ULONG) AddRef() { return (ULONG)InterlockedIncrement(&m_ref); }
+    STDMETHODIMP_(ULONG) Release() { LONG r = InterlockedDecrement(&m_ref); if (r == 0) delete this; return (ULONG)r; }
+    STDMETHODIMP GetData(FORMATETC* pfe, STGMEDIUM* pmed) {
+        if (!pfe || !pmed) return E_POINTER;
+        if (pfe->cfFormat == CF_UNICODETEXT && m_hasText && (pfe->tymed & TYMED_HGLOBAL)) {
+            HGLOBAL h = MakeTextGlobal(m_text);
+            if (!h) return E_OUTOFMEMORY;
+            pmed->tymed = TYMED_HGLOBAL; pmed->hGlobal = h; pmed->pUnkForRelease = NULL;
+            return S_OK;
+        }
+        if (pfe->cfFormat == CF_HDROP && m_hasFiles && (pfe->tymed & TYMED_HGLOBAL)) {
+            HGLOBAL h = MakeFilesGlobal(m_files);
+            if (!h) return E_OUTOFMEMORY;
+            pmed->tymed = TYMED_HGLOBAL; pmed->hGlobal = h; pmed->pUnkForRelease = NULL;
+            return S_OK;
+        }
+        return DV_E_FORMATETC;
+    }
+    STDMETHODIMP GetDataHere(FORMATETC*, STGMEDIUM*) { return E_NOTIMPL; }
+    STDMETHODIMP QueryGetData(FORMATETC* pfe) {
+        if (!pfe) return E_POINTER;
+        for (size_t i = 0; i < m_fmts.size(); i++) if (m_fmts[i].cfFormat == pfe->cfFormat) return S_OK;
+        return DV_E_FORMATETC;
+    }
+    STDMETHODIMP GetCanonicalFormatEtc(FORMATETC*, FORMATETC*) { return E_NOTIMPL; }
+    STDMETHODIMP SetData(FORMATETC*, STGMEDIUM*, BOOL) { return E_NOTIMPL; }
+    STDMETHODIMP EnumFormatEtc(DWORD, IEnumFORMATETC** ppenum) {
+        if (!ppenum) return E_POINTER;
+        *ppenum = new SimpleEnumFormatEtc(m_fmts);
+        return S_OK;
+    }
+    STDMETHODIMP DAdvise(FORMATETC*, DWORD, IAdviseSink*, DWORD*) { return OLE_E_ADVISENOTSUPPORTED; }
+    STDMETHODIMP DUnadvise(DWORD) { return OLE_E_ADVISENOTSUPPORTED; }
+    STDMETHODIMP EnumDAdvise(IEnumSTATDATA**) { return OLE_E_ADVISENOTSUPPORTED; }
+};
+class SimpleDropSource : public IDropSource {
+    LONG m_ref = 1;
+public:
+    STDMETHODIMP QueryInterface(REFIID riid, void** ppv) {
+        if (!ppv) return E_POINTER;
+        if (riid == IID_IUnknown || riid == IID_IDropSource) { *ppv = static_cast<IDropSource*>(this); AddRef(); return S_OK; }
+        *ppv = NULL; return E_NOINTERFACE;
+    }
+    STDMETHODIMP_(ULONG) AddRef() { return (ULONG)InterlockedIncrement(&m_ref); }
+    STDMETHODIMP_(ULONG) Release() { LONG r = InterlockedDecrement(&m_ref); if (r == 0) delete this; return (ULONG)r; }
+    STDMETHODIMP QueryContinueDrag(BOOL fEscapePressed, DWORD grfKeyState) {
+        if (fEscapePressed) return DRAGDROP_S_CANCEL;
+        if (!(grfKeyState & MK_LBUTTON)) return DRAGDROP_S_DROP;
+        return S_OK;
+    }
+    STDMETHODIMP GiveFeedback(DWORD) { return DRAGDROP_S_USEDEFAULTCURSORS; }
+};
+static void DoDragTextOrFiles(const std::wstring& text, const std::vector<std::wstring>& files)
+{
+    if (text.empty() && files.empty()) return;
+    SimpleDataObject* obj = new SimpleDataObject(text, files);
+    SimpleDropSource* src = new SimpleDropSource();
+    DWORD effect = 0;
+    DoDragDrop(obj, src, DROPEFFECT_COPY, &effect);
+    obj->Release();
+    src->Release();
+}
+
 // ===========================================================================
 // v7 Direct2D rendering layer. This section REPLACES the v6 GDI painting
 // (memory DC + BitBlt, GDI brushes/pens/fonts, hand-drawn GDI glyphs).
@@ -2621,6 +3060,7 @@ static void DrawBarD2D(Canvas* cv, const RECT& rc, int pct)
     }
 }
 
+static void DrawDockGlyphExtraD2D(Canvas* cv, int tabId, int cx, int cy, int r, COLORREF color);
 static void DrawDockGlyphD2D(Canvas* cv, int tabId, int cx, int cy, int r, COLORREF color)
 {
     int ir = r * 3 / 4; if (ir < 4) ir = 4;
@@ -2642,9 +3082,24 @@ static void DrawDockGlyphD2D(Canvas* cv, int tabId, int cx, int cy, int r, COLOR
         RECT cal = { cx - ir, cy - ir * 3 / 4, cx + ir, cy + ir };
         cv->StrokeRounded(cal, color, 1.0f, 2.0f);
         cv->FillRect(RECT{ cal.left, cal.top, cal.right, cal.top + ir / 3 }, color);
+    } else if (tabId == kTabClipboard || tabId == kTabShelf) {
+        DrawDockGlyphExtraD2D(cv, tabId, cx, cy, r, color);
     }
 }
 
+static void DrawDockGlyphExtraD2D(Canvas* cv, int tabId, int cx, int cy, int r, COLORREF color)
+{
+    int ir = r * 3 / 4; if (ir < 4) ir = 4;
+    if (tabId == kTabClipboard) {
+        RECT board = { cx - ir * 2 / 3, cy - ir / 2, cx + ir * 2 / 3, cy + ir };
+        cv->StrokeRounded(board, color, 1.0f, 2.0f);
+        cv->FillRect(RECT{ cx - ir / 3, cy - ir, cx + ir / 3, cy - ir / 2 }, color);
+        cv->Line((float)(cx - ir / 2), (float)(cy + ir / 4), (float)(cx + ir / 2), (float)(cy + ir / 4), color, 2.0f);
+    } else if (tabId == kTabShelf) {
+        cv->StrokeRounded(RECT{ cx - ir, cy - ir / 2, cx + ir, cy + ir }, color, 1.0f, 2.0f);
+        cv->FillRect(RECT{ cx - ir / 2, cy - ir, cx + ir / 2, cy - ir / 2 }, color);
+    }
+}
 static void DrawMediaButtonsRowD2D(Canvas* cv, Notch* n, const Layout& L, bool home)
 {
     for (int i = 0; i < 3; i++) {
@@ -2702,7 +3157,7 @@ static void PaintNotchD2D(Notch* n, Canvas* cv)
     }
     Layout L = ComputeLayout(n, rc.right);
     int effTab = EffectiveTab(n);
-    static const wchar_t* kTabTitles[5] = { L"Home", L"Media", L"System", L"Calendar", L"Clock" };
+    static const wchar_t* kTabTitles[7] = { L"Home", L"Media", L"System", L"Calendar", L"Clock", L"Clipboard", L"Shelf" };
     wchar_t subtitle[128] = { 0 };
     if (effTab == kTabHome) { FormatDate(subtitle, 128); }
     else if (effTab == kTabSystem) { wcscpy_s(subtitle, 128, L"Power \x00B7 Network \x00B7 Audio"); }
@@ -2714,6 +3169,10 @@ static void PaintNotchD2D(Notch* n, Canvas* cv)
     } else if (effTab == kTabMedia) {
         if (g_smtcHasTrack && g_smtcArtist[0] != L'\0') wcsncpy_s(subtitle, 128, g_smtcArtist, _TRUNCATE);
         else wcscpy_s(subtitle, 128, L"Media controls");
+    } else if (effTab == kTabClipboard) {
+        swprintf(subtitle, 128, L"%d item%s in history", (int)g_clipItems.size(), g_clipItems.size() == 1 ? L"" : L"s");
+    } else if (effTab == kTabShelf) {
+        swprintf(subtitle, 128, L"%d file%s parked", (int)g_shelfItems.size(), g_shelfItems.size() == 1 ? L"" : L"s");
     }
     int margin = Scale(20, dpi);
     D2DText(cv, kFontSmall, kTabTitles[effTab], (float)margin, (float)Scale(8, dpi), (float)rc.right / 2.0f, (float)Scale(24, dpi), th.primary, false);
@@ -2804,6 +3263,21 @@ static void PaintNotchD2D(Notch* n, Canvas* cv)
                 D2DText(cv, kFontBig, big, (float)c.left, (float)(c.top + Scale(36, dpi)), (float)(c.right - c.left), (float)Scale(48, dpi), th.primary, true);
                 D2DText(cv, kFontTiny, bt, (float)(c.left + 14), (float)(c.top + Scale(92, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.secondary, true);
                 if (known) { RECT bar = { c.left + 14, c.bottom - Scale(18, dpi), c.right - 14, c.bottom - Scale(12, dpi) }; DrawBarD2D(cv, bar, pct); }
+            } else if (id == 6) {
+                // v8 HOME clipboard summary: latest item only.
+                DrawCardD2D(cv, c, L"CLIPBOARD");
+                if (!g_clipItems.empty()) {
+                    ClipItem& it = g_clipItems[0];
+                    wchar_t line[128];
+                    if (it.type == 1) swprintf(line, 128, L"Image %dx%d (thumbnail)", it.origW, it.origH);
+                    else if (it.type == 2) swprintf(line, 128, L"%d file%s", (int)it.files.size(), it.files.size() == 1 ? L"" : L"s");
+                    else wcsncpy_s(line, 128, it.text.c_str(), _TRUNCATE);
+                    D2DTextEllipsis(cv, kFontTiny, line, (float)(c.left + 14), (float)(c.top + Scale(36, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.primary);
+                    if (it.truncated) D2DText(cv, kFontTiny, L"(truncated at 4096 chars)", (float)(c.left + 14), (float)(c.top + Scale(62, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.muted, false);
+                } else {
+                    D2DText(cv, kFontTiny, L"No copied items yet", (float)(c.left + 14), (float)(c.top + Scale(36, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.secondary, false);
+                }
+                D2DText(cv, kFontTiny, L"Click Clipboard tab for history", (float)(c.left + 14), (float)(c.top + Scale(92, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.muted, false);
             } else if (id == 5) {
                 DrawCardD2D(cv, c, L"NETWORK");
                 if (g_netOk) {
@@ -2973,6 +3447,75 @@ static void PaintNotchD2D(Notch* n, Canvas* cv)
             }
             D2DText(cv, kFontTiny, L"No events", (float)(c.left + 14), (float)(y + Scale(4, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.muted, false);
         }
+    } else if (effTab == kTabClipboard) {
+        DrawCardD2D(cv, L.clipCard, L"CLIPBOARD");
+        {
+            RECT c = L.clipCard;
+            static const wchar_t* kChips[5] = { L"All", L"Text", L"Images", L"Links", L"Files" };
+            for (int i = 0; i < 5; i++) {
+                RECT r = L.clipChipRects[i];
+                if (i == n->clipFilter) cv->FillRounded(r, th.accent, (float)(r.bottom - r.top) / 2.0f);
+                else cv->StrokeRounded(r, th.muted, 1.0f, (float)(r.bottom - r.top) / 2.0f);
+                D2DText(cv, kFontTiny, kChips[i], (float)r.left, (float)r.top, (float)(r.right - r.left), (float)(r.bottom - r.top), (i == n->clipFilter) ? th.pillText : th.secondary, true);
+            }
+            std::vector<int> disp; DisplayClipIndices(n->clipFilter, disp);
+            if (disp.empty()) {
+                D2DText(cv, kFontTiny, L"No copied items yet", (float)(c.left + 14), (float)L.clipListY, (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.secondary, false);
+                D2DText(cv, kFontTiny, L"Copy something with Clipboard history on. History is in-memory only and clears on quit.", (float)(c.left + 14), (float)(L.clipListY + Scale(22, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.muted, false);
+            } else {
+                for (int row = 0; row < 8; row++) {
+                    int di = n->clipScroll + row;
+                    if (di < 0 || di >= (int)disp.size()) break;
+                    ClipItem& it = g_clipItems[disp[di]];
+                    int y0 = L.clipListY + row * L.clipRowH;
+                    wchar_t line[160];
+                    if (it.type == 1) swprintf(line, 160, L"Image  %dx%d", it.origW, it.origH);
+                    else if (it.type == 2) {
+                        if (!it.files.empty()) swprintf(line, 160, L"Files  %s%s", FileNameOf(it.files[0]).c_str(), it.files.size() > 1 ? L"  (+" : L"");
+                        else wcscpy_s(line, 160, L"Files");
+                        if (it.files.size() > 1) { wchar_t extra[16]; swprintf(extra, 16, L"%d)", (int)it.files.size() - 1); wcscat_s(line, 160, extra); }
+                    } else wcsncpy_s(line, 160, it.text.c_str(), _TRUNCATE);
+                    if (it.truncated) wcscat_s(line, 160, L"  (truncated)");
+                    D2DTextEllipsis(cv, kFontTiny, line, (float)(c.left + 14), (float)y0, (float)(c.right - c.left - 90), (float)Scale(20, dpi), th.primary);
+                    int pinL = c.right - 14 - 44;
+                    D2DText(cv, kFontTiny, it.pinned ? L"Pinned" : L"Pin", (float)pinL, (float)y0, 44.0f, (float)Scale(20, dpi), it.pinned ? th.accent : th.muted, true);
+                }
+                if (n->clipScroll > 0 || n->clipScroll + 8 < (int)disp.size())
+                    D2DText(cv, kFontTiny, L"Scroll with mouse wheel", (float)(c.left + 14), (float)(L.clipClearRect.top - Scale(20, dpi)), (float)(c.right - c.left - 28), (float)Scale(16, dpi), th.muted, false);
+            }
+            cv->StrokeRounded(L.clipClearRect, th.muted, 1.0f, 4.0f);
+            D2DText(cv, kFontTiny, L"Clear all", (float)L.clipClearRect.left, (float)L.clipClearRect.top, (float)(L.clipClearRect.right - L.clipClearRect.left), (float)(L.clipClearRect.bottom - L.clipClearRect.top), th.secondary, true);
+            D2DText(cv, kFontTiny, L"Click an item to copy it back. Drag text/files out to another app. Images: click to copy only.", (float)(L.clipClearRect.right + Scale(12, dpi)), (float)L.clipClearRect.top, (float)(c.right - L.clipClearRect.right - Scale(26, dpi)), (float)Scale(20, dpi), th.muted, false);
+        }
+    } else if (effTab == kTabShelf) {
+        DrawCardD2D(cv, L.shelfCard, L"FILE SHELF");
+        {
+            RECT c = L.shelfCard;
+            if (g_shelfItems.empty()) {
+                D2DText(cv, kFontTiny, L"No parked files yet", (float)(c.left + 14), (float)L.shelfListY, (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.secondary, false);
+                D2DText(cv, kFontTiny, L"Drag files onto the notch to park them. Files are referenced only, never copied. Paths are saved in shelf.ini.", (float)(c.left + 14), (float)(L.shelfListY + Scale(22, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.muted, false);
+            } else {
+                for (int row = 0; row < 8; row++) {
+                    int di = n->shelfScroll + row;
+                    if (di < 0 || di >= (int)g_shelfItems.size()) break;
+                    ShelfItem& it = g_shelfItems[di];
+                    int y0 = L.shelfListY + row * L.shelfRowH;
+                    wchar_t name[160];
+                    wcsncpy_s(name, 160, FileNameOf(it.path).c_str(), _TRUNCATE);
+                    if (it.missing) wcscat_s(name, 160, L"  (Missing)");
+                    D2DTextEllipsis(cv, kFontTiny, name, (float)(c.left + 14), (float)y0, (float)(c.right - c.left - 150), (float)Scale(20, dpi), it.missing ? th.muted : th.primary);
+                    int remL = c.right - 14 - 24;
+                    int openL = remL - 6 - 48;
+                    D2DText(cv, kFontTiny, L"Open", (float)openL, (float)y0, 48.0f, (float)Scale(20, dpi), it.missing ? th.muted : th.accent, true);
+                    D2DText(cv, kFontTiny, L"X", (float)remL, (float)y0, 24.0f, (float)Scale(20, dpi), th.muted, true);
+                }
+                if ((int)g_shelfItems.size() >= kShelfCap)
+                    D2DText(cv, kFontTiny, L"Shelf full — remove a file to park another", (float)(c.left + 14), (float)(L.shelfClearRect.top - Scale(20, dpi)), (float)(c.right - c.left - 28), (float)Scale(16, dpi), th.muted, false);
+            }
+            cv->StrokeRounded(L.shelfClearRect, th.muted, 1.0f, 4.0f);
+            D2DText(cv, kFontTiny, L"Clear all", (float)L.shelfClearRect.left, (float)L.shelfClearRect.top, (float)(L.shelfClearRect.right - L.shelfClearRect.left), (float)(L.shelfClearRect.bottom - L.shelfClearRect.top), th.secondary, true);
+            D2DText(cv, kFontTiny, L"Click a row to select. Open opens the file. Drag a row out to another app.", (float)(L.shelfClearRect.right + Scale(12, dpi)), (float)L.shelfClearRect.top, (float)(c.right - L.shelfClearRect.right - Scale(26, dpi)), (float)Scale(20, dpi), th.muted, false);
+        }
     } else if (effTab == kTabMedia) {
         DrawCardD2D(cv, L.mediaCard, L"MEDIA");
         if (g_smtcHasTrack) {
@@ -3138,6 +3681,8 @@ static LRESULT CALLBACK NotchWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             // per-frame); apply the saved blur setting to the
             // new window so its first frame matches the others.
             ApplyBlur(created);
+            // v8 shelf: accept file drops on every notch window.
+            DragAcceptFiles(hwnd, TRUE);
             bool already = false;
             for (size_t i = 0; i < g_notches.size(); i++) if (g_notches[i] == created) already = true;
             if (!already) g_notches.push_back(created);
@@ -3158,6 +3703,29 @@ static LRESULT CALLBACK NotchWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         if (g_managerHwnd) PostMessage(g_managerHwnd, WM_APP_REBUILD, 0, 0);
         return 0;
     case WM_MOUSEMOVE: {
+        if (n && n->dragKind != 0 && !n->dragStarted && (wParam & MK_LBUTTON)) {
+            POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+            int dx = pt.x - n->dragStartX, dy = pt.y - n->dragStartY;
+            if (dx * dx + dy * dy > 25) {
+                // v8 drag-out: snapshot the item BEFORE
+                // DoDragDrop (the target may change our state
+                // while dragging), then drag text/files only.
+                // Images have no drag-out in v8: a drag attempt
+                // on an image row simply ends the candidate.
+                int kind = n->dragKind, idx = n->dragIndex;
+                n->dragKind = 0; n->dragIndex = -1; n->dragStarted = true;
+                if (kind == 1 && idx >= 0 && idx < (int)g_clipItems.size()) {
+                    ClipItem& it = g_clipItems[idx];
+                    if (it.type == 0 || it.type == 3) DoDragTextOrFiles(it.text, std::vector<std::wstring>());
+                    else if (it.type == 2) DoDragTextOrFiles(std::wstring(), it.files);
+                } else if (kind == 2 && idx >= 0 && idx < (int)g_shelfItems.size()) {
+                    ShelfItem& it = g_shelfItems[idx];
+                    if (!it.missing) DoDragTextOrFiles(std::wstring(), std::vector<std::wstring>(1, it.path));
+                }
+                n->dragStarted = false;
+                return 0;
+            }
+        }
         if (n) {
             n->hoverNotch = true;
             POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
@@ -3218,6 +3786,7 @@ static LRESULT CALLBACK NotchWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             n->hoverDock = -1;
             n->hoverClose = false;
             n->hoverCalArrow = 0; n->hoverCalToday = false; n->hoverCalCell = -1;
+            n->dragKind = 0; n->dragIndex = -1;
             if (n->expanded && !n->pinned) SetNotchExpanded(n, false);
         }
         return 0;
@@ -3267,6 +3836,55 @@ static LRESULT CALLBACK NotchWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             }
             return 0;
         }
+        // v8 tab content: clipboard chips/pins/rows and shelf
+        // open/remove/rows. Hit order stays gear > X > dock >
+        // tab content > pin: this block is after dock and
+        // before the pin fallback at the end.
+        if (EffectiveTab(n) == kTabClipboard) {
+            int chip = -1;
+            if (ClipChipHitAt(n, pt.x, pt.y, false, chip)) {
+                n->clipFilter = chip; n->clipScroll = 0;
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 0;
+            }
+            int item = -1, part = -1;
+            if (ClipHitAt(n, pt.x, pt.y, false, item, part)) {
+                if (part == 3) {
+                    for (size_t i = 0; i < g_clipItems.size(); i++) if (g_clipItems[i].thumb) DeleteObject(g_clipItems[i].thumb);
+                    g_clipItems.clear();
+                    n->clipScroll = 0;
+                } else if (part == 1 && item >= 0 && item < (int)g_clipItems.size()) {
+                    g_clipItems[item].pinned = !g_clipItems[item].pinned;
+                } else if (part == 0 && item >= 0) {
+                    // Row press: start a drag candidate. A plain
+                    // click (no move past the threshold) copies
+                    // back on button-up; a drag starts OLE
+                    // drag-out on mouse-move instead.
+                    n->dragKind = 1; n->dragIndex = item;
+                    n->dragStartX = pt.x; n->dragStartY = pt.y;
+                }
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 0;
+            }
+        }
+        if (EffectiveTab(n) == kTabShelf) {
+            int item = -1, part = -1;
+            if (ShelfHitAt(n, pt.x, pt.y, false, item, part)) {
+                if (part == 3) {
+                    g_shelfItems.clear(); n->shelfScroll = 0; SaveShelf();
+                } else if (part == 1 && item >= 0 && item < (int)g_shelfItems.size()) {
+                    if (!g_shelfItems[item].missing)
+                        ShellExecuteW(NULL, L"open", g_shelfItems[item].path.c_str(), NULL, NULL, SW_SHOWNORMAL);
+                } else if (part == 2 && item >= 0 && item < (int)g_shelfItems.size()) {
+                    g_shelfItems.erase(g_shelfItems.begin() + item); SaveShelf();
+                } else if (part == 0 && item >= 0) {
+                    n->dragKind = 2; n->dragIndex = item;
+                    n->dragStartX = pt.x; n->dragStartY = pt.y;
+                }
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 0;
+            }
+        }
         // v6-fix calendar: prev/next month, Today, and day
         // selection. Inserted after dock and before media/pin, so
         // the documented order (gear, X, dock, media, pin) is
@@ -3315,12 +3933,67 @@ static LRESULT CALLBACK NotchWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         return 0;
     }
     case WM_LBUTTONUP:
+        if (n && n->dragKind != 0 && !n->dragStarted) {
+            // v8 plain click: clipboard row copies back;
+            // a shelf row click only selects (Open is explicit).
+            int kind = n->dragKind, idx = n->dragIndex;
+            n->dragKind = 0; n->dragIndex = -1;
+            if (kind == 1) CopyClipItemBack(idx);
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
         if (n && (n->pressedBtn >= 0 || n->pressedGear)) {
             n->pressedBtn = -1;
             n->pressedGear = false;
             InvalidateRect(hwnd, NULL, FALSE);
         }
         return 0;
+    case WM_MOUSEWHEEL: {
+        if (n && n->paintExpanded) {
+            int delta = GET_WHEEL_DELTA_WPARAM(wParam);
+            int step = delta / 120 * 3;
+            if (EffectiveTab(n) == kTabClipboard) {
+                std::vector<int> disp; DisplayClipIndices(n->clipFilter, disp);
+                int maxOff = (int)disp.size() - 8; if (maxOff < 0) maxOff = 0;
+                n->clipScroll -= step;
+                if (n->clipScroll < 0) n->clipScroll = 0;
+                if (n->clipScroll > maxOff) n->clipScroll = maxOff;
+                InvalidateRect(hwnd, NULL, FALSE);
+            } else if (EffectiveTab(n) == kTabShelf) {
+                int maxOff = (int)g_shelfItems.size() - 8; if (maxOff < 0) maxOff = 0;
+                n->shelfScroll -= step;
+                if (n->shelfScroll < 0) n->shelfScroll = 0;
+                if (n->shelfScroll > maxOff) n->shelfScroll = maxOff;
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
+        }
+        return 0;
+    }
+    case WM_DROPFILES: {
+        // v8 shelf drop: park referenced paths only. Dropping
+        // on a collapsed notch expands straight to the shelf
+        // tab; dropping on any expanded tab switches to it.
+        // A full shelf (50) parks nothing and shows Shelf full
+        // in the tab — it never silently evicts a parked file.
+        HDROP hd = (HDROP)wParam;
+        UINT count = DragQueryFileW(hd, 0xFFFFFFFF, NULL, 0);
+        bool added = false;
+        if (g_shelfEnabled) {
+            for (UINT i = 0; i < count; i++) {
+                wchar_t path[MAX_PATH] = { 0 };
+                if (DragQueryFileW(hd, i, path, MAX_PATH) > 0) {
+                    if (ShelfAddPath(path)) added = true;
+                }
+            }
+            if (added) SaveShelf();
+        }
+        DragFinish(hd);
+        if (n && g_shelfEnabled) {
+            if (!n->expanded) SetNotchExpanded(n, true);
+            n->activeTab = kTabShelf;
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        return 0;
+    }
     case WM_PAINT: {
         // v7: a layered window is presented with
         // UpdateLayeredWindow, not by painting into the screen
@@ -3349,6 +4022,199 @@ static LRESULT CALLBACK NotchWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
+// ---------- v8 clipboard capture (manager window owns the listener) ----------
+// Password-manager heuristic: skip an item entirely when the
+// clipboard owner's process image name matches this list. It is
+// a HEURISTIC, not a guarantee: a password manager with an
+// unknown exe name, a browser password fill, or a clipboard
+// manager that re-posts the item will not be skipped. The list
+// is matched on the lowercased exe filename only.
+static bool IsPasswordManagerExe(const std::wstring& exeLower)
+{
+    static const wchar_t* kList[] = { L"1password.exe", L"bitwarden.exe", L"keepass.exe", L"keepassxc.exe",
+        L"dashlane.exe", L"lastpass.exe", L"roboform.exe", L"enpass.exe", L"bitwarden-desktop.exe" };
+    for (size_t i = 0; i < 9; i++) if (exeLower == kList[i]) return true;
+    return false;
+}
+static bool ClipboardOwnerIsPasswordManager()
+{
+    HWND owner = GetClipboardOwner();
+    if (!owner) return false;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(owner, &pid);
+    if (!pid) return false;
+    HANDLE hp = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!hp) return false;
+    wchar_t path[MAX_PATH] = { 0 };
+    DWORD len = MAX_PATH;
+    BOOL ok = QueryFullProcessImageNameW(hp, 0, path, &len);
+    CloseHandle(hp);
+    if (!ok) return false;
+    std::wstring fn = FileNameOf(path);
+    for (size_t i = 0; i < fn.size(); i++) if (fn[i] >= L'A' && fn[i] <= L'Z') fn[i] = (wchar_t)(fn[i] + 32);
+    return IsPasswordManagerExe(fn);
+}
+static HBITMAP MakeThumbnailFromDib(BITMAPINFOHEADER* hdr, const BYTE* bits, int& outW, int& outH, int& origW, int& origH)
+{
+    if (!hdr || hdr->biWidth <= 0 || hdr->biHeight == 0) return NULL;
+    int w = hdr->biWidth;
+    int h = hdr->biHeight < 0 ? -hdr->biHeight : hdr->biHeight;
+    origW = w; origH = h;
+    int maxSide = (w > h) ? w : h;
+    double sc = (maxSide > 256) ? 256.0 / (double)maxSide : 1.0;
+    outW = (int)(w * sc + 0.5); outH = (int)(h * sc + 0.5);
+    if (outW < 1) outW = 1; if (outH < 1) outH = 1;
+    BITMAPINFO bi = { 0 };
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = outW;
+    bi.bmiHeader.biHeight = -outH;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    void* dstBits = NULL;
+    HBITMAP bmp = CreateDIBSection(NULL, &bi, DIB_RGB_COLORS, &dstBits, NULL, 0);
+    if (!bmp) return NULL;
+    HDC dc = CreateCompatibleDC(NULL);
+    if (!dc) { DeleteObject(bmp); return NULL; }
+    HBITMAP old = (HBITMAP)SelectObject(dc, bmp);
+    // Source DIB may be bottom-up; StretchDIBits handles the
+    // header height sign, so pass the original header as-is.
+    StretchDIBits(dc, 0, 0, outW, outH, 0, 0, w, h, bits, (BITMAPINFO*)hdr, DIB_RGB_COLORS, SRCCOPY);
+    SelectObject(dc, old);
+    DeleteDC(dc);
+    return bmp;
+}
+static void ClipPush(ClipItem&& item)
+{
+    // Deduplicate consecutive identical items (newest only).
+    if (!g_clipItems.empty()) {
+        ClipItem& prev = g_clipItems[0];
+        if (prev.type == item.type && prev.text == item.text && prev.files == item.files) {
+            if (item.thumb) DeleteObject(item.thumb);
+            return;
+        }
+    }
+    if ((int)g_clipItems.size() >= kClipCap) {
+        // Evict the oldest UNPINNED item; pinned items are never
+        // evicted. If every item is pinned, the new item is
+        // dropped rather than evicting a pinned one.
+        for (int i = (int)g_clipItems.size() - 1; i >= 0; i--) {
+            if (!g_clipItems[i].pinned) {
+                if (g_clipItems[i].thumb) DeleteObject(g_clipItems[i].thumb);
+                g_clipItems.erase(g_clipItems.begin() + i);
+                break;
+            }
+        }
+        if ((int)g_clipItems.size() >= kClipCap) {
+            if (item.thumb) DeleteObject(item.thumb);
+            return;
+        }
+    }
+    g_clipItems.insert(g_clipItems.begin(), std::move(item));
+}
+static void CaptureClipboard()
+{
+    if (!g_clipEnabled) return;
+    if (!OpenClipboard(g_managerHwnd)) return;
+    if (ClipboardOwnerIsPasswordManager()) { CloseClipboard(); return; }
+    // Files first: a file copy also carries text in some apps,
+    // and the file list is the useful capture, not the text.
+    HANDLE hDrop = GetClipboardData(CF_HDROP);
+    if (hDrop) {
+        HDROP hd = (HDROP)hDrop;
+        UINT count = DragQueryFileW(hd, 0xFFFFFFFF, NULL, 0);
+        if (count > 0 && count <= 64) {
+            ClipItem item; item.type = 2;
+            for (UINT i = 0; i < count; i++) {
+                wchar_t path[MAX_PATH] = { 0 };
+                if (DragQueryFileW(hd, i, path, MAX_PATH) > 0) item.files.push_back(path);
+            }
+            if (!item.files.empty()) { CloseClipboard(); ClipPush(std::move(item)); return; }
+        }
+    }
+    HANDLE hDib = GetClipboardData(CF_DIB);
+    if (hDib) {
+        BITMAPINFOHEADER* hdr = (BITMAPINFOHEADER*)GlobalLock(hDib);
+        if (hdr) {
+            int bpp = hdr->biBitCount;
+            const BYTE* bits = (const BYTE*)hdr + sizeof(BITMAPINFOHEADER);
+            if (bpp <= 8) {
+                int colors = hdr->biClrUsed ? (int)hdr->biClrUsed : (1 << bpp);
+                bits += colors * sizeof(RGBQUAD);
+            }
+            int tw = 0, th = 0, ow = 0, oh = 0;
+            HBITMAP thumb = MakeThumbnailFromDib(hdr, bits, tw, th, ow, oh);
+            GlobalUnlock(hDib);
+            if (thumb) {
+                ClipItem item; item.type = 1; item.thumb = thumb;
+                item.thumbW = tw; item.thumbH = th; item.origW = ow; item.origH = oh;
+                CloseClipboard(); ClipPush(std::move(item)); return;
+            }
+        } else {
+            GlobalUnlock(hDib);
+        }
+    }
+    HANDLE hText = GetClipboardData(CF_UNICODETEXT);
+    if (hText) {
+        const wchar_t* txt = (const wchar_t*)GlobalLock(hText);
+        if (txt) {
+            std::wstring t = txt;
+            GlobalUnlock(hText);
+            if (!t.empty()) {
+                ClipItem item;
+                if (t.size() > (size_t)kClipTextCap) { t.resize(kClipTextCap); item.truncated = true; }
+                item.text = t;
+                item.type = IsLinkText(t) ? 3 : 0;
+                CloseClipboard(); ClipPush(std::move(item)); return;
+            }
+        } else {
+            GlobalUnlock(hText);
+        }
+    }
+    CloseClipboard();
+}
+static void CopyClipItemBack(int storageIdx)
+{
+    if (storageIdx < 0 || storageIdx >= (int)g_clipItems.size()) return;
+    ClipItem& item = g_clipItems[storageIdx];
+    if (!OpenClipboard(g_managerHwnd)) return;
+    g_clipIgnoreNext = true;
+    EmptyClipboard();
+    if (item.type == 2 && !item.files.empty()) {
+        size_t total = 0;
+        for (size_t i = 0; i < item.files.size(); i++) total += item.files[i].size() + 1;
+        total += 1;
+        size_t bytes = sizeof(DROPFILES) + total * sizeof(wchar_t);
+        HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, bytes);
+        if (h) {
+            BYTE* base = (BYTE*)GlobalLock(h);
+            if (base) {
+                DROPFILES* df = (DROPFILES*)base;
+                df->pFiles = sizeof(DROPFILES); df->pt.x = 0; df->pt.y = 0; df->fNC = FALSE; df->fWide = TRUE;
+                wchar_t* dst = (wchar_t*)(base + sizeof(DROPFILES));
+                for (size_t i = 0; i < item.files.size(); i++) { wcscpy_s(dst, total, item.files[i].c_str()); dst += item.files[i].size() + 1; }
+                *dst = L'\0';
+                GlobalUnlock(h);
+                SetClipboardData(CF_HDROP, h);
+            } else {
+                GlobalFree(h);
+            }
+        }
+    } else if (item.type == 1 && item.thumb) {
+        HBITMAP copy = (HBITMAP)CopyImage(item.thumb, IMAGE_BITMAP, 0, 0, LR_CREATEDIBSECTION);
+        if (copy) SetClipboardData(CF_BITMAP, copy);
+    } else if (!item.text.empty()) {
+        size_t bytes = (item.text.size() + 1) * sizeof(wchar_t);
+        HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, bytes);
+        if (h) {
+            wchar_t* p = (wchar_t*)GlobalLock(h);
+            if (p) { memcpy(p, item.text.c_str(), bytes); GlobalUnlock(h); SetClipboardData(CF_UNICODETEXT, h); }
+            else GlobalFree(h);
+        }
+    }
+    CloseClipboard();
+}
+
 // ---------------------------------------------------------------------------
 // Manager window procedure: tray, timer, toggles, rebuilds.
 // ---------------------------------------------------------------------------
@@ -3359,6 +4225,11 @@ static LRESULT CALLBACK ManagerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
         g_managerHwnd = hwnd;
         AddTrayIcon(hwnd, ((LPCREATESTRUCT)lParam)->hInstance);
         SetTimer(hwnd, ID_TIMER_CLOCK, 1000, NULL);
+        // v8: listen on the hidden manager window, NOT on the
+        // notch windows, so listening survives notch rebuilds
+        // (multi-monitor changes, strip transitions). Failure
+        // is silent: clipboard history simply records nothing.
+        AddClipboardFormatListener(hwnd);
         RebuildNotches(((LPCREATESTRUCT)lParam)->hInstance);
         return 0;
     }
@@ -3391,6 +4262,13 @@ static LRESULT CALLBACK ManagerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
     case WM_DISPLAYCHANGE:
         RequestRebuild((HINSTANCE)GetModuleHandle(NULL));
         return 0;
+    case WM_CLIPBOARDUPDATE:
+        // v8: our own copy-back sets g_clipIgnoreNext so it
+        // does not re-enter history as a new item.
+        if (g_clipIgnoreNext) g_clipIgnoreNext = false;
+        else CaptureClipboard();
+        InvalidateAllNotches();
+        return 0;
     case WM_TRAY:
         if (lParam == WM_RBUTTONUP) ShowTrayMenu(hwnd);
         return 0;
@@ -3401,6 +4279,7 @@ static LRESULT CALLBACK ManagerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             // is destroyed (WM_DESTROY below saves again as a
             // belt-and-braces step, so a quit via any path saves).
             SaveSettings();
+            SaveShelf();
             // Destroy notch windows first, then the manager (which quits).
             std::vector<HWND> hwnds;
             for (size_t i = 0; i < g_notches.size(); i++) hwnds.push_back(g_notches[i]->hwnd);
@@ -3429,6 +4308,20 @@ static LRESULT CALLBACK ManagerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             break;
         case ID_TRAY_WIDGET_CALENDAR:
             g_widgetCalendar = !g_widgetCalendar;
+            SaveSettings();
+            ApplySizeToAll();
+            break;
+        case ID_TRAY_CLIPBOARD:
+            // v8: turning this on starts recording from now;
+            // nothing already on the clipboard is captured
+            // retroactively, and turning it off stops capture
+            // (history stays in memory until quit or Clear).
+            g_clipEnabled = !g_clipEnabled;
+            SaveSettings();
+            ApplySizeToAll();
+            break;
+        case ID_TRAY_SHELF:
+            g_shelfEnabled = !g_shelfEnabled;
             SaveSettings();
             ApplySizeToAll();
             break;
@@ -3483,7 +4376,7 @@ static LRESULT CALLBACK ManagerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
         case ID_TRAY_MEDIA_NEXT: SendMediaKey(VK_MEDIA_NEXT_TRACK); break;
         case ID_TRAY_ABOUT:
             MessageBoxW(hwnd,
-                L"OnyxNotch v7 (Direct2D rewrite of v6)\nMac-style notch for Windows.\nNative Win32 C++, no runtime, low memory.\nDirect2D/DirectWrite rendering on a layered\nwindow with per-pixel alpha; spring animation;\nblur is an OFF-by-default experimental tray\ntoggle with an opaque fallback.\n\nv4: premium UI — gradient surface, lighter\ntypography, circular media buttons, battery glyph,\ncalendar pill — reorganized in place: compact\ntwo-column body (media beside system stats),\nsection headers, stats rows with bars.\n\nv5-SMTC: with Media controls on, the Media tab\nshows the current track title and artist from\nWindows SMTC (read-only), and Home shows a\ncompact title line. No track, no title — the\nmedia buttons still work via media keys.\n\nv5-settings: size and toggles are saved to\n%APPDATA%\\OnyxNotch\\settings.ini and restored\nat startup. Start with Windows (tray menu) writes\nthe Run registry value for this .exe.\n\nThemes: tray menu Themes submenu — Onyx, Midnight,\nGraphite — applies instantly to all notches and is\nsaved to settings.ini as theme=onyx|midnight|graphite.\n\nClick the notch header to pin it open;\nclick again to unpin. The gear button in the\nexpanded header opens this menu from the notch.\n\nv6: wide card dashboard with a header bar,\ncard grid and a bottom icon dock. Home is a\ncompact summary; System, Clock, Calendar\nand Media show full card versions. Click a\ndock icon to switch. Close X collapses only.",
+                L"OnyxNotch v8 (clipboard history + file shelf)\nMac-style notch for Windows.\nNative Win32 C++, no runtime, low memory.\nDirect2D/DirectWrite rendering on a layered\nwindow with per-pixel alpha; spring animation;\nblur is an OFF-by-default experimental tray\ntoggle with an opaque fallback.\n\nv4: premium UI — gradient surface, lighter\ntypography, circular media buttons, battery glyph,\ncalendar pill — reorganized in place: compact\ntwo-column body (media beside system stats),\nsection headers, stats rows with bars.\n\nv5-SMTC: with Media controls on, the Media tab\nshows the current track title and artist from\nWindows SMTC (read-only), and Home shows a\ncompact title line. No track, no title — the\nmedia buttons still work via media keys.\n\nv5-settings: size and toggles are saved to\n%APPDATA%\\OnyxNotch\\settings.ini and restored\nat startup. Start with Windows (tray menu) writes\nthe Run registry value for this .exe.\n\nThemes: tray menu Themes submenu — Onyx, Midnight,\nGraphite — applies instantly to all notches and is\nsaved to settings.ini as theme=onyx|midnight|graphite.\n\nClick the notch header to pin it open;\nclick again to unpin. The gear button in the\nexpanded header opens this menu from the notch.\n\nv6: wide card dashboard with a header bar,\ncard grid and a bottom icon dock. Home is a\ncompact summary; System, Clock, Calendar\nand Media show full card versions. Click a\ndock icon to switch. Close X collapses only.\n\nv8: clipboard history + file shelf, both OFF by\ndefault in the tray menu. Clipboard history is\nin-memory only (clears on quit, never written to\ndisk), capped at 50, with a password-manager\nheuristic skip that is NOT a guarantee. Click an\nitem to copy it back; drag text/files out to\nanother app (images: copy only). File shelf parks\nreferenced paths only; paths are saved in\n%APPDATA%\\OnyxNotch\\shelf.ini. No search box:\nthe notch must not steal keyboard focus, so\nfilters are mouse-click chips only.",
                 L"OnyxNotch", MB_OK | MB_ICONINFORMATION);
             break;
         }
@@ -3493,6 +4386,7 @@ static LRESULT CALLBACK ManagerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
         // come through the tray Quit command. SaveSettings never
         // blocks or shows UI, so this cannot delay shutdown.
         SaveSettings();
+        SaveShelf();
         KillTimer(hwnd, ID_TIMER_CLOCK);
         Shell_NotifyIconW(NIM_DELETE, &g_nid);
         PostQuitMessage(0);
@@ -3539,8 +4433,13 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/,
     // first notch already uses the saved size/toggles. Load
     // failures fall back to the defaults silently (see LoadSettings
     // / LoadAutoStart); startup never depends on them.
+    // v8: COM in MTA so OLE drag-out and the SMTC session
+    // share one apartment. If this fails, drag-out fails but
+    // the app still runs (click-to-copy still works).
+    bool comOk = SUCCEEDED(CoInitializeEx(NULL, COINIT_MULTITHREADED));
     LoadSettings();
     LoadAutoStart();
+    LoadShelf();
 
     // Hidden manager window: owns the tray icon and the 1-second timer,
     // and creates one notch window per monitor in WM_CREATE.
@@ -3553,5 +4452,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/,
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
+    if (comOk) CoUninitialize();
     return (int)msg.wParam;
 }

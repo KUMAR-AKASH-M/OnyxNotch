@@ -1,16 +1,17 @@
-# OnyxNotch v7 — Direct2D rewrite of v6
+# OnyxNotch v8 — clipboard history + file shelf, Vayli-style
 
 Mac-style notch for Windows, in native C++ Win32. One source file, one
 `.exe`, no Electron, no Python, no .NET runtime.
 
-**Scope of this folder:** v7 keeps every v6 feature and behaviour
-and replaces ONLY the rendering layer: GDI painting is replaced by
-Direct2D/DirectWrite rendering on a layered window with per-pixel
-alpha, and expand/collapse animation uses a damped spring instead
-of ease-out cubic. Nothing else was added: no weather, no notes, no
-clipboard history, no screen-time tracking, no new data sources.
-Album-art accent tinting is deliberately OUT of scope (SMTC gives
-title/artist, not album art, in our path) and is not faked.
+**Scope of this folder:** v8 keeps every v7 feature and behaviour
+(Direct2D/DirectWrite layered window, spring animation, thin-strip
+fullscreen, unified tab size, SMTC, settings, auto-start, themes)
+and adds ONLY the two most Vayli-like features, both OFF by default:
+clipboard history and a file shelf. Nothing else was added: no
+weather, no notes, no timers, no screen-time tracking, no network,
+no accounts, no telemetry. Album-art accent tinting is still
+deliberately OUT of scope (SMTC gives title/artist, not album art,
+in our path) and is not faked.
 
 ## What's new in v7
 
@@ -323,6 +324,191 @@ LNK1104 because it cannot overwrite the running .exe.
 - If v7 does not run at all, v6 (commit ce42cbf, unified tab
   size, GDI painting) remains the known-good fallback: it is
   untouched in `~/workspace/onyxnotch-v6/`.
+
+## What's new in v8
+
+### 1. Clipboard history (OFF by default)
+
+Turn it on from the tray menu ("Clipboard history") or the gear
+menu. It is saved in `settings.ini` as `clipboard=1`, but it does
+NOT start recording until you turn it on: nothing already on the
+clipboard is captured retroactively, and turning it off stops
+capture immediately.
+
+- **How it listens.** The hidden manager window (not the notch
+  windows) registers with `AddClipboardFormatListener`, so
+  listening survives notch rebuilds (multi-monitor changes,
+  thin-strip transitions). Each `WM_CLIPBOARDUPDATE` captures one
+  new item, newest first, capped at 50.
+- **What is captured.** Text (`CF_UNICODETEXT`), images
+  (`CF_DIB`/`CF_BITMAP`), file lists (`CF_HDROP`), or links.
+  A link is text that parses as a bare `http://` or `https://`
+  URL with no spaces — it is shown as a link type, never fetched
+  and never opened automatically. A file copy is captured as its
+  file list (paths only), not as text, even if the clipboard also
+  carries text for it.
+- **Text cap.** Stored text is truncated at 4096 characters, and
+  truncated items say so in the tab and on the Home card. The cap
+  exists so one giant copy cannot bloat the list.
+- **Images are thumbnails.** An image copy is stored as a bitmap
+  thumbnail at most 256 px on its long side, never the full
+  clipboard bitmap, to bound memory. Consequence, stated plainly:
+  copying an image back pastes the thumbnail, not the original
+  full-resolution image. That is a v8 cut, not a bug to hide.
+- **Deduplication.** Copying the same thing twice in a row does
+  not fill the list: a new item identical to the newest item
+  (same text, same file set, same image) is skipped.
+- **In-memory only — a privacy choice, not a bug.** Clipboard
+  contents are NEVER written to disk in v8. History is cleared
+  on quit. If you want history across restarts, that is future
+  work with an explicit opt-in, not something v8 does silently.
+- **Password-manager skipping is a heuristic, NOT a guarantee.**
+  If the clipboard owner's process image name (lowercased exe
+  name) matches this list, the item is skipped entirely:
+  `1password.exe`, `bitwarden.exe`, `bitwarden-desktop.exe`,
+  `keepass.exe`, `keepassxc.exe`, `dashlane.exe`,
+  `lastpass.exe`, `roboform.exe`, `enpass.exe`.
+  Anything not on that list is NOT skipped: an unknown password
+  manager, a browser password fill, or another clipboard manager
+  re-posting the item will still be captured. Do not treat this
+  as perfect password protection. If you copy a password and are
+  unsure, turn clipboard history off and use Clear all.
+- **The CLIPBOARD tab.** Visible only while clipboard history is
+  on. Dock order is Home, System, Media, Clock, Calendar,
+  Clipboard, Shelf (feature tabs only if enabled). The tab shows
+  a scrollable list (mouse wheel, 8 rows at a time), type chips
+  (All / Text / Images / Links / Files — mouse clicks only),
+  a Pin button per item, and a Clear all button. Pinned items
+  stay at the top of the list and are NEVER evicted by the
+  50-item cap; if every item is pinned, new items are dropped
+  rather than evicting a pinned one. Clear all clears everything,
+  pinned items included.
+- **Click to copy back.** Clicking an item copies it back to the
+  clipboard (`SetClipboardData` for its type: text, file list, or
+  bitmap thumbnail). The copy-back is ignored by the listener, so
+  it does not re-enter history as a new item.
+- **Drag-out.** Dragging a text, link, or file item out of the
+  tab into another app works via OLE drag-and-drop
+  (`IDropSource`/`IDataObject`, `CF_UNICODETEXT` / `CF_HDROP`,
+  copy effect only — the source is never moved or deleted).
+  Images do NOT support drag-out in v8: dragging an image row
+  does nothing, and click-to-copy is the only path for images.
+  If drag-out fails on a particular target app, click-to-copy
+  remains the fallback; a failed drag never deletes anything.
+- **Home card.** While clipboard history is on, Home shows a
+  small clipboard summary card: the latest item, truncated
+  (text, "N files", or "Image WxH (thumbnail)").
+
+### 2. File shelf (OFF by default)
+
+Turn it on from the tray menu ("File shelf") or the gear menu.
+Saved in `settings.ini` as `shelf=1`.
+
+- **Referenced only, never copied or moved.** Drag files onto
+  the notch — any expanded tab, or the collapsed notch, which
+  expands straight to the shelf tab — to park them. Only the
+  full path is stored. This is the Windhawk file-tray model:
+  parking a file does not copy it, move it, or upload it.
+- **The SHELF tab.** Visible only while the shelf is on. Each
+  row shows the file name plus its parent folder (truncated),
+  with an Open button and a Remove (X) button, plus Clear all.
+  Clicking a row only selects it; Open uses `ShellExecute` and
+  is the only way a file opens — selection never auto-opens.
+  Dragging a row out of the tab into another app works via
+  `CF_HDROP` OLE drag, same as clipboard files.
+- **Missing files stay visible.** If a parked file is moved or
+  deleted afterwards, its row stays in the list, greyed, marked
+  "Missing". It is never silently deleted, and no path is ever
+  invented. Remove it with its X button, or Clear all.
+- **Persistence — paths only.** Shelf paths ARE persisted
+  (unlike clipboard contents) in a separate plain file,
+  `%APPDATA%\OnyxNotch\shelf.ini`: one UTF-8 path per line,
+  loaded at startup, saved on every change and on clean quit.
+  Corrupt or empty lines are ignored on load; paths that no
+  longer exist load as Missing. The shelf tab's empty state
+  names this file, so the saved-paths behaviour is visible in
+  the app, not just here. Only paths are saved, never file
+  contents.
+- **Cap: 50 parked files.** Dropping a 51st file parks nothing
+  and the tab shows "Shelf full — remove a file to park
+  another". It never silently evicts a parked file.
+
+### 3. Why there is no search box (deliberate)
+
+A search box needs keyboard focus. The notch is
+`WS_EX_NOACTIVATE` and must never steal focus from the app you
+are working in — that rule is what makes a notch usable at all.
+So v8 has no typing anywhere in the notch: clipboard filtering
+is mouse-click chips, scrolling is the mouse wheel, and
+everything else is clicks and drags. Adding a broken search box
+that cannot receive keystrokes would be worse than no search
+box, so it is explained here instead of faked.
+
+### 4. Integration rules (unchanged from v6/v7, extended)
+
+- Both new tabs participate in unified tab size: their natural
+  heights count toward the maximum over all visible tabs, the
+  header and dock stay at the same Y on every tab, shorter tabs
+  are vertically centred, and tab switching only repaints.
+- Hit order is gear > close X > dock > tab content > pin, and
+  clipboard/shelf hit areas are computed from the same
+  `ComputeLayout` as painting, so a click lands where the
+  content is drawn.
+- Both toggles appear in the tray menu and therefore in the
+  gear menu, are saved in `settings.ini`, and default OFF.
+- No new network, no accounts, no telemetry, no cloud, no new
+  runtime. MSVC only; MinGW cannot build v8 (C++/WinRT SMTC).
+- `build.bat` gains one library only: `ole32.lib` for
+  `DoDragDrop`. It keeps goto error labels and ZERO parenthesis
+  characters anywhere (the cmd-parsing trap from v2/v5).
+  The `ole32.lib` pragma is also in `main.cpp`.
+
+### 5. Build (Windows) — v8
+
+From a Visual Studio Developer Command Prompt, in the folder
+containing `main.cpp`:
+
+```
+build.bat
+```
+
+That runs `rc` on `onyxnotch.rc` (custom icon into
+`onyxnotch.res`), then `cl /std:c++17 /EHsc` with
+`windowsapp.lib advapi32.lib iphlpapi.lib winmm.lib d2d1.lib
+dwrite.lib ole32.lib`. Output is `OnyxNotch.exe` in the same
+folder. Quit any running OnyxNotch first, or the link fails
+with LNK1104 (the running exe cannot be overwritten).
+
+### 6. Honest limits — v8 (not verified on Windows)
+
+v8 was written and reviewed in the Linux VM, which has no
+Windows toolchain. Nothing in this section was compiled or
+tested on Windows by the assistant, and none of it should be
+claimed as verified until Kumar builds and runs it:
+
+- The code does not compile yet on a real Windows machine —
+  the COM drag classes, the `CF_DIB` thumbnail path, and the
+  clipboard listener are all uncompiled.
+- Clipboard listener reliability on real apps (Explorer,
+  browsers, Office) is unverified, including whether
+  `WM_CLIPBOARDUPDATE` fires for every copy and whether the
+  owner heuristic matches real password-manager processes.
+- OLE drag-out on real target apps is unverified for text and
+  for files, and is known-cut for images (copy only).
+- Image thumbnails (scaling, bottom-up DIBs, 8-bit palettes)
+  are unverified and may render wrong on some sources.
+- Password skipping on real password managers is unverified
+  and, by design, heuristic only — see the list and its limits
+  above.
+- Shelf drops onto the collapsed notch, drops from Explorer
+  and browsers, and the Missing-file path are unverified.
+- Per-monitor DPI, spring-animation interplay with the new
+  taller tabs, and idle memory (the under-10 MB target is a
+  target, not a measurement) are unverified for v8.
+- The unified tab size now includes the clipboard and shelf
+  tabs when they are on, so the expanded panel is taller with
+  either feature enabled — that height change itself is
+  unverified on a real display.
 
 # OnyxNotch v6 — Card + dock dashboard look, existing data only
 

@@ -6,6 +6,7 @@ REM The SMTC code needs C++17 and windowsapp.lib. Those are the only new build r
 REM v5-settings adds advapi32.lib only, for the Reg auto-start calls.
 REM v6 adds iphlpapi.lib for GetIfTable network counters and winmm.lib for waveOutGetVolume.
 REM v7 adds d2d1.lib for Direct2D rendering and dwrite.lib for DirectWrite text.
+REM v8 adds ole32.lib for DoDragDrop drag-out from the clipboard and shelf tabs.
 REM v7 links are also in main.cpp as pragma comment lib lines, so the cl line below lists them for clarity.
 REM File I/O uses the already-linked Win32 APIs, so no other library is new.
 REM MinGW CANNOT build the C++/WinRT SMTC part, so there is no MinGW command for v5 - MSVC is the supported path.
@@ -15,7 +16,7 @@ REM Note on cmd parsing: this script deliberately uses no parenthesised if block
 setlocal
 rc /nologo onyxnotch.rc
 if errorlevel 1 goto rc_failed
-cl /nologo /std:c++17 /EHsc /O2 /MT /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS main.cpp onyxnotch.res user32.lib gdi32.lib shell32.lib windowsapp.lib advapi32.lib iphlpapi.lib winmm.lib d2d1.lib dwrite.lib /link /SUBSYSTEM:WINDOWS /OUT:OnyxNotch.exe
+cl /nologo /std:c++17 /EHsc /O2 /MT /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS main.cpp onyxnotch.res user32.lib gdi32.lib shell32.lib windowsapp.lib advapi32.lib iphlpapi.lib winmm.lib d2d1.lib dwrite.lib ole32.lib /link /SUBSYSTEM:WINDOWS /OUT:OnyxNotch.exe
 if errorlevel 1 goto cl_failed
 echo.
 echo Built: OnyxNotch.exe
