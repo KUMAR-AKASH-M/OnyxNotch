@@ -6,12 +6,19 @@ Mac-style notch for Windows, in native C++ Win32. One source file, one
 **Scope of this folder:** v8 keeps every v7 feature and behaviour
 (Direct2D/DirectWrite layered window, spring animation, thin-strip
 fullscreen, unified tab size, SMTC, settings, auto-start, themes)
-and adds ONLY the two most Vayli-like features, both OFF by default:
-clipboard history and a file shelf. Nothing else was added: no
-weather, no notes, no timers, no screen-time tracking, no network,
-no accounts, no telemetry. Album-art accent tinting is still
-deliberately OUT of scope (SMTC gives title/artist, not album art,
-in our path) and is not faked.
+and adds, in place and in two stages, the Vayli-like features
+that follow the standing rules (native, local, no network, no
+focus steal): first clipboard history and a file shelf, both OFF
+by default, then HOME customization, then the v8-continued set
+in §6 of the v8 section (timers, notes, screen time, volume /
+brightness, clipboard persistence, image drag-out). Nothing else
+was added: no weather, no accounts, no telemetry. Album-art
+accent tinting is still deliberately OUT of scope (SMTC gives
+title/artist, not album art, in our path) and is not faked.
+Privacy dots and Bluetooth battery were investigated for the
+v8-continued set and CUT (see §6): no reliable public native
+signal exists for either, and faking them would be worse than
+omitting them.
 
 ## What's new in v7
 
@@ -358,10 +365,12 @@ capture immediately.
 - **Deduplication.** Copying the same thing twice in a row does
   not fill the list: a new item identical to the newest item
   (same text, same file set, same image) is skipped.
-- **In-memory only — a privacy choice, not a bug.** Clipboard
-  contents are NEVER written to disk in v8. History is cleared
-  on quit. If you want history across restarts, that is future
-  work with an explicit opt-in, not something v8 does silently.
+- **In-memory by default — a privacy choice, not a bug.**
+  Clipboard contents are NEVER written to disk unless you turn
+  on the v8-continued toggle "Keep clipboard history after
+  quit" (see §6): with it off, history is cleared on quit;
+  with it on, text items only are kept in a DPAPI-protected
+  file, and images are still never persisted.
 - **Password-manager skipping is a heuristic, NOT a guarantee.**
   If the clipboard owner's process image name (lowercased exe
   name) matches this list, the item is skipped entirely:
@@ -391,10 +400,12 @@ capture immediately.
   tab into another app works via OLE drag-and-drop
   (`IDropSource`/`IDataObject`, `CF_UNICODETEXT` / `CF_HDROP`,
   copy effect only — the source is never moved or deleted).
-  Images do NOT support drag-out in v8: dragging an image row
-  does nothing, and click-to-copy is the only path for images.
-  If drag-out fails on a particular target app, click-to-copy
-  remains the fallback; a failed drag never deletes anything.
+  Images support drag-out since the v8-continued change, with
+  the same thumbnail limit as copy-back: dragging an image row
+  drags the stored thumbnail (max 256 px), never the original
+  full-resolution image. If drag-out fails on a particular
+  target app, click-to-copy remains the fallback; a failed
+  drag never deletes anything.
 - **Home card.** While clipboard history is on, Home shows a
   small clipboard summary card: the latest item, truncated
   (text, "N files", or "Image WxH (thumbnail)").
@@ -468,12 +479,13 @@ box, so it is explained here instead of faked.
 HOME is no longer a fixed grid. You choose which cards it
 shows, and in what order, up to a hard maximum of six.
 
-The 8 candidates are: System, Calendar, Clock, Media,
-Battery, Network, Clipboard, and Shelf (new in this change:
-title SHELF, parked-file count, the latest parked file name
-truncated, a "Missing" note if that file has moved or been
-deleted, "No parked files yet" when empty, and a
-"Click Shelf tab for files" hint). The other cards keep
+The 11 candidates are: System, Calendar, Clock, Media,
+Battery, Network, Clipboard, Shelf, Timer, Notes, and Screen
+(the last three are new in the v8-continued change; see §6).
+The Shelf card shows title SHELF, the parked-file count, the
+latest parked file name truncated, a "Missing" note if that
+file has moved or been deleted, "No parked files yet" when
+empty, and a "Click Shelf tab for files" hint. The other cards keep
 their existing content, including the Media card buttons.
 
 The 6-card cap is enforced at layout, not just in the menu:
@@ -499,7 +511,7 @@ focus, same reason as §3):
   it only changes what HOME shows.
 - With edit mode on, HOME paints an edit list instead of
   the card grid: a header "Home cards — N of 6 selected",
-  then all 8 candidates in the current order. Each row has
+  then all 11 candidates in the current order. Each row has
   a checkbox (checked = selected), the card name (with
   "(feature off)" when its feature toggle is off — such a
   card can be selected but simply is not displayed until
@@ -524,9 +536,10 @@ focus, same reason as §3):
 Persistence, in `%APPDATA%\OnyxNotch\settings.ini`
 (corrupt values ignored, as with every other key):
 
-- `home_order=0,1,2,3,4,5,6,7` — the display order, a
-  permutation of 0..7 (System 0, Calendar 1, Clock 2,
-  Media 3, Battery 4, Network 5, Clipboard 6, Shelf 7).
+- `home_order=0,1,2,3,4,5,6,7,8,9,10` — the display order, a
+  permutation of 0..10 (System 0, Calendar 1, Clock 2,
+  Media 3, Battery 4, Network 5, Clipboard 6, Shelf 7,
+  Timer 8, Notes 9, Screen 10).
   On load, duplicates and unknown ids are ignored and any
   missing canonical id is appended at the end, so an old
   file (written before this change, with no such key) gets
@@ -547,7 +560,187 @@ checkbox cap, so checking a 7th selected card is still
 blocked even if one of the 6 selected cards is currently
 hidden by its feature toggle.
 
-### 6. Build (Windows) — v8
+
+### 6. What is new in v8 — continued (in place, after HOME customization)
+
+Everything here follows the same standing rules as v8: native
+C++ Win32, single .exe, no network, no accounts, no telemetry,
+and NO typing anywhere in the notch (it is `WS_EX_NOACTIVATE`
+and must not steal focus). Every control below is a mouse
+click or the mouse wheel. New tabs join the dock in this
+order: Home, System, Media, Clock, Calendar, Clipboard,
+Shelf, Timer, Notes, Screen (Screen only when screen time is
+on). All new tabs participate in unified tab size, so the
+panel height is still one height across visible tabs, and
+tab switching still only repaints. The dock pill at 10 icons
+is 496 px at 96 DPI, well inside the 840 px panel; on a
+narrow monitor the pill clamps to the left margin, the same
+pre-existing behaviour as with 7 icons.
+
+#### 6.1 TIMER tab (always visible, like Clock)
+
+Stopwatch, Countdown, and Focus, switched by three mode
+buttons. Countdown and Focus share the same mechanics; only
+the label differs. Presets are 5 / 10 / 25 / 45 minutes, and
+step buttons are -5 / -1 / +1 / +5 minutes. Presets and steps
+apply to Countdown/Focus only, and only while paused; in
+Stopwatch mode they do nothing. Start/Pause toggles, Reset
+stops and clears. There is NO typed duration entry, because
+there is no typing in the notch — presets and steps are the
+whole input model, and that is deliberate.
+
+Live activity: while a Countdown or Focus timer is running,
+the collapsed notch shows the remaining time instead of the
+clock; when it finishes, the collapsed notch shows "Done"
+and the TIMER tab shows "Done — Reset to run again" until
+you Reset or change mode. Stopwatch never replaces the
+collapsed clock; see it on the TIMER tab. There is NO sound
+on finish in this change (no beep toggle was added). Timers
+are in-memory only and stop on quit — they are not persisted.
+
+#### 6.2 NOTES tab (always visible, like Clock)
+
+Local notes, stored in `%APPDATA%\OnyxNotch\notes.ini`, one
+`[note]` section per note:
+
+```
+[note]
+pinned=0
+text=<first line>
+text=<next line>
+```
+
+Blank lines end a section; pinned notes sort first in the
+tab. The tab has four top buttons: New blank, From
+clipboard, Reload all, Clear all. Each row has Pin, Open,
+and Delete (X), and the list scrolls with the mouse wheel.
+
+The typing constraint, stated plainly: the notch cannot
+accept typing, by design (no-activate), so notes are NOT
+edited in the notch and no fake editor is provided. Notes
+are created blank ("New note") or from the latest clipboard
+text/link item ("From clipboard" does nothing if clipboard
+history is off or the latest item is not text). To edit a
+note, click Open: the note is written to
+`notes-edit-<index>.txt` in the same folder and opened in
+Notepad. Edit and save there, then click Reload all: every
+note whose edit file exists is re-read from it. Notes with
+no edit file are untouched by Reload all. This is the honest
+shape of notes under the no-focus rule, not a limitation
+hidden behind a text box that cannot receive keystrokes.
+
+#### 6.3 SCREEN tab (only when screen time is on)
+
+Turn it on from the tray menu ("Screen time",
+`screen_time=1` in settings.ini). It is OFF by default,
+because it records which apps you use. Sampling uses the
+existing 1-second timer: the foreground window's process
+image name (exe) is recorded, one second per tick, for
+today. Window titles are NEVER read — titles can contain
+private content (document titles, chats, URLs), and exe
+names are the only data this feature touches. OnyxNotch
+itself is never counted. The tab shows the top apps by time
+today and a total, with a Reset today button. Totals persist
+in `%APPDATA%\OnyxNotch\screentime.ini` (`day=YYYY-MM-DD`
+first, then `<exe>` + tab + seconds per line, corrupt lines
+ignored, at most 64 apps), and reset at local midnight. The
+tab's empty state names both the exe-only rule and the
+file, so the recording behaviour is visible in the app.
+
+#### 6.4 SYSTEM tab: volume buttons and brightness
+
+Volume was already read-only (wave-out level). It is now
+also adjustable: - and + buttons step the SYSTEM wave-out
+volume by 5 (not a per-app volume), and Mute remembers the
+pre-mute level and restores it on Unmute. Changing the
+volume changes the system volume — that is the point of
+the buttons, and it is stated here and in the tab so it is
+never a surprise.
+
+Brightness uses native WMI (`ROOT\WMI`,
+`WmiMonitorBrightness` / `WmiMonitorBrightnessMethods`) for
+internal displays, with - / + buttons stepping 10 and a
+Refresh button. Brightness is refreshed when you switch to
+the SYSTEM tab and when you press Refresh or a step button
+— never per paint frame, so a slow WMI call cannot stall
+every frame. If WMI finds no controllable display, the card
+says "Brightness control unavailable on this display"
+instead of showing a fake slider. No gamma-ramp hacks are
+used. If WMI fails on a particular machine, the buttons do
+nothing harmful: they re-query and leave the card at
+Unavailable.
+
+#### 6.5 Clipboard persistence (OFF by default)
+
+Tray menu "Keep clipboard history after quit"
+(`keep_clipboard=1` in settings.ini). With it off — the
+default — nothing changes from v8: history is in-memory
+only and clears on quit. With it on, TEXT items only
+(text and links; file items persist as paths, exactly as
+the shelf already persists paths) are saved to
+`%APPDATA%\OnyxNotch\clipboard.dat`, protected with
+Windows DPAPI (`CryptProtectData`, user scope). DPAPI here
+means the file is readable only under the same Windows
+user account — it is account protection, not a password,
+and it does not protect against anyone signed in as you.
+Images are NEVER persisted, even with this toggle on
+(thumbnails live in memory only). Pinned text items
+persist too. On startup with the toggle on, the file is
+decrypted and loaded (newest first, capped at 50); on any
+decrypt or parse failure the file is dropped and history
+starts empty — never a crash, never garbage shown. Turning
+the toggle off stops all writes but does NOT delete the
+file: deleting user data silently on toggle-off would be
+worse, so the file stays until you delete it manually, and
+this paragraph is where that is documented. The CLIPBOARD
+tab's empty state says which mode is active.
+
+#### 6.6 Image drag-out (thumbnails only)
+
+Dragging an image row out of the CLIPBOARD tab now works
+via OLE drag-out (`CF_BITMAP` / `CF_DIB`), with the same
+honest limit as copy-back: the dragged image is the stored
+thumbnail (max 256 px on the long side), never the original
+full-resolution image, because v8 stores thumbnails only to
+bound memory. The tab footer says "Images drag as
+thumbnails only." Do not claim full-resolution drag-out.
+
+#### 6.7 HOME cards extended (6-card cap unchanged)
+
+Three new HOME candidates join the customization list:
+Timer (mode + current display), Notes (count + first note),
+Screen (total today + top app). The candidate list is now
+11 (System, Calendar, Clock, Media, Battery, Network,
+Clipboard, Shelf, Timer, Notes, Screen); the hard 6-card
+cap is unchanged and still enforced at layout; the defaults
+are unchanged (the v6/v7 six); Timer, Notes, and Screen are
+NOT selected by default. `home_order=` is now a permutation
+of 0..10 and `home_cards=` still holds at most 6 selected
+ids; old files (permutation of 0..7, or no such keys) load
+with missing ids appended at the end, unselected. The edit
+list now shows all 11 candidates with the same checkbox /
+up / down / Done behaviour and the same rule that checking
+a 7th selected card does nothing until one is unchecked.
+
+#### 6.8 CUT, with reasons (no dead UI left for either)
+
+- **Privacy dots (mic/camera in use) — CUT.** There is no
+  simple public Win32 or WinRT API that reports whether
+  another app is using the microphone or camera. Windows'
+  own indicator is not exposed to apps, and guessing from
+  running processes would lie (a process can hold a device
+  handle without using it, and vice versa). No dot is drawn
+  anywhere, because a dot that guesses is worse than no dot.
+- **Bluetooth battery — CUT.** Paired-device enumeration
+  via the classic Bluetooth APIs does not expose battery
+  level, and the GATT battery service needs WinRT async
+  GATT clients, which cannot be driven reliably from the
+  notch's synchronous paint/click paths in one pass without
+  risking UI stalls. No Bluetooth section is drawn in the
+  SYSTEM tab, and no Refresh button for it exists, so there
+  is no dead control to click.
+
+### 7. Build (Windows) — v8
 
 From a Visual Studio Developer Command Prompt, in the folder
 containing `main.cpp`:
@@ -559,7 +752,8 @@ build.bat
 That runs `rc` on `onyxnotch.rc` (custom icon into
 `onyxnotch.res`), then `cl /std:c++17 /EHsc` with
 `windowsapp.lib advapi32.lib iphlpapi.lib winmm.lib d2d1.lib
-dwrite.lib ole32.lib`. Output is `OnyxNotch.exe` in the same
+dwrite.lib ole32.lib crypt32.lib wbemuuid.lib` (the last two
+are new in the v8-continued change: DPAPI and WMI). Output is `OnyxNotch.exe` in the same
 folder. Quit any running OnyxNotch first, or the link fails
 with LNK1104 (the running exe cannot be overwritten).
 
@@ -573,7 +767,7 @@ v8 now uses its own identical-layout `OnyxDropFiles` struct
 and `CopyClipItemBack` is forward-declared near the shelf
 forward declarations. No behaviour changed.
 
-### 7. Honest limits — v8 (not verified on Windows)
+### 8. Honest limits — v8 (not verified on Windows)
 
 v8 was written and reviewed in the Linux VM, which has no
 Windows toolchain. Nothing in this section was compiled or
@@ -609,6 +803,19 @@ claimed as verified until Kumar builds and runs it:
   size, the Shelf HOME card, settings round-tripping for
   `home_order=` / `home_cards=`, and per-monitor DPI of the
   edit rows are all unverified.
+- v8-continued (this change) is likewise uncompiled and
+  untested on Windows: the TIMER tab (mode/preset/step
+  clicks, countdown accuracy over minutes, the collapsed
+  remaining-time display, Done state), the NOTES tab
+  (notes.ini round-trip, Notepad open/reload, pinned-first
+  hit order), screen-time sampling (foreground exe capture,
+  midnight reset, screentime.ini round-trip), wave-out
+  volume set/mute on real hardware, WMI brightness get/set
+  (including the Unavailable path on desktops and external
+  monitors), DPAPI clipboard save/load (including corrupt
+  file handling), image drag-out to real target apps,
+  unified tab size with 10 dock icons, and idle memory
+  with the new tabs enabled.
 
 # OnyxNotch v6 — Card + dock dashboard look, existing data only
 

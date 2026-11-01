@@ -1,4 +1,10 @@
 // OnyxNotch v8 - clipboard history + file shelf, Vayli-style (see README v8 section).
+// v8-continued (in place, after the v8 push): timers, notes, screen
+// time, volume/brightness controls, clipboard persistence and image
+// drag-out, all native and local. Privacy dots and Bluetooth battery
+// were investigated and CUT (see README): no reliable public native
+// signal exists for either, and faking them would be worse than
+// omitting them. No typing anywhere: the notch stays no-activate.
 // v8 adds ONLY those two features, both OFF by default, on top of v7:
 // clipboard history (in-memory only, AddClipboardFormatListener on the
 // manager window, password-manager heuristic skip, click-to-copy-back,
@@ -242,6 +248,8 @@
 #include <d2d1.h> // v7: Direct2D rendering
 #include <dwrite.h> // v7: DirectWrite text
 #include <ole2.h> // v8: DoDragDrop / IDataObject for drag-out
+#include <wbemidl.h> // v8-continued: WMI brightness (root\\WMI)
+#include <wincrypt.h> // v8-continued: DPAPI clipboard persistence
 // v5-SMTC: C++/WinRT headers for the local SMTC session manager.
 // These need the Windows SDK with C++/WinRT and /std:c++17 (see
 // build.bat). No other WinRT API is used; there is no network use.
@@ -265,6 +273,8 @@
 #pragma comment(lib, "d2d1.lib") // v7: Direct2D rendering
 #pragma comment(lib, "dwrite.lib") // v7: DirectWrite text
 #pragma comment(lib, "ole32.lib") // v8: DoDragDrop
+#pragma comment(lib, "wbemuuid.lib") // v8-continued: WMI brightness
+#pragma comment(lib, "crypt32.lib") // v8-continued: DPAPI
 
 #define ID_TRAY_ICON            1
 #define WM_TRAY                 (WM_APP + 1)
@@ -292,6 +302,8 @@
 #define ID_TRAY_CLIPBOARD       1019
 #define ID_TRAY_SHELF           1020
 #define ID_TRAY_HOME_EDIT       1021
+#define ID_TRAY_SCREEN_TIME     1022
+#define ID_TRAY_KEEP_CLIP       1023
 #define IDI_ONYXNOTCH_ICON      100
 
 static const wchar_t kNotchClass[] = L"OnyxNotch";
@@ -323,7 +335,8 @@ static bool g_shelfEnabled = false;
 
 // v8-home-custom: HOME card selection + order. Candidate ids:
 // 0 System, 1 Calendar, 2 Clock, 3 Media, 4 Battery, 5 Network,
-// 6 Clipboard, 7 Shelf. g_homeOrder is a permutation of 0..7;
+// 6 Clipboard, 7 Shelf, 8 Timer, 9 Notes, 10 Screen (v8-continued).
+// g_homeOrder is a permutation of 0..10;
 // g_homeSel says which candidates are chosen. Defaults keep
 // exactly the v6/v7 HOME (ids 0-5); Clipboard and Shelf do NOT
 // auto-appear on HOME when their features are turned on.
@@ -332,8 +345,9 @@ static bool g_shelfEnabled = false;
 // and again in the edit click handler (selection), so no code
 // path can ever show 7 cards on HOME.
 static const int kHomeCardMax = 6;
-static int g_homeOrder[8] = { 0, 1, 2, 3, 4, 5, 6, 7 };
-static bool g_homeSel[8] = { true, true, true, true, true, true, false, false };
+static const int kHomeCardCount = 11;
+static int g_homeOrder[11] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
+static bool g_homeSel[11] = { true, true, true, true, true, true, false, false, false, false, false };
 static bool g_homeEdit = false;
 static bool HomeCardFeatureOn(int id)
 {
@@ -346,16 +360,19 @@ static bool HomeCardFeatureOn(int id)
     case 5: return g_widgetStats;
     case 6: return g_clipEnabled;
     case 7: return g_shelfEnabled;
+    case 8: return true; // Timer: always available, like Clock
+    case 9: return true; // Notes: always available, like Clock
+    case 10: return g_screenTimeEnabled;
     default: return false;
     }
 }
 static int HomeSelectedCount()
 {
     int c = 0;
-    for (int i = 0; i < 8; i++) if (g_homeSel[i]) c++;
+    for (int i = 0; i < kHomeCardCount; i++) if (g_homeSel[i]) c++;
     return c;
 }
-// Parse home_order=: comma list, a permutation of 0..7.
+// Parse home_order=: comma list, a permutation of 0..10.
 // Duplicates and unknown ids are ignored; any missing canonical
 // id is appended at the end, so an old or corrupt value still
 // yields a full valid order.
@@ -374,38 +391,38 @@ static bool HomeListHasNonSeparator(const char* val)
 }
 static void ParseHomeOrder(const char* val)
 {
-    int order[8]; int count = 0; bool seen[8] = { false, false, false, false, false, false, false, false };
+    int order[11]; int count = 0; bool seen[11] = { false, false, false, false, false, false, false, false, false, false, false };
     const char* q = val;
     while (*q) {
         char* end = NULL;
         long v = strtol(q, &end, 10);
         if (end == q) break;
-        if (v >= 0 && v < 8 && !seen[v]) { seen[v] = true; order[count++] = (int)v; }
+        if (v >= 0 && v < kHomeCardCount && !seen[v]) { seen[v] = true; order[count++] = (int)v; }
         q = end;
         while (*q == ',' || *q == ' ' || *q == '\t') q++;
     }
-    for (int id = 0; id < 8; id++) if (!seen[id]) order[count++] = id;
+    for (int id = 0; id < kHomeCardCount; id++) if (!seen[id]) order[count++] = id;
     if (count == 0 && HomeListHasNonSeparator(val)) return; // corrupt: keep current order
-    for (int i = 0; i < 8; i++) g_homeOrder[i] = order[i];
+    for (int i = 0; i < kHomeCardCount; i++) g_homeOrder[i] = order[i];
 }
 // Parse home_cards=: comma list of SELECTED ids, in display
 // order. Duplicates and unknown ids are ignored; only the
 // first 6 unique ids count, matching the 6-card cap.
 static void ParseHomeCards(const char* val)
 {
-    bool sel[8] = { false, false, false, false, false, false, false, false };
+    bool sel[11] = { false, false, false, false, false, false, false, false, false, false, false };
     int count = 0;
     const char* q = val;
     while (*q && count < kHomeCardMax) {
         char* end = NULL;
         long v = strtol(q, &end, 10);
         if (end == q) break;
-        if (v >= 0 && v < 8 && !sel[v]) { sel[v] = true; count++; }
+        if (v >= 0 && v < kHomeCardCount && !sel[v]) { sel[v] = true; count++; }
         q = end;
         while (*q == ',' || *q == ' ' || *q == '\t') q++;
     }
     if (count == 0 && HomeListHasNonSeparator(val)) return; // corrupt: keep current selection
-    for (int i = 0; i < 8; i++) g_homeSel[i] = sel[i];
+    for (int i = 0; i < kHomeCardCount; i++) g_homeSel[i] = sel[i];
 }
 
 // v8 clipboard item. Text is capped at 4096 chars stored (longer
@@ -442,6 +459,81 @@ static bool GetShelfPath(wchar_t* out, size_t count);
 static void SaveShelf();
 static void LoadShelf();
 static void CopyClipItemBack(int storageIdx); // v8-fix: used by NotchWndProc, defined later
+static void SaveNotes();
+static void SaveScreenTime();
+static void SaveClipPersist();
+static void LoadClipPersist();
+
+// ---------- v8-continued: timers, notes, screen time, volume/brightness ----------
+// Timers are GLOBAL (shared by all notches), like clipboard history.
+// mode: 0 stopwatch, 1 countdown, 2 focus. Countdown/focus share the
+// same mechanics; only the label differs. Presets and steps apply
+// to countdown/focus only; in stopwatch mode they do nothing.
+// No sound: on finish the TIMER tab shows Done and the collapsed
+// notch shows Done until Reset or a mode change. Timers are
+// in-memory only and stop on quit (documented, not a bug).
+static int g_timerMode = 1; // default: countdown
+static bool g_timerRunning = false;
+static bool g_timerDone = false;
+static ULONGLONG g_timerAccumMs = 0;
+static ULONGLONG g_timerStartTick = 0;
+static ULONGLONG g_timerTargetMs = 25 * 60 * 1000;
+static ULONGLONG TimerElapsedMs()
+{
+    if (!g_timerRunning) return g_timerAccumMs;
+    ULONGLONG now = GetTickCount64();
+    return g_timerAccumMs + (now >= g_timerStartTick ? now - g_timerStartTick : 0);
+}
+static ULONGLONG TimerDisplayMs()
+{
+    if (g_timerMode == 0) return TimerElapsedMs();
+    if (g_timerDone) return 0;
+    ULONGLONG el = TimerElapsedMs();
+    return (el >= g_timerTargetMs) ? 0 : g_timerTargetMs - el;
+}
+static void TimerUpdate()
+{
+    if (!g_timerRunning || g_timerMode == 0) return;
+    if (TimerElapsedMs() >= g_timerTargetMs) {
+        g_timerRunning = false; g_timerDone = true; g_timerAccumMs = g_timerTargetMs;
+    }
+}
+static void TimerFormatMs(ULONGLONG ms, wchar_t* out, size_t count)
+{
+    ULONGLONG totalSec = ms / 1000;
+    ULONGLONG h = totalSec / 3600, m = (totalSec % 3600) / 60, sec = totalSec % 60;
+    if (h > 0) swprintf(out, count, L"%llu:%02llu:%02llu", h, m, sec);
+    else swprintf(out, count, L"%02llu:%02llu", m, sec);
+}
+static const wchar_t* TimerModeName()
+{
+    return (g_timerMode == 0) ? L"Stopwatch" : (g_timerMode == 2) ? L"Focus" : L"Countdown";
+}
+// Notes: plain text, one note per [note] section in notes.ini.
+// Editing happens in Notepad (see SaveNotes/LoadNotes section);
+// the notch itself never accepts typing (no-activate).
+struct NoteItem { std::wstring text; bool pinned = false; };
+static std::vector<NoteItem> g_notes;
+// Screen time: exe names ONLY, never window titles (titles can
+// hold private content). Seconds for today, local midnight reset.
+struct ScreenApp { std::wstring exe; ULONGLONG seconds = 0; };
+static std::vector<ScreenApp> g_screenApps;
+static wchar_t g_screenDay[16] = { 0 };
+static bool g_screenTimeEnabled = false;
+static bool g_keepClipboard = false;
+static ULONGLONG ScreenTotalSeconds()
+{
+    ULONGLONG t = 0;
+    for (size_t i = 0; i < g_screenApps.size(); i++) t += g_screenApps[i].seconds;
+    return t;
+}
+// Volume/brightness state. Volume is wave-out (system wave volume,
+// not per-app). Mute remembers the pre-mute level. Brightness is
+// WMI (internal displays); g_brightOk false means unavailable.
+static bool g_volMuted = false;
+static int g_volBeforeMute = 50;
+static bool g_brightOk = false;
+static int g_brightPercent = 0;
 
 // ---------------------------------------------------------------------------
 // v5-themes: theme table. Onyx reproduces the v4 colours exactly
@@ -638,6 +730,10 @@ static void LoadSettings()
                     if (ParseBoolValue(val, b)) g_clipEnabled = b;
                 } else if (StrEqualsIgnoreCase(key, "shelf")) {
                     if (ParseBoolValue(val, b)) g_shelfEnabled = b;
+                } else if (StrEqualsIgnoreCase(key, "screen_time")) {
+                    if (ParseBoolValue(val, b)) g_screenTimeEnabled = b;
+                } else if (StrEqualsIgnoreCase(key, "keep_clipboard")) {
+                    if (ParseBoolValue(val, b)) g_keepClipboard = b;
                 } else if (StrEqualsIgnoreCase(key, "home_order")) {
                     ParseHomeOrder(val);
                 } else if (StrEqualsIgnoreCase(key, "home_cards")) {
@@ -676,22 +772,22 @@ static void SaveSettings()
     // selected list is g_homeSel filtered through g_homeOrder,
     // so the saved file always lists selected ids in display
     // order and never more than 6 of them.
-    char orderStr[64] = { 0 };
+    char orderStr[96] = { 0 };
     {
         int pos = 0;
-        for (int i = 0; i < 8; i++) pos += sprintf_s(orderStr + pos, sizeof(orderStr) - pos, "%s%d", i ? "," : "", g_homeOrder[i]);
+        for (int i = 0; i < kHomeCardCount; i++) pos += sprintf_s(orderStr + pos, sizeof(orderStr) - pos, "%s%d", i ? "," : "", g_homeOrder[i]);
     }
     char cardsStr[64] = { 0 };
     {
         int pos = 0; bool first = true;
-        for (int i = 0; i < 8; i++) {
+        for (int i = 0; i < kHomeCardCount; i++) {
             int id = g_homeOrder[i];
             if (!g_homeSel[id]) continue;
             pos += sprintf_s(cardsStr + pos, sizeof(cardsStr) - pos, "%s%d", first ? "" : ",", id);
             first = false;
         }
     }
-    char buf[768];
+    char buf[1024];
     int len = sprintf_s(buf, sizeof(buf),
         "; OnyxNotch settings - rewritten on every change and on clean quit.\r\n"
         "; Unknown keys are ignored on load; values are 0 = off, 1 = on.\r\n"
@@ -704,6 +800,8 @@ static void SaveSettings()
         "blur=%d\r\n"
         "clipboard=%d\r\n"
         "shelf=%d\r\n"
+        "screen_time=%d\r\n"
+        "keep_clipboard=%d\r\n"
         "home_order=%s\r\n"
         "home_cards=%s\r\n"
         "theme=%s\r\n",
@@ -716,6 +814,8 @@ static void SaveSettings()
         g_blurEnabled ? 1 : 0,
         g_clipEnabled ? 1 : 0,
         g_shelfEnabled ? 1 : 0,
+        g_screenTimeEnabled ? 1 : 0,
+        g_keepClipboard ? 1 : 0,
         orderStr,
         cardsStr,
         ThemeKey(g_theme));
@@ -859,6 +959,8 @@ struct Notch {
     int clipFilter = 0; // 0 All, 1 Text, 2 Images, 3 Links, 4 Files
     int clipScroll = 0; // item offset into the filtered display list
     int shelfScroll = 0;
+    int noteScroll = 0; // v8-continued: notes list scroll
+    int screenScroll = 0; // v8-continued: screen-time list scroll
     int dragKind = 0; // 0 none, 1 clipboard row, 2 shelf row
     int dragIndex = -1; // storage index of the drag candidate
     int dragStartX = 0, dragStartY = 0;
@@ -1025,6 +1127,9 @@ static const int kTabCalendar = 3;
 static const int kTabClock = 4;
 static const int kTabClipboard = 5;
 static const int kTabShelf = 6;
+static const int kTabTimer = 7; // v8-continued: always visible, like Clock
+static const int kTabNotes = 8; // v8-continued: always visible, like Clock
+static const int kTabScreen = 9; // v8-continued: only when screen time is on
 
 struct Layout {
     int totalH = 0;
@@ -1033,25 +1138,45 @@ struct Layout {
     int closeCX = 0, closeCY = 0, closeR = 0;
     int bodyY = 0;
     int dockY = 0, dockH = 0, dockCount = 0;
-    int dockIds[7] = { 0, 0, 0, 0, 0, 0, 0 };
-    RECT dockRects[7] = { { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 } };
+    int dockIds[10] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    RECT dockRects[10] = { { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 } };
     RECT dockPill = { 0, 0, 0, 0 };
     // HOME grid cards. homeCardIds: 0 System, 1 Calendar, 2 Clock,
     // 3 Media, 4 Battery, 5 Network, 6 Clipboard, 7 Shelf.
     // At most kHomeCardMax (6) are ever displayed; the arrays
     // are sized 8 for headroom, not because 8 can show.
     int homeCardCount = 0;
-    int homeCardIds[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
-    RECT homeCards[8] = { { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 } };
+    int homeCardIds[11] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    RECT homeCards[11] = { { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 } };
     // v8-home-custom edit list: shown instead of the card grid
     // when g_homeEdit is on and HOME is the shown tab. Row i is
     // candidate g_homeOrder[i]; check toggles selection, up/down
     // swap neighbours in g_homeOrder, done exits edit mode.
     int homeEditHeaderY = 0;
     int homeEditListY = 0, homeEditRowH = 0;
-    RECT homeEditCheckRects[8] = { { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 } };
-    RECT homeEditUpRects[8] = { { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 } };
-    RECT homeEditDownRects[8] = { { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 } };
+    RECT homeEditCheckRects[11] = { { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 } };
+    RECT homeEditUpRects[11] = { { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 } };
+    RECT homeEditDownRects[11] = { { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 } };
+    // v8-continued tabs: timer, notes, screen, and SYSTEM extras.
+    RECT timerCard = { 0, 0, 0, 0 };
+    RECT timerModeRects[3] = { { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 } };
+    RECT timerPresetRects[4] = { { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 } };
+    RECT timerStepRects[4] = { { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 } };
+    RECT timerStartRect = { 0, 0, 0, 0 };
+    RECT timerResetRect = { 0, 0, 0, 0 };
+    RECT notesCard = { 0, 0, 0, 0 };
+    int notesListY = 0, notesRowH = 0;
+    RECT notesTopRects[4] = { { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 } };
+    RECT screenCard = { 0, 0, 0, 0 };
+    int screenListY = 0, screenRowH = 0;
+    RECT screenResetRect = { 0, 0, 0, 0 };
+    RECT sysExtraCard = { 0, 0, 0, 0 };
+    RECT volMinusRect = { 0, 0, 0, 0 };
+    RECT volPlusRect = { 0, 0, 0, 0 };
+    RECT volMuteRect = { 0, 0, 0, 0 };
+    RECT brightMinusRect = { 0, 0, 0, 0 };
+    RECT brightPlusRect = { 0, 0, 0, 0 };
+    RECT brightRefreshRect = { 0, 0, 0, 0 };
     int homeEditDoneY = 0;
     RECT homeEditDoneRect = { 0, 0, 0, 0 };
     // v8 clipboard/shelf cards (full-width body cards).
@@ -1125,7 +1250,8 @@ static int EffectiveTab(Notch* n)
     if (t == kTabCalendar && !g_widgetCalendar) return kTabHome;
     if (t == kTabClipboard && !g_clipEnabled) return kTabHome;
     if (t == kTabShelf && !g_shelfEnabled) return kTabHome;
-    if (t != kTabHome && t != kTabMedia && t != kTabSystem && t != kTabCalendar && t != kTabClock && t != kTabClipboard && t != kTabShelf) return kTabHome;
+    if (t == kTabScreen && !g_screenTimeEnabled) return kTabHome;
+    if (t != kTabHome && t != kTabMedia && t != kTabSystem && t != kTabCalendar && t != kTabClock && t != kTabClipboard && t != kTabShelf && t != kTabTimer && t != kTabNotes && t != kTabScreen) return kTabHome;
     return t;
 }
 
@@ -1140,6 +1266,9 @@ static int DockIds(int* out)
     if (g_widgetCalendar) out[c++] = kTabCalendar;
     if (g_clipEnabled) out[c++] = kTabClipboard;
     if (g_shelfEnabled) out[c++] = kTabShelf;
+    out[c++] = kTabTimer;
+    out[c++] = kTabNotes;
+    if (g_screenTimeEnabled) out[c++] = kTabScreen;
     return c;
 }
 
@@ -1176,7 +1305,7 @@ static Layout ComputeLayoutForTab(Notch* n, int clientW, int tab)
             int checkS = Scale(20, dpi);
             int arrowW = Scale(24, dpi);
             int rightEdge = clientW - margin - Scale(14, dpi);
-            for (int i = 0; i < 8; i++) {
+            for (int i = 0; i < kHomeCardCount; i++) {
                 int y0 = L.homeEditListY + i * L.homeEditRowH;
                 int cy = y0 + (L.homeEditRowH - checkS) / 2;
                 L.homeEditCheckRects[i] = { margin + Scale(14, dpi), cy, margin + Scale(14, dpi) + checkS, cy + checkS };
@@ -1185,14 +1314,14 @@ static Layout ComputeLayoutForTab(Notch* n, int clientW, int tab)
                 L.homeEditUpRects[i] = { upL, y0, upL + arrowW, y0 + L.homeEditRowH };
                 L.homeEditDownRects[i] = { downL, y0, downL + arrowW, y0 + L.homeEditRowH };
             }
-            L.homeEditDoneY = L.homeEditListY + 8 * L.homeEditRowH + Scale(8, dpi);
+            L.homeEditDoneY = L.homeEditListY + kHomeCardCount * L.homeEditRowH + Scale(8, dpi);
             L.homeEditDoneRect = { margin + Scale(14, dpi), L.homeEditDoneY, margin + Scale(110, dpi), L.homeEditDoneY + Scale(22, dpi) };
             bodyH = L.homeEditDoneRect.bottom - L.bodyY;
         } else {
         int count = 0;
         // Selection + order + feature gate + HARD 6 cap, all
         // enforced here at layout: no path can display a 7th.
-        for (int oi = 0; oi < 8; oi++) {
+        for (int oi = 0; oi < kHomeCardCount; oi++) {
             int id = g_homeOrder[oi];
             if (count >= kHomeCardMax) break;
             if (g_homeSel[id] && HomeCardFeatureOn(id)) { L.homeCardIds[count] = id; count++; }
@@ -1233,7 +1362,27 @@ static Layout ComputeLayoutForTab(Notch* n, int clientW, int tab)
             int y = L.bodyY + row * (cardH + gap);
             L.sysCards[i] = { x, y, x + cardW, y + cardH };
         }
-        bodyH = 2 * cardH + gap;
+        // v8-continued: volume buttons inside the VOLUME card
+        // (sysCards[3]), and a full-width BRIGHTNESS card below
+        // the 2x2 grid. Bluetooth battery is NOT here: it was
+        // cut (see README), so no dead section is drawn for it.
+        {
+            RECT vc = L.sysCards[3];
+            int vy = vc.bottom - Scale(34, dpi);
+            L.volMinusRect = { vc.left + Scale(14, dpi), vy, vc.left + Scale(62, dpi), vy + Scale(26, dpi) };
+            L.volPlusRect = { vc.left + Scale(70, dpi), vy, vc.left + Scale(118, dpi), vy + Scale(26, dpi) };
+            L.volMuteRect = { vc.left + Scale(126, dpi), vy, vc.left + Scale(206, dpi), vy + Scale(26, dpi) };
+        }
+        int extraH = Scale(110, dpi);
+        int extraY = L.bodyY + 2 * cardH + gap + gap;
+        L.sysExtraCard = { margin, extraY, margin + bodyW, extraY + extraH };
+        {
+            int by = extraY + Scale(62, dpi);
+            L.brightMinusRect = { margin + Scale(14, dpi), by, margin + Scale(62, dpi), by + Scale(26, dpi) };
+            L.brightPlusRect = { margin + Scale(70, dpi), by, margin + Scale(118, dpi), by + Scale(26, dpi) };
+            L.brightRefreshRect = { margin + Scale(126, dpi), by, margin + Scale(226, dpi), by + Scale(26, dpi) };
+        }
+        bodyH = 2 * cardH + gap + gap + extraH;
     } else if (effTab == kTabClock) {
         int clockW = bodyW * 55 / 100;
         int worldW = bodyW - clockW - gap;
@@ -1317,11 +1466,65 @@ static Layout ComputeLayoutForTab(Notch* n, int clientW, int tab)
         L.shelfClearRect = { margin + Scale(14, dpi), L.shelfCard.bottom - Scale(30, dpi),
                              margin + Scale(110, dpi), L.shelfCard.bottom - Scale(8, dpi) };
         bodyH = cardH;
+    } else if (effTab == kTabTimer) {
+        // v8-continued TIMER: display, mode row, preset row,
+        // step row, action row. All mouse clicks, no typing.
+        int cardH = Scale(28, dpi) + Scale(52, dpi) + Scale(34, dpi) * 3 + Scale(34, dpi) + Scale(40, dpi);
+        L.timerCard = { margin, L.bodyY, margin + bodyW, L.bodyY + cardH };
+        int innerX = margin + Scale(14, dpi);
+        int innerW = bodyW - Scale(28, dpi);
+        int modeY = L.bodyY + Scale(28, dpi) + Scale(52, dpi);
+        int presetY = modeY + Scale(34, dpi) + Scale(8, dpi);
+        int stepY = presetY + Scale(34, dpi) + Scale(8, dpi);
+        int actY = stepY + Scale(34, dpi) + Scale(8, dpi);
+        for (int i = 0; i < 3; i++) {
+            int w = (innerW - 2 * gap) / 3;
+            int x = innerX + i * (w + gap);
+            L.timerModeRects[i] = { x, modeY, x + w, modeY + Scale(26, dpi) };
+        }
+        for (int i = 0; i < 4; i++) {
+            int w = (innerW - 3 * gap) / 4;
+            int x = innerX + i * (w + gap);
+            L.timerPresetRects[i] = { x, presetY, x + w, presetY + Scale(26, dpi) };
+        }
+        for (int i = 0; i < 4; i++) {
+            int w = (innerW - 3 * gap) / 4;
+            int x = innerX + i * (w + gap);
+            L.timerStepRects[i] = { x, stepY, x + w, stepY + Scale(26, dpi) };
+        }
+        L.timerStartRect = { innerX, actY, innerX + Scale(160, dpi), actY + Scale(26, dpi) };
+        L.timerResetRect = { innerX + Scale(168, dpi), actY, innerX + Scale(278, dpi), actY + Scale(26, dpi) };
+        bodyH = cardH;
+    } else if (effTab == kTabNotes) {
+        // v8-continued NOTES: 4 top buttons, 8 list rows.
+        // No typing: notes are created blank or from the
+        // clipboard, and edited in Notepad (see README).
+        int cardH = Scale(28, dpi) + Scale(34, dpi) + 8 * Scale(30, dpi) + Scale(12, dpi);
+        L.notesCard = { margin, L.bodyY, margin + bodyW, L.bodyY + cardH };
+        int topY = L.bodyY + Scale(28, dpi);
+        int topW[4] = { Scale(140, dpi), Scale(170, dpi), Scale(120, dpi), Scale(110, dpi) };
+        int tx = margin + Scale(14, dpi);
+        for (int i = 0; i < 4; i++) {
+            L.notesTopRects[i] = { tx, topY, tx + topW[i], topY + Scale(26, dpi) };
+            tx += topW[i] + Scale(8, dpi);
+        }
+        L.notesListY = topY + Scale(34, dpi);
+        L.notesRowH = Scale(30, dpi);
+        bodyH = cardH;
+    } else if (effTab == kTabScreen) {
+        // v8-continued SCREEN: 8 list rows, Reset today row.
+        int cardH = Scale(28, dpi) + 8 * Scale(30, dpi) + Scale(34, dpi);
+        L.screenCard = { margin, L.bodyY, margin + bodyW, L.bodyY + cardH };
+        L.screenListY = L.bodyY + Scale(28, dpi);
+        L.screenRowH = Scale(30, dpi);
+        L.screenResetRect = { margin + Scale(14, dpi), L.screenCard.bottom - Scale(30, dpi),
+                              margin + Scale(130, dpi), L.screenCard.bottom - Scale(8, dpi) };
+        bodyH = cardH;
     }
     // Bottom icon dock: centred pill, one icon per dock tab.
     L.dockH = Scale(56, dpi);
     L.dockY = L.bodyY + bodyH + Scale(8, dpi);
-    int dockIds[7];
+    int dockIds[10];
     int dc = DockIds(dockIds);
     L.dockCount = dc;
     int iconStep = Scale(48, dpi);
@@ -1361,7 +1564,7 @@ static void ShiftRectY(RECT& r, int dy)
 static Layout ComputeLayout(Notch* n, int clientW)
 {
     Layout L = ComputeLayoutForTab(n, clientW, EffectiveTab(n));
-    int ids[7];
+    int ids[10];
     int dc = DockIds(ids);
     int maxTotal = L.totalH;
     for (int i = 0; i < dc; i++) {
@@ -1372,7 +1575,7 @@ static Layout ComputeLayout(Notch* n, int clientW)
     if (delta <= 0) return L;
     int shift = delta / 2;
     for (int i = 0; i < L.homeCardCount; i++) ShiftRectY(L.homeCards[i], shift);
-    for (int i = 0; i < 8; i++) {
+    for (int i = 0; i < kHomeCardCount; i++) {
         ShiftRectY(L.homeEditCheckRects[i], shift);
         ShiftRectY(L.homeEditUpRects[i], shift);
         ShiftRectY(L.homeEditDownRects[i], shift);
@@ -1413,6 +1616,25 @@ static Layout ComputeLayout(Notch* n, int clientW)
     ShiftRectY(L.shelfCard, shift);
     L.shelfListY += shift;
     ShiftRectY(L.shelfClearRect, shift);
+    ShiftRectY(L.timerCard, shift);
+    for (int i = 0; i < 3; i++) ShiftRectY(L.timerModeRects[i], shift);
+    for (int i = 0; i < 4; i++) ShiftRectY(L.timerPresetRects[i], shift);
+    for (int i = 0; i < 4; i++) ShiftRectY(L.timerStepRects[i], shift);
+    ShiftRectY(L.timerStartRect, shift);
+    ShiftRectY(L.timerResetRect, shift);
+    ShiftRectY(L.notesCard, shift);
+    for (int i = 0; i < 4; i++) ShiftRectY(L.notesTopRects[i], shift);
+    L.notesListY += shift;
+    ShiftRectY(L.screenCard, shift);
+    L.screenListY += shift;
+    ShiftRectY(L.screenResetRect, shift);
+    ShiftRectY(L.sysExtraCard, shift);
+    ShiftRectY(L.volMinusRect, shift);
+    ShiftRectY(L.volPlusRect, shift);
+    ShiftRectY(L.volMuteRect, shift);
+    ShiftRectY(L.brightMinusRect, shift);
+    ShiftRectY(L.brightPlusRect, shift);
+    ShiftRectY(L.brightRefreshRect, shift);
     L.dockY += delta;
     ShiftRectY(L.dockPill, delta);
     for (int i = 0; i < L.dockCount; i++) ShiftRectY(L.dockRects[i], delta);
@@ -1661,6 +1883,8 @@ static void ShowTrayMenuAt(POINT pt, UINT alignFlags)
     AppendCheck(menu, ID_TRAY_WIDGET_CALENDAR, L"Widget: Calendar", g_widgetCalendar);
     AppendCheck(menu, ID_TRAY_CLIPBOARD, L"Clipboard history", g_clipEnabled);
     AppendCheck(menu, ID_TRAY_SHELF, L"File shelf", g_shelfEnabled);
+    AppendCheck(menu, ID_TRAY_SCREEN_TIME, L"Screen time", g_screenTimeEnabled);
+    AppendCheck(menu, ID_TRAY_KEEP_CLIP, L"Keep clipboard history after quit", g_keepClipboard);
     AppendCheck(menu, ID_TRAY_HOME_EDIT, L"Customize Home page", g_homeEdit);
     AppendCheck(menu, ID_TRAY_ANIMATIONS, L"Animations", g_animations);
     AppendCheck(menu, ID_TRAY_BLUR, L"Blur background (experimental)", g_blurEnabled);
@@ -2655,7 +2879,7 @@ static bool HomeEditHitAt(Notch* n, int px, int py, bool usePaint, int& rowOut, 
     Layout L = ComputeLayout(n, rc.right);
     if (px >= L.homeEditDoneRect.left && px < L.homeEditDoneRect.right &&
         py >= L.homeEditDoneRect.top && py < L.homeEditDoneRect.bottom) { partOut = 3; rowOut = -1; return true; }
-    for (int i = 0; i < 8; i++) {
+    for (int i = 0; i < kHomeCardCount; i++) {
         RECT cr = L.homeEditCheckRects[i];
         if (px >= cr.left && px < cr.right && py >= cr.top && py < cr.bottom) { partOut = 0; rowOut = i; return true; }
         RECT up = L.homeEditUpRects[i];
@@ -2663,6 +2887,104 @@ static bool HomeEditHitAt(Notch* n, int px, int py, bool usePaint, int& rowOut, 
         RECT dn = L.homeEditDownRects[i];
         if (px >= dn.left && px < dn.right && py >= dn.top && py < dn.bottom) { partOut = 2; rowOut = i; return true; }
     }
+    return false;
+}
+
+// ---------- v8-continued hit tests (share ComputeLayout) ----------
+// Timer: part 0 mode, 1 preset, 2 step, 3 start/pause, 4 reset.
+// itemOut is the button index for parts 0-2, -1 otherwise.
+// Notes: part 0 row (no action), 1 pin, 2 open, 3 delete,
+// 4 new blank, 5 from clipboard, 6 reload all, 7 clear all.
+// Screen: part 3 reset only; rows have no action.
+// Volume: part 0 minus, 1 plus, 2 mute. Brightness: 0 minus,
+// 1 plus, 2 refresh. All only while expanded on their tab.
+static bool TimerHitAt(Notch* n, int px, int py, bool usePaint, int& itemOut, int& partOut)
+{
+    if (usePaint ? !n->paintExpanded : !n->expanded) return false;
+    if (EffectiveTab(n) != kTabTimer) return false;
+    RECT rc; GetClientRect(n->hwnd, &rc);
+    Layout L = ComputeLayout(n, rc.right);
+    for (int i = 0; i < 3; i++) {
+        RECT r = L.timerModeRects[i];
+        if (px >= r.left && px < r.right && py >= r.top && py < r.bottom) { partOut = 0; itemOut = i; return true; }
+    }
+    for (int i = 0; i < 4; i++) {
+        RECT r = L.timerPresetRects[i];
+        if (px >= r.left && px < r.right && py >= r.top && py < r.bottom) { partOut = 1; itemOut = i; return true; }
+    }
+    for (int i = 0; i < 4; i++) {
+        RECT r = L.timerStepRects[i];
+        if (px >= r.left && px < r.right && py >= r.top && py < r.bottom) { partOut = 2; itemOut = i; return true; }
+    }
+    if (px >= L.timerStartRect.left && px < L.timerStartRect.right && py >= L.timerStartRect.top && py < L.timerStartRect.bottom) { partOut = 3; itemOut = -1; return true; }
+    if (px >= L.timerResetRect.left && px < L.timerResetRect.right && py >= L.timerResetRect.top && py < L.timerResetRect.bottom) { partOut = 4; itemOut = -1; return true; }
+    return false;
+}
+static bool NotesHitAt(Notch* n, int px, int py, bool usePaint, int& itemOut, int& partOut)
+{
+    if (usePaint ? !n->paintExpanded : !n->expanded) return false;
+    if (EffectiveTab(n) != kTabNotes) return false;
+    RECT rc; GetClientRect(n->hwnd, &rc);
+    Layout L = ComputeLayout(n, rc.right);
+    for (int i = 0; i < 4; i++) {
+        RECT r = L.notesTopRects[i];
+        if (px >= r.left && px < r.right && py >= r.top && py < r.bottom) { partOut = 4 + i; itemOut = -1; return true; }
+    }
+    // Display order is pinned first (same as paint); the
+    // returned itemOut is a STORAGE index, not a row index.
+    std::vector<int> disp;
+    for (int pass = 0; pass < 2; pass++) for (size_t i = 0; i < g_notes.size(); i++) if ((pass == 0) == g_notes[i].pinned) disp.push_back((int)i);
+    for (int row = 0; row < 8; row++) {
+        int di = n->noteScroll + row;
+        if (di < 0 || di >= (int)disp.size()) break;
+        int storageIdx = disp[di];
+        int y0 = L.notesListY + row * L.notesRowH;
+        int y1 = y0 + L.notesRowH;
+        if (py < y0 || py >= y1) continue;
+        if (px < L.notesCard.left + 14 || px >= L.notesCard.right - 14) return false;
+        int delL = L.notesCard.right - 14 - 24;
+        int openL = delL - 6 - 48;
+        int pinL = openL - 6 - 44;
+        if (px >= delL) { partOut = 3; itemOut = storageIdx; return true; }
+        if (px >= openL) { partOut = 2; itemOut = storageIdx; return true; }
+        if (px >= pinL) { partOut = 1; itemOut = storageIdx; return true; }
+        partOut = 0; itemOut = storageIdx; return true;
+    }
+    return false;
+}
+static bool ScreenHitAt(Notch* n, int px, int py, bool usePaint, int& itemOut, int& partOut)
+{
+    if (!g_screenTimeEnabled) return false;
+    if (usePaint ? !n->paintExpanded : !n->expanded) return false;
+    if (EffectiveTab(n) != kTabScreen) return false;
+    RECT rc; GetClientRect(n->hwnd, &rc);
+    Layout L = ComputeLayout(n, rc.right);
+    if (px >= L.screenResetRect.left && px < L.screenResetRect.right &&
+        py >= L.screenResetRect.top && py < L.screenResetRect.bottom) { partOut = 3; itemOut = -1; return true; }
+    return false;
+}
+static bool VolHitAt(Notch* n, int px, int py, bool usePaint, int& partOut)
+{
+    if (!g_widgetStats) return false;
+    if (usePaint ? !n->paintExpanded : !n->expanded) return false;
+    if (EffectiveTab(n) != kTabSystem) return false;
+    RECT rc; GetClientRect(n->hwnd, &rc);
+    Layout L = ComputeLayout(n, rc.right);
+    if (px >= L.volMinusRect.left && px < L.volMinusRect.right && py >= L.volMinusRect.top && py < L.volMinusRect.bottom) { partOut = 0; return true; }
+    if (px >= L.volPlusRect.left && px < L.volPlusRect.right && py >= L.volPlusRect.top && py < L.volPlusRect.bottom) { partOut = 1; return true; }
+    if (px >= L.volMuteRect.left && px < L.volMuteRect.right && py >= L.volMuteRect.top && py < L.volMuteRect.bottom) { partOut = 2; return true; }
+    return false;
+}
+static bool BrightHitAt(Notch* n, int px, int py, bool usePaint, int& partOut)
+{
+    if (!g_widgetStats) return false;
+    if (usePaint ? !n->paintExpanded : !n->expanded) return false;
+    if (EffectiveTab(n) != kTabSystem) return false;
+    RECT rc; GetClientRect(n->hwnd, &rc);
+    Layout L = ComputeLayout(n, rc.right);
+    if (px >= L.brightMinusRect.left && px < L.brightMinusRect.right && py >= L.brightMinusRect.top && py < L.brightMinusRect.bottom) { partOut = 0; return true; }
+    if (px >= L.brightPlusRect.left && px < L.brightPlusRect.right && py >= L.brightPlusRect.top && py < L.brightPlusRect.bottom) { partOut = 1; return true; }
+    if (px >= L.brightRefreshRect.left && px < L.brightRefreshRect.right && py >= L.brightRefreshRect.top && py < L.brightRefreshRect.bottom) { partOut = 2; return true; }
     return false;
 }
 
@@ -2709,7 +3031,36 @@ class SimpleDataObject : public IDataObject {
     std::vector<FORMATETC> m_fmts;
     std::wstring m_text;
     std::vector<std::wstring> m_files;
-    bool m_hasText = false, m_hasFiles = false;
+    HBITMAP m_bitmap = NULL; // v8-continued: image drag-out (thumbnail only)
+    bool m_hasText = false, m_hasFiles = false, m_hasBitmap = false;
+    static HGLOBAL MakeDibGlobal(HBITMAP bmp)
+    {
+        // CF_DIB from a bitmap: 32-bit BITMAPINFOHEADER + pixels.
+        // Bottom-up (positive height) so targets read it as-is.
+        BITMAP bm = { 0 };
+        if (!bmp || GetObjectW(bmp, sizeof(bm), &bm) == 0) return NULL;
+        if (bm.bmWidth <= 0 || bm.bmHeight <= 0) return NULL;
+        BITMAPINFOHEADER hdr = { 0 };
+        hdr.biSize = sizeof(BITMAPINFOHEADER);
+        hdr.biWidth = bm.bmWidth;
+        hdr.biHeight = bm.bmHeight;
+        hdr.biPlanes = 1;
+        hdr.biBitCount = 32;
+        hdr.biCompression = BI_RGB;
+        size_t pixBytes = (size_t)bm.bmWidth * (size_t)bm.bmHeight * 4;
+        HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, sizeof(BITMAPINFOHEADER) + pixBytes);
+        if (!h) return NULL;
+        BYTE* base = (BYTE*)GlobalLock(h);
+        if (!base) { GlobalFree(h); return NULL; }
+        memcpy(base, &hdr, sizeof(hdr));
+        HDC dc = CreateCompatibleDC(NULL);
+        if (!dc) { GlobalUnlock(h); GlobalFree(h); return NULL; }
+        BITMAPINFO bi = { 0 }; bi.bmiHeader = hdr;
+        GetDIBits(dc, bmp, 0, (UINT)bm.bmHeight, base + sizeof(BITMAPINFOHEADER), &bi, DIB_RGB_COLORS);
+        DeleteDC(dc);
+        GlobalUnlock(h);
+        return h;
+    }
     static HGLOBAL MakeTextGlobal(const std::wstring& t) {
         size_t bytes = (t.size() + 1) * sizeof(wchar_t);
         HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, bytes);
@@ -2742,7 +3093,7 @@ class SimpleDataObject : public IDataObject {
         return h;
     }
 public:
-    SimpleDataObject(const std::wstring& text, const std::vector<std::wstring>& files) : m_text(text), m_files(files) {
+    SimpleDataObject(const std::wstring& text, const std::vector<std::wstring>& files, HBITMAP bitmap = NULL) : m_text(text), m_files(files) {
         if (!text.empty()) {
             FORMATETC fe = { 0 }; fe.cfFormat = CF_UNICODETEXT; fe.dwAspect = DVASPECT_CONTENT; fe.lindex = -1; fe.tymed = TYMED_HGLOBAL;
             m_fmts.push_back(fe); m_hasText = true;
@@ -2751,7 +3102,20 @@ public:
             FORMATETC fe = { 0 }; fe.cfFormat = CF_HDROP; fe.dwAspect = DVASPECT_CONTENT; fe.lindex = -1; fe.tymed = TYMED_HGLOBAL;
             m_fmts.push_back(fe); m_hasFiles = true;
         }
+        if (bitmap) {
+            // Own a copy: the source thumbnail may be freed while
+            // the target is still reading the drag data.
+            m_bitmap = (HBITMAP)CopyImage(bitmap, IMAGE_BITMAP, 0, 0, LR_CREATEDIBSECTION);
+            if (m_bitmap) {
+                FORMATETC fe = { 0 }; fe.cfFormat = CF_BITMAP; fe.dwAspect = DVASPECT_CONTENT; fe.lindex = -1; fe.tymed = TYMED_GDI;
+                m_fmts.push_back(fe);
+                FORMATETC fe2 = { 0 }; fe2.cfFormat = CF_DIB; fe2.dwAspect = DVASPECT_CONTENT; fe2.lindex = -1; fe2.tymed = TYMED_HGLOBAL;
+                m_fmts.push_back(fe2);
+                m_hasBitmap = true;
+            }
+        }
     }
+    ~SimpleDataObject() { if (m_bitmap) DeleteObject(m_bitmap); }
     STDMETHODIMP QueryInterface(REFIID riid, void** ppv) {
         if (!ppv) return E_POINTER;
         if (riid == IID_IUnknown || riid == IID_IDataObject) { *ppv = static_cast<IDataObject*>(this); AddRef(); return S_OK; }
@@ -2769,6 +3133,18 @@ public:
         }
         if (pfe->cfFormat == CF_HDROP && m_hasFiles && (pfe->tymed & TYMED_HGLOBAL)) {
             HGLOBAL h = MakeFilesGlobal(m_files);
+            if (!h) return E_OUTOFMEMORY;
+            pmed->tymed = TYMED_HGLOBAL; pmed->hGlobal = h; pmed->pUnkForRelease = NULL;
+            return S_OK;
+        }
+        if (pfe->cfFormat == CF_BITMAP && m_hasBitmap && (pfe->tymed & TYMED_GDI)) {
+            HBITMAP copy = (HBITMAP)CopyImage(m_bitmap, IMAGE_BITMAP, 0, 0, LR_CREATEDIBSECTION);
+            if (!copy) return E_OUTOFMEMORY;
+            pmed->tymed = TYMED_GDI; pmed->hBitmap = copy; pmed->pUnkForRelease = NULL;
+            return S_OK;
+        }
+        if (pfe->cfFormat == CF_DIB && m_hasBitmap && (pfe->tymed & TYMED_HGLOBAL)) {
+            HGLOBAL h = MakeDibGlobal(m_bitmap);
             if (!h) return E_OUTOFMEMORY;
             pmed->tymed = TYMED_HGLOBAL; pmed->hGlobal = h; pmed->pUnkForRelease = NULL;
             return S_OK;
@@ -2818,6 +3194,563 @@ static void DoDragTextOrFiles(const std::wstring& text, const std::vector<std::w
     DoDragDrop(obj, src, DROPEFFECT_COPY, &effect);
     obj->Release();
     src->Release();
+}
+static void DoDragImage(HBITMAP thumb)
+{
+    // v8-continued: drag-out for images, with the same honest
+    // limit as copy-back: the dragged image is the stored
+    // thumbnail (max 256 px), never the original full image.
+    if (!thumb) return;
+    SimpleDataObject* obj = new SimpleDataObject(std::wstring(), std::vector<std::wstring>(), thumb);
+    SimpleDropSource* src = new SimpleDropSource();
+    DWORD effect = 0;
+    DoDragDrop(obj, src, DROPEFFECT_COPY, &effect);
+    obj->Release();
+    src->Release();
+}
+
+// ===========================================================================
+// v8-continued implementations: notes, screen time, brightness, DPAPI.
+// Timer state/format helpers live with the globals (they are needed
+// by the collapsed paint path too); TimerUpdate is called from the
+// manager 1-second timer. None of this touches the network.
+// ===========================================================================
+static bool GetNotesPath(wchar_t* out, size_t count)
+{
+    if (!GetOnyxSettingsDir(out, count)) return false;
+    if (wcscat_s(out, count, L"\\notes.ini") != 0) return false;
+    return true;
+}
+static bool GetScreenPath(wchar_t* out, size_t count)
+{
+    if (!GetOnyxSettingsDir(out, count)) return false;
+    if (wcscat_s(out, count, L"\\screentime.ini") != 0) return false;
+    return true;
+}
+static bool GetClipPersistPath(wchar_t* out, size_t count)
+{
+    if (!GetOnyxSettingsDir(out, count)) return false;
+    if (wcscat_s(out, count, L"\\clipboard.dat") != 0) return false;
+    return true;
+}
+static void ScreenDayNow(wchar_t* out, size_t count)
+{
+    SYSTEMTIME st; GetLocalTime(&st);
+    swprintf(out, count, L"%04d-%02d-%02d", st.wYear, st.wMonth, st.wDay);
+}
+// --- Notes: notes.ini format, one [note] section per note:
+// [note]
+// pinned=0
+// text=<first line>
+// text=<next line>
+// (blank line ends the section). Text lines are stored as-is;
+// a line that literally starts with "text=" is still a text line
+// because it follows the pinned= line inside a section, and the
+// loader only treats a line as a header when it is exactly
+// "[note]". Notes are UTF-8 on disk, like shelf.ini.
+static void SaveNotes()
+{
+    wchar_t dir[MAX_PATH] = { 0 }, path[MAX_PATH] = { 0 };
+    if (!GetOnyxSettingsDir(dir, MAX_PATH)) return;
+    if (!GetNotesPath(path, MAX_PATH)) return;
+    CreateDirectoryW(dir, NULL);
+    HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return;
+    DWORD w = 0;
+    for (size_t i = 0; i < g_notes.size(); i++) {
+        char head[64];
+        int hl = sprintf_s(head, sizeof(head), "[note]\r\npinned=%d\r\n", g_notes[i].pinned ? 1 : 0);
+        if (hl > 0) WriteFile(h, head, (DWORD)hl, &w, NULL);
+        // Split the note text on newlines; each line becomes one
+        // text= line. A trailing newline does not add a phantom
+        // empty line at the end of the note.
+        std::wstring t = g_notes[i].text;
+        size_t pos = 0;
+        while (true) {
+            size_t nl = t.find(L'\n', pos);
+            std::wstring line = (nl == std::wstring::npos) ? t.substr(pos) : t.substr(pos, nl - pos);
+            if (!line.empty() && line.back() == L'\r') line.pop_back();
+            char mb[4096];
+            int n = WideCharToMultiByte(CP_UTF8, 0, line.c_str(), -1, mb, (int)sizeof(mb) - 8, NULL, NULL);
+            if (n > 0) {
+                char out[4200];
+                int ol = sprintf_s(out, sizeof(out), "text=%s\r\n", mb);
+                if (ol > 0) WriteFile(h, out, (DWORD)ol, &w, NULL);
+            }
+            if (nl == std::wstring::npos) break;
+            pos = nl + 1;
+            if (pos >= t.size()) break;
+        }
+        WriteFile(h, "\r\n", 2, &w, NULL);
+    }
+    CloseHandle(h);
+}
+static void LoadNotes()
+{
+    g_notes.clear();
+    wchar_t path[MAX_PATH] = { 0 };
+    if (!GetNotesPath(path, MAX_PATH)) return;
+    HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return;
+    char buf[65536]; DWORD read = 0;
+    BOOL ok = ReadFile(h, buf, (DWORD)sizeof(buf) - 1, &read, NULL);
+    CloseHandle(h);
+    if (!ok) return;
+    buf[read] = '\0';
+    NoteItem cur; bool inNote = false;
+    char* p = buf;
+    while (*p) {
+        char* e = p; while (*e && *e != '\n') e++;
+        char saved = *e; *e = '\0';
+        while (*p == ' ' || *p == '\t' || *p == '\r') p++;
+        char* end = p + strlen(p);
+        while (end > p && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\r')) { end--; *end = '\0'; }
+        if (strcmp(p, "[note]") == 0) {
+            if (inNote) g_notes.push_back(cur);
+            cur = NoteItem(); inNote = true;
+        } else if (inNote && strncmp(p, "pinned=", 7) == 0) {
+            cur.pinned = (strcmp(p + 7, "1") == 0);
+        } else if (inNote && strncmp(p, "text=", 5) == 0) {
+            wchar_t wp[4096];
+            if (MultiByteToWideChar(CP_UTF8, 0, p + 5, -1, wp, 4096) > 0) {
+                if (!cur.text.empty()) cur.text += L"\r\n";
+                cur.text += wp;
+            }
+        }
+        if (saved == '\0') break;
+        p = e + 1;
+    }
+    if (inNote) g_notes.push_back(cur);
+}
+static std::wstring NoteFirstLine(const NoteItem& nt)
+{
+    size_t nl = nt.text.find(L'\n');
+    std::wstring line = (nl == std::wstring::npos) ? nt.text : nt.text.substr(0, nl);
+    if (!line.empty() && line.back() == L'\r') line.pop_back();
+    if (line.empty()) line = L"(empty note)";
+    return line;
+}
+static bool NoteAddFromClipboard()
+{
+    // Creation path that needs no typing: the latest clipboard
+    // text/link item becomes a note. If clipboard history is off
+    // or the latest item is not text, nothing is created.
+    if (g_clipItems.empty()) return false;
+    ClipItem& it = g_clipItems[0];
+    if ((it.type != 0 && it.type != 3) || it.text.empty()) return false;
+    NoteItem nt; nt.text = it.text; nt.pinned = false;
+    g_notes.insert(g_notes.begin(), nt);
+    return true;
+}
+static bool GetNoteEditPath(int idx, wchar_t* out, size_t count)
+{
+    if (!GetOnyxSettingsDir(out, count)) return false;
+    wchar_t tail[64];
+    swprintf(tail, 64, L"\\notes-edit-%d.txt", idx);
+    if (wcscat_s(out, count, tail) != 0) return false;
+    return true;
+}
+static void NoteOpenInNotepad(int idx)
+{
+    if (idx < 0 || idx >= (int)g_notes.size()) return;
+    wchar_t dir[MAX_PATH] = { 0 }, path[MAX_PATH] = { 0 };
+    if (!GetOnyxSettingsDir(dir, MAX_PATH)) return;
+    if (!GetNoteEditPath(idx, path, MAX_PATH)) return;
+    CreateDirectoryW(dir, NULL);
+    HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return;
+    // UTF-8 with BOM so Notepad reads non-ASCII text correctly.
+    DWORD w = 0;
+    unsigned char bom[3] = { 0xEF, 0xBB, 0xBF };
+    WriteFile(h, bom, 3, &w, NULL);
+    char mb[16384];
+    int n = WideCharToMultiByte(CP_UTF8, 0, g_notes[idx].text.c_str(), -1, mb, (int)sizeof(mb) - 3, NULL, NULL);
+    if (n > 0) WriteFile(h, mb, (DWORD)strlen(mb), &w, NULL);
+    CloseHandle(h);
+    ShellExecuteW(NULL, L"open", L"notepad.exe", path, NULL, SW_SHOWNORMAL);
+}
+static void ReloadNotesFromEditFiles()
+{
+    // Re-read every notes-edit-N.txt that exists, replacing that
+    // note's text. Notes with no edit file are untouched.
+    for (int i = 0; i < (int)g_notes.size(); i++) {
+        wchar_t path[MAX_PATH] = { 0 };
+        if (!GetNoteEditPath(i, path, MAX_PATH)) continue;
+        HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (h == INVALID_HANDLE_VALUE) continue;
+        char buf[16384]; DWORD read = 0;
+        BOOL ok = ReadFile(h, buf, (DWORD)sizeof(buf) - 1, &read, NULL);
+        CloseHandle(h);
+        if (!ok) continue;
+        buf[read] = '\0';
+        char* start = buf;
+        if (read >= 3 && (unsigned char)buf[0] == 0xEF && (unsigned char)buf[1] == 0xBB && (unsigned char)buf[2] == 0xBF) start = buf + 3;
+        wchar_t wp[8192];
+        if (MultiByteToWideChar(CP_UTF8, 0, start, -1, wp, 8192) > 0) g_notes[i].text = wp;
+    }
+}
+// --- Screen time: screentime.ini, UTF-8:
+// day=YYYY-MM-DD
+// <exe>\t<seconds>
+// <exe>\t<seconds>
+// Exe names only, never window titles. Corrupt lines ignored.
+static void SaveScreenTime()
+{
+    wchar_t dir[MAX_PATH] = { 0 }, path[MAX_PATH] = { 0 };
+    if (!GetOnyxSettingsDir(dir, MAX_PATH)) return;
+    if (!GetScreenPath(path, MAX_PATH)) return;
+    CreateDirectoryW(dir, NULL);
+    HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return;
+    DWORD w = 0;
+    wchar_t day[16]; ScreenDayNow(day, 16);
+    char head[64];
+    int hl = sprintf_s(head, sizeof(head), "day=%ls\r\n", day);
+    // %ls in a narrow sprintf_s with a wide day string is not
+    // portable, so build the header from the narrow day instead.
+    if (hl <= 0) { CloseHandle(h); return; }
+    // Rewrite the header safely: day is ASCII digits and dashes.
+    char dayMb[16] = { 0 };
+    WideCharToMultiByte(CP_UTF8, 0, day, -1, dayMb, 16, NULL, NULL);
+    hl = sprintf_s(head, sizeof(head), "day=%s\r\n", dayMb);
+    if (hl > 0) WriteFile(h, head, (DWORD)hl, &w, NULL);
+    for (size_t i = 0; i < g_screenApps.size(); i++) {
+        char mb[512];
+        int n = WideCharToMultiByte(CP_UTF8, 0, g_screenApps[i].exe.c_str(), -1, mb, (int)sizeof(mb) - 32, NULL, NULL);
+        if (n <= 0) continue;
+        char line[560];
+        int ll = sprintf_s(line, sizeof(line), "%s\t%llu\r\n", mb, g_screenApps[i].seconds);
+        if (ll > 0) WriteFile(h, line, (DWORD)ll, &w, NULL);
+    }
+    CloseHandle(h);
+}
+static void LoadScreenTime()
+{
+    g_screenApps.clear();
+    wchar_t today[16]; ScreenDayNow(today, 16);
+    wchar_t path[MAX_PATH] = { 0 };
+    if (!GetScreenPath(path, MAX_PATH)) return;
+    HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) { wcscpy_s(g_screenDay, 16, today); return; }
+    char buf[16384]; DWORD read = 0;
+    BOOL ok = ReadFile(h, buf, (DWORD)sizeof(buf) - 1, &read, NULL);
+    CloseHandle(h);
+    if (!ok) { wcscpy_s(g_screenDay, 16, today); return; }
+    buf[read] = '\0';
+    char* p = buf;
+    bool firstLine = true;
+    while (*p) {
+        char* e = p; while (*e && *e != '\n') e++;
+        char saved = *e; *e = '\0';
+        while (*p == ' ' || *p == '\t' || *p == '\r') p++;
+        char* end = p + strlen(p);
+        while (end > p && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\r')) { end--; *end = '\0'; }
+        if (firstLine && strncmp(p, "day=", 4) == 0) {
+            wchar_t wp[16];
+            if (MultiByteToWideChar(CP_UTF8, 0, p + 4, -1, wp, 16) > 0) wcscpy_s(g_screenDay, 16, wp);
+            firstLine = false;
+        } else if (*p) {
+            firstLine = false;
+            char* tab = strchr(p, '\t');
+            if (tab) {
+                *tab = '\0';
+                unsigned long long secs = strtoull(tab + 1, NULL, 10);
+                wchar_t wp[256];
+                if (MultiByteToWideChar(CP_UTF8, 0, p, -1, wp, 256) > 0 && g_screenApps.size() < 64) {
+                    ScreenApp app; app.exe = wp; app.seconds = secs;
+                    g_screenApps.push_back(app);
+                }
+            }
+        }
+        if (saved == '\0') break;
+        p = e + 1;
+    }
+    // A new day means a fresh list, whatever the file held.
+    if (wcscmp(g_screenDay, today) != 0) {
+        g_screenApps.clear();
+        wcscpy_s(g_screenDay, 16, today);
+    }
+}
+static void SampleScreenTime()
+{
+    if (!g_screenTimeEnabled) return;
+    wchar_t today[16]; ScreenDayNow(today, 16);
+    if (g_screenDay[0] != L'\0' && wcscmp(g_screenDay, today) != 0) {
+        g_screenApps.clear();
+        wcscpy_s(g_screenDay, 16, today);
+        SaveScreenTime();
+    }
+    if (g_screenDay[0] == L'\0') wcscpy_s(g_screenDay, 16, today);
+    HWND fg = GetForegroundWindow();
+    if (!fg) return;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(fg, &pid);
+    if (!pid) return;
+    HANDLE hp = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!hp) return;
+    wchar_t path[MAX_PATH] = { 0 };
+    DWORD len = MAX_PATH;
+    BOOL ok = QueryFullProcessImageNameW(hp, 0, path, &len);
+    CloseHandle(hp);
+    if (!ok) return;
+    std::wstring exe = FileNameOf(path);
+    if (exe.empty()) return;
+    std::wstring lower = exe;
+    for (size_t i = 0; i < lower.size(); i++) if (lower[i] >= L'A' && lower[i] <= L'Z') lower[i] = (wchar_t)(lower[i] + 32);
+    if (lower == L"onyxnotch.exe") return; // never count our own notch
+    for (size_t i = 0; i < g_screenApps.size(); i++) {
+        std::wstring have = g_screenApps[i].exe;
+        for (size_t k = 0; k < have.size(); k++) if (have[k] >= L'A' && have[k] <= L'Z') have[k] = (wchar_t)(have[k] + 32);
+        if (have == lower) { g_screenApps[i].seconds += 1; return; }
+    }
+    if (g_screenApps.size() < 64) {
+        ScreenApp app; app.exe = exe; app.seconds = 1;
+        g_screenApps.push_back(app);
+    }
+}
+// --- Brightness via WMI (root\WMI). Best effort everywhere: any
+// failure leaves g_brightOk false and the UI shows Unavailable.
+// No gamma-ramp hacks. Called on System-tab switch and on the
+// brightness buttons, never per paint frame.
+static void RefreshBrightness()
+{
+    g_brightOk = false;
+    IWbemLocator* loc = NULL;
+    HRESULT hr = CoCreateInstance(CLSID_WbemLocator, NULL, CLSCTX_INPROC_SERVER, IID_IWbemLocator, (LPVOID*)&loc);
+    if (FAILED(hr) || !loc) return;
+    IWbemServices* svc = NULL;
+    BSTR ns = SysAllocString(L"ROOT\\WMI");
+    hr = loc->ConnectServer(ns, NULL, NULL, NULL, 0, NULL, NULL, &svc);
+    SysFreeString(ns);
+    loc->Release();
+    if (FAILED(hr) || !svc) return;
+    BSTR lang = SysAllocString(L"WQL");
+    BSTR query = SysAllocString(L"SELECT CurrentBrightness FROM WmiMonitorBrightness");
+    IEnumWbemClassObject* en = NULL;
+    hr = svc->ExecQuery(lang, query, WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY, NULL, &en);
+    SysFreeString(lang); SysFreeString(query);
+    if (SUCCEEDED(hr) && en) {
+        IWbemClassObject* obj = NULL; ULONG ret = 0;
+        if (SUCCEEDED(en->Next(WBEM_INFINITE, 1, &obj, &ret)) && ret == 1 && obj) {
+            VARIANT v; VariantInit(&v);
+            if (SUCCEEDED(obj->Get(L"CurrentBrightness", 0, &v, NULL, NULL))) {
+                if (v.vt == VT_UI1) { g_brightPercent = (int)v.bVal; g_brightOk = true; }
+                else if (v.vt == VT_I4) { g_brightPercent = (int)v.lVal; g_brightOk = true; }
+                else if (v.vt == VT_UI4) { g_brightPercent = (int)v.ulVal; g_brightOk = true; }
+                if (g_brightPercent < 0) g_brightPercent = 0;
+                if (g_brightPercent > 100) g_brightPercent = 100;
+            }
+            VariantClear(&v);
+            obj->Release();
+        }
+        en->Release();
+    }
+    svc->Release();
+}
+static bool SetBrightness(int pct)
+{
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    IWbemLocator* loc = NULL;
+    HRESULT hr = CoCreateInstance(CLSID_WbemLocator, NULL, CLSCTX_INPROC_SERVER, IID_IWbemLocator, (LPVOID*)&loc);
+    if (FAILED(hr) || !loc) return false;
+    IWbemServices* svc = NULL;
+    BSTR ns = SysAllocString(L"ROOT\\WMI");
+    hr = loc->ConnectServer(ns, NULL, NULL, NULL, 0, NULL, NULL, &svc);
+    SysFreeString(ns);
+    loc->Release();
+    if (FAILED(hr) || !svc) return false;
+    BSTR lang = SysAllocString(L"WQL");
+    BSTR query = SysAllocString(L"SELECT * FROM WmiMonitorBrightnessMethods");
+    IEnumWbemClassObject* en = NULL;
+    hr = svc->ExecQuery(lang, query, WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY, NULL, &en);
+    SysFreeString(lang); SysFreeString(query);
+    bool done = false;
+    if (SUCCEEDED(hr) && en) {
+        IWbemClassObject* obj = NULL; ULONG ret = 0;
+        if (SUCCEEDED(en->Next(WBEM_INFINITE, 1, &obj, &ret)) && ret == 1 && obj) {
+            VARIANT pathV; VariantInit(&pathV);
+            if (SUCCEEDED(obj->Get(L"__PATH", 0, &pathV, NULL, NULL)) && pathV.vt == VT_BSTR) {
+                // GetMethod lives on the CLASS object, not the
+                // instance: fetch the class, then its method.
+                IWbemClassObject* clsObj = NULL;
+                IWbemClassObject* meth = NULL;
+                if (SUCCEEDED(svc->GetObject(L"WmiMonitorBrightnessMethods", 0, NULL, &clsObj, NULL)) && clsObj) {
+                    if (FAILED(clsObj->GetMethod(L"WmiSetBrightness", 0, &meth, NULL))) meth = NULL;
+                    clsObj->Release();
+                }
+                if (meth) {
+                    IWbemClassObject* in = NULL;
+                    if (SUCCEEDED(meth->SpawnInstance(0, &in)) && in) {
+                        VARIANT bv; VariantInit(&bv); bv.vt = VT_UI1; bv.bVal = (BYTE)pct;
+                        in->Put(L"Brightness", 0, &bv, 0); VariantClear(&bv);
+                        VARIANT tv; VariantInit(&tv); tv.vt = VT_UI4; tv.ulVal = 0;
+                        in->Put(L"Timeout", 0, &tv, 0); VariantClear(&tv);
+                        IWbemClassObject* out = NULL;
+                        BSTR mName = SysAllocString(L"WmiSetBrightness");
+                        if (SUCCEEDED(svc->ExecMethod(pathV.bstrVal, mName, 0, NULL, in, &out, NULL))) {
+                            done = true;
+                            if (out) out->Release();
+                        }
+                        SysFreeString(mName);
+                        in->Release();
+                    }
+                    meth->Release();
+                }
+            }
+            VariantClear(&pathV);
+            obj->Release();
+        }
+        en->Release();
+    }
+    svc->Release();
+    if (done) { g_brightPercent = pct; g_brightOk = true; }
+    return done;
+}
+// --- Clipboard persistence via DPAPI (user scope).
+// Payload (UTF-8, in memory only until protected):
+// ITEM <type> <pinned> <truncated>
+// L <escaped text line>   (text/link items, one L per line)
+// P <file path>           (file items, one P per path)
+// END
+// Escapes in L lines: backslash -> \\, newline is the line break
+// itself, so no other escaping is needed. Images are NEVER
+// persisted (thumbnails only, in memory). On any decrypt/parse
+// failure the file is dropped and history starts empty.
+static std::string ClipPersistEscape(const std::wstring& line)
+{
+    std::string out;
+    char mb[4096];
+    int n = WideCharToMultiByte(CP_UTF8, 0, line.c_str(), -1, mb, (int)sizeof(mb) - 8, NULL, NULL);
+    if (n <= 0) return out;
+    for (char* q = mb; *q; q++) {
+        if (*q == '\\') out += "\\\\";
+        else out += *q;
+    }
+    return out;
+}
+static void SaveClipPersist()
+{
+    if (!g_keepClipboard) return;
+    std::string payload;
+    for (size_t i = 0; i < g_clipItems.size(); i++) {
+        ClipItem& it = g_clipItems[i];
+        if (it.type == 1) continue; // images never persisted
+        char head[64];
+        int hl = sprintf_s(head, sizeof(head), "ITEM %d %d %d\n", it.type, it.pinned ? 1 : 0, it.truncated ? 1 : 0);
+        if (hl > 0) payload += head;
+        if (it.type == 2) {
+            for (size_t k = 0; k < it.files.size(); k++) {
+                payload += "P ";
+                payload += ClipPersistEscape(it.files[k]);
+                payload += "\n";
+            }
+        } else {
+            size_t pos = 0;
+            while (true) {
+                size_t nl = it.text.find(L'\n', pos);
+                std::wstring line = (nl == std::wstring::npos) ? it.text.substr(pos) : it.text.substr(pos, nl - pos);
+                if (!line.empty() && line.back() == L'\r') line.pop_back();
+                payload += "L ";
+                payload += ClipPersistEscape(line);
+                payload += "\n";
+                if (nl == std::wstring::npos) break;
+                pos = nl + 1;
+                if (pos >= it.text.size()) break;
+            }
+        }
+        payload += "END\n";
+    }
+    DATA_BLOB in = { 0 }, out = { 0 };
+    in.pbData = (BYTE*)payload.data();
+    in.cbData = (DWORD)payload.size();
+    if (!CryptProtectData(&in, L"OnyxNotch clipboard", NULL, NULL, NULL, CRYPTPROTECT_UI_FORBIDDEN, &out)) return;
+    wchar_t dir[MAX_PATH] = { 0 }, path[MAX_PATH] = { 0 };
+    if (!GetOnyxSettingsDir(dir, MAX_PATH) || !GetClipPersistPath(path, MAX_PATH)) { LocalFree(out.pbData); return; }
+    CreateDirectoryW(dir, NULL);
+    HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h != INVALID_HANDLE_VALUE) {
+        DWORD w = 0;
+        WriteFile(h, out.pbData, out.cbData, &w, NULL);
+        CloseHandle(h);
+    }
+    LocalFree(out.pbData);
+}
+static void LoadClipPersist()
+{
+    wchar_t path[MAX_PATH] = { 0 };
+    if (!GetClipPersistPath(path, MAX_PATH)) return;
+    HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return;
+    DWORD size = GetFileSize(h, NULL);
+    if (size == INVALID_FILE_SIZE || size == 0 || size > 1024 * 1024) { CloseHandle(h); return; }
+    BYTE* buf = (BYTE*)malloc(size);
+    if (!buf) { CloseHandle(h); return; }
+    DWORD read = 0;
+    BOOL ok = ReadFile(h, buf, size, &read, NULL);
+    CloseHandle(h);
+    if (!ok || read != size) { free(buf); return; }
+    DATA_BLOB in = { 0 }, out = { 0 };
+    in.pbData = buf; in.cbData = size;
+    if (!CryptUnprotectData(&in, NULL, NULL, NULL, NULL, CRYPTPROTECT_UI_FORBIDDEN, &out)) { free(buf); return; }
+    free(buf);
+    std::string payload((char*)out.pbData, out.cbData);
+    LocalFree(out.pbData);
+    // Parse newest-first, appending in file order (which is the
+    // stored newest-first order), capped at 50.
+    std::vector<ClipItem> loaded;
+    ClipItem cur; bool inItem = false;
+    size_t pos = 0;
+    while (pos < payload.size()) {
+        size_t nl = payload.find('\n', pos);
+        std::string line = (nl == std::string::npos) ? payload.substr(pos) : payload.substr(pos, nl - pos);
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.rfind("ITEM ", 0) == 0) {
+            if (inItem && loaded.size() < (size_t)kClipCap) loaded.push_back(std::move(cur));
+            cur = ClipItem(); inItem = true;
+            int ty = 0, pin = 0, tr = 0;
+            if (sscanf_s(line.c_str(), "ITEM %d %d %d", &ty, &pin, &tr) == 3) {
+                cur.type = ty; cur.pinned = (pin != 0); cur.truncated = (tr != 0);
+            }
+        } else if (inItem && line == "END") {
+            if (loaded.size() < (size_t)kClipCap) loaded.push_back(std::move(cur));
+            cur = ClipItem(); inItem = false;
+        } else if (inItem && line.rfind("L ", 0) == 0) {
+            std::string raw = line.substr(2);
+            std::string un;
+            for (size_t k = 0; k < raw.size(); k++) {
+                if (raw[k] == '\\' && k + 1 < raw.size() && raw[k + 1] == '\\') { un += '\\'; k++; }
+                else un += raw[k];
+            }
+            wchar_t wp[4096];
+            if (MultiByteToWideChar(CP_UTF8, 0, un.c_str(), -1, wp, 4096) > 0) {
+                if (!cur.text.empty()) cur.text += L"\r\n";
+                cur.text += wp;
+            }
+        } else if (inItem && line.rfind("P ", 0) == 0) {
+            std::string raw = line.substr(2);
+            std::string un;
+            for (size_t k = 0; k < raw.size(); k++) {
+                if (raw[k] == '\\' && k + 1 < raw.size() && raw[k + 1] == '\\') { un += '\\'; k++; }
+                else un += raw[k];
+            }
+            wchar_t wp[MAX_PATH];
+            if (MultiByteToWideChar(CP_UTF8, 0, un.c_str(), -1, wp, MAX_PATH) > 0) cur.files.push_back(wp);
+        }
+        if (nl == std::string::npos) break;
+        pos = nl + 1;
+    }
+    if (inItem && loaded.size() < (size_t)kClipCap) loaded.push_back(std::move(cur));
+    // Only accept the load if every item parsed cleanly: a file
+    // item with no paths, or a text item with no text, means the
+    // payload was corrupt, so drop it all rather than showing
+    // garbage. (An empty payload loads as an empty list.)
+    for (size_t i = 0; i < loaded.size(); i++) {
+        if (loaded[i].type == 2 && loaded[i].files.empty()) return;
+        if ((loaded[i].type == 0 || loaded[i].type == 3) && loaded[i].text.empty()) return;
+        if (loaded[i].type < 0 || loaded[i].type > 3) return;
+    }
+    g_clipItems = std::move(loaded);
 }
 
 // ===========================================================================
@@ -3278,7 +4211,7 @@ static void DrawDockGlyphD2D(Canvas* cv, int tabId, int cx, int cy, int r, COLOR
         RECT cal = { cx - ir, cy - ir * 3 / 4, cx + ir, cy + ir };
         cv->StrokeRounded(cal, color, 1.0f, 2.0f);
         cv->FillRect(RECT{ cal.left, cal.top, cal.right, cal.top + ir / 3 }, color);
-    } else if (tabId == kTabClipboard || tabId == kTabShelf) {
+    } else if (tabId == kTabClipboard || tabId == kTabShelf || tabId == kTabTimer || tabId == kTabNotes || tabId == kTabScreen) {
         DrawDockGlyphExtraD2D(cv, tabId, cx, cy, r, color);
     }
 }
@@ -3294,6 +4227,20 @@ static void DrawDockGlyphExtraD2D(Canvas* cv, int tabId, int cx, int cy, int r, 
     } else if (tabId == kTabShelf) {
         cv->StrokeRounded(RECT{ cx - ir, cy - ir / 2, cx + ir, cy + ir }, color, 1.0f, 2.0f);
         cv->FillRect(RECT{ cx - ir / 2, cy - ir, cx + ir / 2, cy - ir / 2 }, color);
+    } else if (tabId == kTabTimer) {
+        // Hourglass: two triangles meeting at the centre.
+        POINT top[3] = { { cx - ir, cy - ir }, { cx + ir, cy - ir }, { cx, cy } };
+        POINT bot[3] = { { cx - ir, cy + ir }, { cx + ir, cy + ir }, { cx, cy } };
+        cv->FillPoly(top, 3, color);
+        cv->FillPoly(bot, 3, color);
+    } else if (tabId == kTabNotes) {
+        cv->StrokeRounded(RECT{ cx - ir * 2 / 3, cy - ir, cx + ir * 2 / 3, cy + ir }, color, 1.0f, 2.0f);
+        cv->Line((float)(cx - ir / 2), (float)(cy - ir / 3), (float)(cx + ir / 2), (float)(cy - ir / 3), color, 2.0f);
+        cv->Line((float)(cx - ir / 2), (float)(cy + ir / 3), (float)(cx + ir / 2), (float)(cy + ir / 3), color, 2.0f);
+    } else if (tabId == kTabScreen) {
+        cv->StrokeRounded(RECT{ cx - ir, cy - ir * 3 / 4, cx + ir, cy + ir / 2 }, color, 1.0f, 2.0f);
+        cv->Line((float)cx, (float)(cy + ir / 2), (float)cx, (float)(cy + ir), color, 2.0f);
+        cv->Line((float)(cx - ir / 2), (float)(cy + ir), (float)(cx + ir / 2), (float)(cy + ir), color, 2.0f);
     }
 }
 static void DrawMediaButtonsRowD2D(Canvas* cv, Notch* n, const Layout& L, bool home)
@@ -3344,6 +4291,14 @@ static void PaintNotchD2D(Notch* n, Canvas* cv)
     }
     PaintSurfaceD2D(cv, n, rc, panelAlpha);
     wchar_t clockText[32]; FormatClock(clockText, 32);
+    // v8-continued live activity: a running (or just finished)
+    // countdown/focus timer replaces the collapsed clock, so the
+    // remaining time is visible without expanding. Stopwatch
+    // never replaces the clock; see it on the TIMER tab.
+    if ((g_timerMode == 1 || g_timerMode == 2) && (g_timerRunning || g_timerDone)) {
+        if (g_timerDone) wcscpy_s(clockText, 32, L"Done");
+        else TimerFormatMs(TimerDisplayMs(), clockText, 32);
+    }
     int dpi = n->dpi;
     const Theme& th = CurrentTheme();
     if (!n->paintExpanded) {
@@ -3353,7 +4308,7 @@ static void PaintNotchD2D(Notch* n, Canvas* cv)
     }
     Layout L = ComputeLayout(n, rc.right);
     int effTab = EffectiveTab(n);
-    static const wchar_t* kTabTitles[7] = { L"Home", L"Media", L"System", L"Calendar", L"Clock", L"Clipboard", L"Shelf" };
+    static const wchar_t* kTabTitles[10] = { L"Home", L"Media", L"System", L"Calendar", L"Clock", L"Clipboard", L"Shelf", L"Timer", L"Notes", L"Screen" };
     wchar_t subtitle[128] = { 0 };
     if (effTab == kTabHome) { FormatDate(subtitle, 128); }
     else if (effTab == kTabSystem) { wcscpy_s(subtitle, 128, L"Power \x00B7 Network \x00B7 Audio"); }
@@ -3369,6 +4324,14 @@ static void PaintNotchD2D(Notch* n, Canvas* cv)
         swprintf(subtitle, 128, L"%d item%s in history", (int)g_clipItems.size(), g_clipItems.size() == 1 ? L"" : L"s");
     } else if (effTab == kTabShelf) {
         swprintf(subtitle, 128, L"%d file%s parked", (int)g_shelfItems.size(), g_shelfItems.size() == 1 ? L"" : L"s");
+    } else if (effTab == kTabTimer) {
+        wchar_t tt[32]; TimerFormatMs(TimerDisplayMs(), tt, 32);
+        swprintf(subtitle, 128, L"%s  %s%s", TimerModeName(), tt, g_timerDone ? L"  Done" : (g_timerRunning ? L"" : L"  Paused"));
+    } else if (effTab == kTabNotes) {
+        swprintf(subtitle, 128, L"%d note%s", (int)g_notes.size(), g_notes.size() == 1 ? L"" : L"s");
+    } else if (effTab == kTabScreen) {
+        ULONGLONG tot = ScreenTotalSeconds();
+        swprintf(subtitle, 128, L"%llu min today", tot / 60);
     }
     int margin = Scale(20, dpi);
     D2DText(cv, kFontSmall, kTabTitles[effTab], (float)margin, (float)Scale(8, dpi), (float)rc.right / 2.0f, (float)Scale(24, dpi), th.primary, false);
@@ -3402,12 +4365,12 @@ static void PaintNotchD2D(Notch* n, Canvas* cv)
             // drawn as two lines, not a glyph, so they cannot
             // turn into tofu in Segoe UI; arrows reuse the
             // up/down glyphs already used for network rates.
-            static const wchar_t* kHomeCardNames[8] = { L"System", L"Calendar", L"Clock", L"Media", L"Battery", L"Network", L"Clipboard", L"Shelf" };
+            static const wchar_t* kHomeCardNames[11] = { L"System", L"Calendar", L"Clock", L"Media", L"Battery", L"Network", L"Clipboard", L"Shelf", L"Timer", L"Notes", L"Screen" };
             wchar_t hdr[96];
             swprintf(hdr, 96, L"Home cards \x2014 %d of 6 selected", HomeSelectedCount());
             D2DText(cv, kFontSmall, hdr, (float)margin, (float)L.homeEditHeaderY, (float)(rc.right - 2 * margin), (float)Scale(22, dpi), th.primary, false);
             D2DText(cv, kFontTiny, L"Check a card to add it. A 7th card cannot be added until one is unchecked. Arrows reorder.", (float)margin, (float)(L.homeEditHeaderY + Scale(22, dpi)), (float)(rc.right - 2 * margin), (float)Scale(20, dpi), th.muted, false);
-            for (int i = 0; i < 8; i++) {
+            for (int i = 0; i < kHomeCardCount; i++) {
                 int id = g_homeOrder[i];
                 RECT cr = L.homeEditCheckRects[i];
                 cv->StrokeRounded(cr, th.muted, 1.0f, 3.0f);
@@ -3424,7 +4387,7 @@ static void PaintNotchD2D(Notch* n, Canvas* cv)
                 RECT up = L.homeEditUpRects[i];
                 D2DText(cv, kFontTiny, L"\x2191", (float)up.left, (float)up.top, (float)(up.right - up.left), (float)(up.bottom - up.top), i == 0 ? th.muted : th.secondary, true);
                 RECT dn = L.homeEditDownRects[i];
-                D2DText(cv, kFontTiny, L"\x2193", (float)dn.left, (float)dn.top, (float)(dn.right - dn.left), (float)(dn.bottom - dn.top), i == 7 ? th.muted : th.secondary, true);
+                D2DText(cv, kFontTiny, L"\x2193", (float)dn.left, (float)dn.top, (float)(dn.right - dn.left), (float)(dn.bottom - dn.top), i == kHomeCardCount - 1 ? th.muted : th.secondary, true);
             }
             cv->StrokeRounded(L.homeEditDoneRect, th.muted, 1.0f, 4.0f);
             D2DText(cv, kFontTiny, L"Done", (float)L.homeEditDoneRect.left, (float)L.homeEditDoneRect.top, (float)(L.homeEditDoneRect.right - L.homeEditDoneRect.left), (float)(L.homeEditDoneRect.bottom - L.homeEditDoneRect.top), th.secondary, true);
@@ -3523,6 +4486,40 @@ static void PaintNotchD2D(Notch* n, Canvas* cv)
                     D2DText(cv, kFontTiny, L"No parked files yet", (float)(c.left + 14), (float)(c.top + Scale(36, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.secondary, false);
                 }
                 D2DText(cv, kFontTiny, L"Click Shelf tab for files", (float)(c.left + 14), (float)(c.top + Scale(92, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.muted, false);
+            } else if (id == 8) {
+                // v8-continued TIMER card: mode + display.
+                DrawCardD2D(cv, c, L"TIMER");
+                wchar_t tt[32]; TimerFormatMs(TimerDisplayMs(), tt, 32);
+                D2DText(cv, kFontBig, tt, (float)c.left, (float)(c.top + Scale(36, dpi)), (float)(c.right - c.left), (float)Scale(48, dpi), th.primary, true);
+                wchar_t st[64];
+                swprintf(st, 64, L"%s%s", TimerModeName(), g_timerDone ? L"  Done" : (g_timerRunning ? L"  Running" : L"  Paused"));
+                D2DText(cv, kFontTiny, st, (float)(c.left + 14), (float)(c.top + Scale(92, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.secondary, true);
+            } else if (id == 9) {
+                // v8-continued NOTES card: count + first note.
+                DrawCardD2D(cv, c, L"NOTES");
+                wchar_t cnt[64];
+                swprintf(cnt, 64, L"%d note%s", (int)g_notes.size(), g_notes.size() == 1 ? L"" : L"s");
+                D2DText(cv, kFontTiny, cnt, (float)(c.left + 14), (float)(c.top + Scale(36, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.primary, false);
+                if (!g_notes.empty()) {
+                    D2DTextEllipsis(cv, kFontTiny, NoteFirstLine(g_notes[0]).c_str(), (float)(c.left + 14), (float)(c.top + Scale(62, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.secondary);
+                } else {
+                    D2DText(cv, kFontTiny, L"No notes yet", (float)(c.left + 14), (float)(c.top + Scale(62, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.secondary, false);
+                }
+                D2DText(cv, kFontTiny, L"Click Notes tab for notes", (float)(c.left + 14), (float)(c.top + Scale(92, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.muted, false);
+            } else if (id == 10) {
+                // v8-continued SCREEN card: total + top app.
+                DrawCardD2D(cv, c, L"SCREEN TIME");
+                ULONGLONG tot = ScreenTotalSeconds();
+                wchar_t big[32];
+                swprintf(big, 32, L"%lluh %02llum", tot / 3600, (tot % 3600) / 60);
+                D2DText(cv, kFontBig, big, (float)c.left, (float)(c.top + Scale(36, dpi)), (float)(c.right - c.left), (float)Scale(48, dpi), th.primary, true);
+                if (!g_screenApps.empty()) {
+                    size_t top = 0;
+                    for (size_t k = 1; k < g_screenApps.size(); k++) if (g_screenApps[k].seconds > g_screenApps[top].seconds) top = k;
+                    D2DTextEllipsis(cv, kFontTiny, g_screenApps[top].exe.c_str(), (float)(c.left + 14), (float)(c.top + Scale(92, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.secondary);
+                } else {
+                    D2DText(cv, kFontTiny, L"No apps tracked yet", (float)(c.left + 14), (float)(c.top + Scale(92, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.secondary, false);
+                }
             } else if (id == 5) {
                 DrawCardD2D(cv, c, L"NETWORK");
                 if (g_netOk) {
@@ -3589,6 +4586,35 @@ static void PaintNotchD2D(Notch* n, Canvas* cv)
             } else {
                 D2DText(cv, kFontTiny, L"Volume unavailable", (float)(c.left + 14), (float)(c.top + Scale(36, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.secondary, false);
             }
+            // v8-continued: wave-out volume buttons. These change
+            // the SYSTEM wave volume, not a per-app volume.
+            cv->StrokeRounded(L.volMinusRect, th.muted, 1.0f, 4.0f);
+            D2DText(cv, kFontTiny, L"-", (float)L.volMinusRect.left, (float)L.volMinusRect.top, (float)(L.volMinusRect.right - L.volMinusRect.left), (float)(L.volMinusRect.bottom - L.volMinusRect.top), th.secondary, true);
+            cv->StrokeRounded(L.volPlusRect, th.muted, 1.0f, 4.0f);
+            D2DText(cv, kFontTiny, L"+", (float)L.volPlusRect.left, (float)L.volPlusRect.top, (float)(L.volPlusRect.right - L.volPlusRect.left), (float)(L.volPlusRect.bottom - L.volPlusRect.top), th.secondary, true);
+            cv->StrokeRounded(L.volMuteRect, th.muted, 1.0f, 4.0f);
+            D2DText(cv, kFontTiny, g_volMuted ? L"Unmute" : L"Mute", (float)L.volMuteRect.left, (float)L.volMuteRect.top, (float)(L.volMuteRect.right - L.volMuteRect.left), (float)(L.volMuteRect.bottom - L.volMuteRect.top), th.secondary, true);
+        }
+        // v8-continued BRIGHTNESS card (SYSTEM tab only).
+        // WMI for internal displays; if no controllable display
+        // is found the card says Unavailable instead of faking
+        // a slider. Bluetooth battery is deliberately absent:
+        // it was cut (see README), so no dead section is drawn.
+        DrawCardD2D(cv, L.sysExtraCard, L"BRIGHTNESS");
+        {
+            RECT c = L.sysExtraCard;
+            if (g_brightOk) {
+                wchar_t big[16]; swprintf(big, 16, L"%d%%", g_brightPercent);
+                D2DText(cv, kFontBig, big, (float)(c.left + 14), (float)(c.top + Scale(30, dpi)), (float)(c.right - c.left - 28), (float)Scale(40, dpi), th.primary, false);
+            } else {
+                D2DText(cv, kFontTiny, L"Brightness control unavailable on this display", (float)(c.left + 14), (float)(c.top + Scale(36, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.secondary, false);
+            }
+            cv->StrokeRounded(L.brightMinusRect, th.muted, 1.0f, 4.0f);
+            D2DText(cv, kFontTiny, L"-", (float)L.brightMinusRect.left, (float)L.brightMinusRect.top, (float)(L.brightMinusRect.right - L.brightMinusRect.left), (float)(L.brightMinusRect.bottom - L.brightMinusRect.top), th.secondary, true);
+            cv->StrokeRounded(L.brightPlusRect, th.muted, 1.0f, 4.0f);
+            D2DText(cv, kFontTiny, L"+", (float)L.brightPlusRect.left, (float)L.brightPlusRect.top, (float)(L.brightPlusRect.right - L.brightPlusRect.left), (float)(L.brightPlusRect.bottom - L.brightPlusRect.top), th.secondary, true);
+            cv->StrokeRounded(L.brightRefreshRect, th.muted, 1.0f, 4.0f);
+            D2DText(cv, kFontTiny, L"Refresh", (float)L.brightRefreshRect.left, (float)L.brightRefreshRect.top, (float)(L.brightRefreshRect.right - L.brightRefreshRect.left), (float)(L.brightRefreshRect.bottom - L.brightRefreshRect.top), th.secondary, true);
         }
     } else if (effTab == kTabClock) {
         DrawCardD2D(cv, L.clockCard, L"CLOCK");
@@ -3706,7 +4732,7 @@ static void PaintNotchD2D(Notch* n, Canvas* cv)
             std::vector<int> disp; DisplayClipIndices(n->clipFilter, disp);
             if (disp.empty()) {
                 D2DText(cv, kFontTiny, L"No copied items yet", (float)(c.left + 14), (float)L.clipListY, (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.secondary, false);
-                D2DText(cv, kFontTiny, L"Copy something with Clipboard history on. History is in-memory only and clears on quit.", (float)(c.left + 14), (float)(L.clipListY + Scale(22, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.muted, false);
+                D2DText(cv, kFontTiny, g_keepClipboard ? L"Copy something with Clipboard history on. History is kept after quit in a DPAPI-protected file (text only)." : L"Copy something with Clipboard history on. History is in-memory only and clears on quit.", (float)(c.left + 14), (float)(L.clipListY + Scale(22, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.muted, false);
             } else {
                 for (int row = 0; row < 8; row++) {
                     int di = n->clipScroll + row;
@@ -3730,7 +4756,7 @@ static void PaintNotchD2D(Notch* n, Canvas* cv)
             }
             cv->StrokeRounded(L.clipClearRect, th.muted, 1.0f, 4.0f);
             D2DText(cv, kFontTiny, L"Clear all", (float)L.clipClearRect.left, (float)L.clipClearRect.top, (float)(L.clipClearRect.right - L.clipClearRect.left), (float)(L.clipClearRect.bottom - L.clipClearRect.top), th.secondary, true);
-            D2DText(cv, kFontTiny, L"Click an item to copy it back. Drag text/files out to another app. Images: click to copy only.", (float)(L.clipClearRect.right + Scale(12, dpi)), (float)L.clipClearRect.top, (float)(c.right - L.clipClearRect.right - Scale(26, dpi)), (float)Scale(20, dpi), th.muted, false);
+            D2DText(cv, kFontTiny, L"Click an item to copy it back. Drag items out to another app. Images drag as thumbnails only.", (float)(L.clipClearRect.right + Scale(12, dpi)), (float)L.clipClearRect.top, (float)(c.right - L.clipClearRect.right - Scale(26, dpi)), (float)Scale(20, dpi), th.muted, false);
         }
     } else if (effTab == kTabShelf) {
         DrawCardD2D(cv, L.shelfCard, L"FILE SHELF");
@@ -3760,6 +4786,100 @@ static void PaintNotchD2D(Notch* n, Canvas* cv)
             cv->StrokeRounded(L.shelfClearRect, th.muted, 1.0f, 4.0f);
             D2DText(cv, kFontTiny, L"Clear all", (float)L.shelfClearRect.left, (float)L.shelfClearRect.top, (float)(L.shelfClearRect.right - L.shelfClearRect.left), (float)(L.shelfClearRect.bottom - L.shelfClearRect.top), th.secondary, true);
             D2DText(cv, kFontTiny, L"Click a row to select. Open opens the file. Drag a row out to another app.", (float)(L.shelfClearRect.right + Scale(12, dpi)), (float)L.shelfClearRect.top, (float)(c.right - L.shelfClearRect.right - Scale(26, dpi)), (float)Scale(20, dpi), th.muted, false);
+        }
+    } else if (effTab == kTabTimer) {
+        DrawCardD2D(cv, L.timerCard, L"TIMER");
+        {
+            RECT c = L.timerCard;
+            wchar_t tt[32]; TimerFormatMs(TimerDisplayMs(), tt, 32);
+            D2DText(cv, kFontBig, tt, (float)c.left, (float)(c.top + Scale(36, dpi)), (float)(c.right - c.left), (float)Scale(48, dpi), th.primary, true);
+            wchar_t st[96];
+            if (g_timerDone) swprintf(st, 96, L"%s  Done — Reset to run again", TimerModeName());
+            else if (g_timerRunning) swprintf(st, 96, L"%s  Running", TimerModeName());
+            else swprintf(st, 96, L"%s  Paused", TimerModeName());
+            D2DText(cv, kFontTiny, st, (float)(c.left + 14), (float)(c.top + Scale(84, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.secondary, false);
+            static const wchar_t* kModes[3] = { L"Stopwatch", L"Countdown", L"Focus" };
+            for (int i = 0; i < 3; i++) {
+                RECT r = L.timerModeRects[i];
+                if (i == g_timerMode) cv->FillRounded(r, th.accent, (float)(r.bottom - r.top) / 2.0f);
+                else cv->StrokeRounded(r, th.muted, 1.0f, (float)(r.bottom - r.top) / 2.0f);
+                D2DText(cv, kFontTiny, kModes[i], (float)r.left, (float)r.top, (float)(r.right - r.left), (float)(r.bottom - r.top), (i == g_timerMode) ? th.pillText : th.secondary, true);
+            }
+            static const wchar_t* kPresets[4] = { L"5 min", L"10 min", L"25 min", L"45 min" };
+            for (int i = 0; i < 4; i++) {
+                RECT r = L.timerPresetRects[i];
+                cv->StrokeRounded(r, th.muted, 1.0f, (float)(r.bottom - r.top) / 2.0f);
+                D2DText(cv, kFontTiny, kPresets[i], (float)r.left, (float)r.top, (float)(r.right - r.left), (float)(r.bottom - r.top), th.secondary, true);
+            }
+            static const wchar_t* kSteps[4] = { L"-5 min", L"-1 min", L"+1 min", L"+5 min" };
+            for (int i = 0; i < 4; i++) {
+                RECT r = L.timerStepRects[i];
+                cv->StrokeRounded(r, th.muted, 1.0f, (float)(r.bottom - r.top) / 2.0f);
+                D2DText(cv, kFontTiny, kSteps[i], (float)r.left, (float)r.top, (float)(r.right - r.left), (float)(r.bottom - r.top), th.secondary, true);
+            }
+            cv->StrokeRounded(L.timerStartRect, th.muted, 1.0f, 4.0f);
+            D2DText(cv, kFontTiny, g_timerRunning ? L"Pause" : L"Start", (float)L.timerStartRect.left, (float)L.timerStartRect.top, (float)(L.timerStartRect.right - L.timerStartRect.left), (float)(L.timerStartRect.bottom - L.timerStartRect.top), th.secondary, true);
+            cv->StrokeRounded(L.timerResetRect, th.muted, 1.0f, 4.0f);
+            D2DText(cv, kFontTiny, L"Reset", (float)L.timerResetRect.left, (float)L.timerResetRect.top, (float)(L.timerResetRect.right - L.timerResetRect.left), (float)(L.timerResetRect.bottom - L.timerResetRect.top), th.secondary, true);
+            D2DText(cv, kFontTiny, L"Presets and steps apply to Countdown/Focus only, and only while paused. Timers are not saved across quit. No sound on finish.", (float)(c.left + 14), (float)(L.timerResetRect.bottom + Scale(6, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.muted, false);
+        }
+    } else if (effTab == kTabNotes) {
+        DrawCardD2D(cv, L.notesCard, L"NOTES");
+        {
+            RECT c = L.notesCard;
+            static const wchar_t* kTop[4] = { L"New blank", L"From clipboard", L"Reload all", L"Clear all" };
+            for (int i = 0; i < 4; i++) {
+                RECT r = L.notesTopRects[i];
+                cv->StrokeRounded(r, th.muted, 1.0f, 4.0f);
+                D2DText(cv, kFontTiny, kTop[i], (float)r.left, (float)r.top, (float)(r.right - r.left), (float)(r.bottom - r.top), th.secondary, true);
+            }
+            // Pinned first, then the rest, both in stored order.
+            std::vector<int> disp;
+            for (int pass = 0; pass < 2; pass++) for (size_t i = 0; i < g_notes.size(); i++) if ((pass == 0) == g_notes[i].pinned) disp.push_back((int)i);
+            if (disp.empty()) {
+                D2DText(cv, kFontTiny, L"No notes yet", (float)(c.left + 14), (float)L.notesListY, (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.secondary, false);
+                D2DText(cv, kFontTiny, L"The notch cannot accept typing (it must not steal focus), so notes are created blank or from the clipboard and edited in Notepad: Open, edit, save, then Reload all. Notes are saved in notes.ini.", (float)(c.left + 14), (float)(L.notesListY + Scale(22, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.muted, false);
+            } else {
+                for (int row = 0; row < 8; row++) {
+                    int di = n->noteScroll + row;
+                    if (di < 0 || di >= (int)disp.size()) break;
+                    NoteItem& it = g_notes[disp[di]];
+                    int y0 = L.notesListY + row * L.notesRowH;
+                    D2DTextEllipsis(cv, kFontTiny, NoteFirstLine(it).c_str(), (float)(c.left + 14), (float)y0, (float)(c.right - c.left - 150), (float)Scale(20, dpi), th.primary);
+                    int delL = c.right - 14 - 24;
+                    int openL = delL - 6 - 48;
+                    int pinL = openL - 6 - 44;
+                    D2DText(cv, kFontTiny, it.pinned ? L"Pinned" : L"Pin", (float)pinL, (float)y0, 44.0f, (float)Scale(20, dpi), it.pinned ? th.accent : th.muted, true);
+                    D2DText(cv, kFontTiny, L"Open", (float)openL, (float)y0, 48.0f, (float)Scale(20, dpi), th.accent, true);
+                    D2DText(cv, kFontTiny, L"X", (float)delL, (float)y0, 24.0f, (float)Scale(20, dpi), th.muted, true);
+                }
+                if (n->noteScroll > 0 || n->noteScroll + 8 < (int)disp.size())
+                    D2DText(cv, kFontTiny, L"Scroll with mouse wheel", (float)(c.left + 14), (float)(L.notesCard.bottom - Scale(20, dpi)), (float)(c.right - c.left - 28), (float)Scale(16, dpi), th.muted, false);
+            }
+        }
+    } else if (effTab == kTabScreen) {
+        DrawCardD2D(cv, L.screenCard, L"SCREEN TIME");
+        {
+            RECT c = L.screenCard;
+            std::vector<ScreenApp> sorted = g_screenApps;
+            for (size_t i = 0; i < sorted.size(); i++) for (size_t k = i + 1; k < sorted.size(); k++) if (sorted[k].seconds > sorted[i].seconds) { ScreenApp tmp = sorted[i]; sorted[i] = sorted[k]; sorted[k] = tmp; }
+            if (sorted.empty()) {
+                D2DText(cv, kFontTiny, L"No apps tracked yet today", (float)(c.left + 14), (float)L.screenListY, (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.secondary, false);
+                D2DText(cv, kFontTiny, L"Exe names only — window titles are never read, so no private text is recorded. Totals are saved in screentime.ini and reset at local midnight.", (float)(c.left + 14), (float)(L.screenListY + Scale(22, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.muted, false);
+            } else {
+                for (int row = 0; row < 8; row++) {
+                    int di = n->screenScroll + row;
+                    if (di < 0 || di >= (int)sorted.size()) break;
+                    ScreenApp& app = sorted[di];
+                    int y0 = L.screenListY + row * L.screenRowH;
+                    wchar_t dur[32];
+                    swprintf(dur, 32, L"%lluh %02llum", app.seconds / 3600, (app.seconds % 3600) / 60);
+                    D2DTextEllipsis(cv, kFontTiny, app.exe.c_str(), (float)(c.left + 14), (float)y0, (float)(c.right - c.left - 150), (float)Scale(20, dpi), th.primary);
+                    D2DText(cv, kFontTiny, dur, (float)(c.right - 14 - 110), (float)y0, 110.0f, (float)Scale(20, dpi), th.secondary, true);
+                }
+            }
+            cv->StrokeRounded(L.screenResetRect, th.muted, 1.0f, 4.0f);
+            D2DText(cv, kFontTiny, L"Reset today", (float)L.screenResetRect.left, (float)L.screenResetRect.top, (float)(L.screenResetRect.right - L.screenResetRect.left), (float)(L.screenResetRect.bottom - L.screenResetRect.top), th.secondary, true);
         }
     } else if (effTab == kTabMedia) {
         DrawCardD2D(cv, L.mediaCard, L"MEDIA");
@@ -3952,17 +5072,17 @@ static LRESULT CALLBACK NotchWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
             int dx = pt.x - n->dragStartX, dy = pt.y - n->dragStartY;
             if (dx * dx + dy * dy > 25) {
-                // v8 drag-out: snapshot the item BEFORE
-                // DoDragDrop (the target may change our state
-                // while dragging), then drag text/files only.
-                // Images have no drag-out in v8: a drag attempt
-                // on an image row simply ends the candidate.
+                // v8-continued drag-out: snapshot the item
+                // BEFORE DoDragDrop (the target may change our
+                // state while dragging). Images now drag too,
+                // as thumbnails only (see DoDragImage).
                 int kind = n->dragKind, idx = n->dragIndex;
                 n->dragKind = 0; n->dragIndex = -1; n->dragStarted = true;
                 if (kind == 1 && idx >= 0 && idx < (int)g_clipItems.size()) {
                     ClipItem& it = g_clipItems[idx];
                     if (it.type == 0 || it.type == 3) DoDragTextOrFiles(it.text, std::vector<std::wstring>());
                     else if (it.type == 2) DoDragTextOrFiles(std::wstring(), it.files);
+                    else if (it.type == 1) DoDragImage(it.thumb);
                 } else if (kind == 2 && idx >= 0 && idx < (int)g_shelfItems.size()) {
                     ShelfItem& it = g_shelfItems[idx];
                     if (!it.missing) DoDragTextOrFiles(std::wstring(), std::vector<std::wstring>(1, it.path));
@@ -4071,6 +5191,11 @@ static LRESULT CALLBACK NotchWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                 // at the current month (documented choice).
                 if (n->activeTab == kTabCalendar) { n->calYear = 0; n->calMonth = 0; n->calDay = 0; }
                 n->activeTab = dockTab;
+                // v8-continued: entering SYSTEM refreshes the
+                // WMI brightness reading (once per switch, never
+                // per paint frame, so a slow WMI call cannot
+                // stall every frame).
+                if (dockTab == kTabSystem) RefreshBrightness();
                 // v6-unified-size: the panel size is identical on
                 // every tab, so a switch only repaints content
                 // (into the double buffer). It must NOT run the
@@ -4092,7 +5217,7 @@ static LRESULT CALLBACK NotchWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                 if (epart == 3) {
                     g_homeEdit = false;
                     ApplySizeToAll();
-                } else if (epart == 0 && erow >= 0 && erow < 8) {
+                } else if (epart == 0 && erow >= 0 && erow < kHomeCardCount) {
                     int id = g_homeOrder[erow];
                     if (g_homeSel[id]) {
                         g_homeSel[id] = false;
@@ -4112,7 +5237,7 @@ static LRESULT CALLBACK NotchWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                     g_homeOrder[erow - 1] = tmp;
                     SaveSettings();
                     ApplySizeToAll();
-                } else if (epart == 2 && erow >= 0 && erow < 7) {
+                } else if (epart == 2 && erow >= 0 && erow < kHomeCardCount - 1) {
                     int tmp = g_homeOrder[erow];
                     g_homeOrder[erow] = g_homeOrder[erow + 1];
                     g_homeOrder[erow + 1] = tmp;
@@ -4142,8 +5267,10 @@ static LRESULT CALLBACK NotchWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                     for (size_t i = 0; i < g_clipItems.size(); i++) if (g_clipItems[i].thumb) DeleteObject(g_clipItems[i].thumb);
                     g_clipItems.clear();
                     n->clipScroll = 0;
+                    SaveClipPersist();
                 } else if (part == 1 && item >= 0 && item < (int)g_clipItems.size()) {
                     g_clipItems[item].pinned = !g_clipItems[item].pinned;
+                    SaveClipPersist();
                 } else if (part == 0 && item >= 0) {
                     // Row press: start a drag candidate. A plain
                     // click (no move past the threshold) copies
@@ -4169,6 +5296,116 @@ static LRESULT CALLBACK NotchWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                 } else if (part == 0 && item >= 0) {
                     n->dragKind = 2; n->dragIndex = item;
                     n->dragStartX = pt.x; n->dragStartY = pt.y;
+                }
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 0;
+            }
+        }
+        // v8-continued tab content: timer, notes, screen,
+        // volume, brightness. Hit order stays gear > X > dock >
+        // tab content > pin, as for clipboard/shelf above.
+        if (EffectiveTab(n) == kTabTimer) {
+            int item = -1, part = -1;
+            if (TimerHitAt(n, pt.x, pt.y, false, item, part)) {
+                if (part == 0 && item >= 0 && item < 3) {
+                    g_timerMode = item; g_timerRunning = false; g_timerDone = false; g_timerAccumMs = 0;
+                } else if (part == 1 && item >= 0 && item < 4) {
+                    if ((g_timerMode == 1 || g_timerMode == 2) && !g_timerRunning) {
+                        static const ULONGLONG kPresets[4] = { 5, 10, 25, 45 };
+                        g_timerTargetMs = kPresets[item] * 60 * 1000;
+                        g_timerDone = false; g_timerAccumMs = 0;
+                    }
+                } else if (part == 2 && item >= 0 && item < 4) {
+                    if ((g_timerMode == 1 || g_timerMode == 2) && !g_timerRunning) {
+                        static const long long kSteps[4] = { -5, -1, 1, 5 };
+                        long long t = (long long)(g_timerTargetMs / 60000) + kSteps[item];
+                        if (t < 1) t = 1;
+                        if (t > 240) t = 240;
+                        g_timerTargetMs = (ULONGLONG)t * 60 * 1000;
+                        g_timerDone = false; g_timerAccumMs = 0;
+                    }
+                } else if (part == 3) {
+                    if (g_timerRunning) {
+                        g_timerAccumMs = TimerElapsedMs(); g_timerRunning = false;
+                    } else {
+                        if (g_timerDone) { g_timerDone = false; g_timerAccumMs = 0; }
+                        g_timerStartTick = GetTickCount64(); g_timerRunning = true;
+                    }
+                } else if (part == 4) {
+                    g_timerRunning = false; g_timerDone = false; g_timerAccumMs = 0;
+                }
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 0;
+            }
+        }
+        if (EffectiveTab(n) == kTabNotes) {
+            int item = -1, part = -1;
+            if (NotesHitAt(n, pt.x, pt.y, false, item, part)) {
+                if (part == 4) {
+                    NoteItem nt; nt.text = L"New note"; nt.pinned = false;
+                    g_notes.insert(g_notes.begin(), nt); SaveNotes();
+                } else if (part == 5) {
+                    if (NoteAddFromClipboard()) SaveNotes();
+                } else if (part == 6) {
+                    ReloadNotesFromEditFiles(); SaveNotes();
+                } else if (part == 7) {
+                    g_notes.clear(); SaveNotes();
+                } else if (part == 1 && item >= 0 && item < (int)g_notes.size()) {
+                    g_notes[item].pinned = !g_notes[item].pinned; SaveNotes();
+                } else if (part == 2 && item >= 0 && item < (int)g_notes.size()) {
+                    NoteOpenInNotepad(item);
+                } else if (part == 3 && item >= 0 && item < (int)g_notes.size()) {
+                    g_notes.erase(g_notes.begin() + item); SaveNotes();
+                }
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 0;
+            }
+        }
+        if (EffectiveTab(n) == kTabScreen) {
+            int item = -1, part = -1;
+            if (ScreenHitAt(n, pt.x, pt.y, false, item, part)) {
+                if (part == 3) {
+                    g_screenApps.clear();
+                    wchar_t today[16]; ScreenDayNow(today, 16);
+                    wcscpy_s(g_screenDay, 16, today);
+                    SaveScreenTime();
+                }
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 0;
+            }
+        }
+        if (EffectiveTab(n) == kTabSystem) {
+            int part = -1;
+            if (VolHitAt(n, pt.x, pt.y, false, part)) {
+                if (part == 0 || part == 1) {
+                    int cur = g_volOk ? g_volPercent : 50;
+                    int nv = cur + (part == 1 ? 5 : -5);
+                    if (nv < 0) nv = 0;
+                    if (nv > 100) nv = 100;
+                    DWORD v = (DWORD)(nv * 65535 / 100);
+                    waveOutSetVolume((HWAVEOUT)(UINT_PTR)WAVE_MAPPER, v | (v << 16));
+                    g_volMuted = false; g_volPercent = nv; g_volOk = true;
+                } else if (part == 2) {
+                    if (g_volMuted) {
+                        int nv = g_volBeforeMute;
+                        DWORD v = (DWORD)(nv * 65535 / 100);
+                        waveOutSetVolume((HWAVEOUT)(UINT_PTR)WAVE_MAPPER, v | (v << 16));
+                        g_volMuted = false; g_volPercent = nv; g_volOk = true;
+                    } else {
+                        g_volBeforeMute = g_volOk ? g_volPercent : 50;
+                        waveOutSetVolume((HWAVEOUT)(UINT_PTR)WAVE_MAPPER, 0);
+                        g_volMuted = true; g_volPercent = 0; g_volOk = true;
+                    }
+                }
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 0;
+            }
+            if (BrightHitAt(n, pt.x, pt.y, false, part)) {
+                if (part == 2) {
+                    RefreshBrightness();
+                } else {
+                    RefreshBrightness();
+                    if (g_brightOk) SetBrightness(g_brightPercent + (part == 1 ? 10 : -10));
                 }
                 InvalidateRect(hwnd, NULL, FALSE);
                 return 0;
@@ -4252,6 +5489,18 @@ static LRESULT CALLBACK NotchWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                 n->shelfScroll -= step;
                 if (n->shelfScroll < 0) n->shelfScroll = 0;
                 if (n->shelfScroll > maxOff) n->shelfScroll = maxOff;
+                InvalidateRect(hwnd, NULL, FALSE);
+            } else if (EffectiveTab(n) == kTabNotes) {
+                int maxOff = (int)g_notes.size() - 8; if (maxOff < 0) maxOff = 0;
+                n->noteScroll -= step;
+                if (n->noteScroll < 0) n->noteScroll = 0;
+                if (n->noteScroll > maxOff) n->noteScroll = maxOff;
+                InvalidateRect(hwnd, NULL, FALSE);
+            } else if (EffectiveTab(n) == kTabScreen) {
+                int maxOff = (int)g_screenApps.size() - 8; if (maxOff < 0) maxOff = 0;
+                n->screenScroll -= step;
+                if (n->screenScroll < 0) n->screenScroll = 0;
+                if (n->screenScroll > maxOff) n->screenScroll = maxOff;
                 InvalidateRect(hwnd, NULL, FALSE);
             }
         }
@@ -4531,6 +5780,8 @@ static LRESULT CALLBACK ManagerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             // existing animation path; a title-text-only change
             // keeps the same height and is just a repaint below.
             RefreshSmtc();
+            TimerUpdate();
+            if (g_screenTimeEnabled) SampleScreenTime();
             // v6-fix: no resize here any more. The MEDIA layout
             // always reserves title+artist rows, so a track
             // appearing or disappearing is just a repaint (below),
@@ -4569,6 +5820,9 @@ static LRESULT CALLBACK ManagerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             // belt-and-braces step, so a quit via any path saves).
             SaveSettings();
             SaveShelf();
+            SaveNotes();
+            SaveScreenTime();
+            SaveClipPersist();
             // Destroy notch windows first, then the manager (which quits).
             std::vector<HWND> hwnds;
             for (size_t i = 0; i < g_notches.size(); i++) hwnds.push_back(g_notches[i]->hwnd);
@@ -4613,6 +5867,18 @@ static LRESULT CALLBACK ManagerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             g_shelfEnabled = !g_shelfEnabled;
             SaveSettings();
             ApplySizeToAll();
+            break;
+        case ID_TRAY_SCREEN_TIME:
+            g_screenTimeEnabled = !g_screenTimeEnabled;
+            if (!g_screenTimeEnabled) SaveScreenTime();
+            SaveSettings();
+            ApplySizeToAll();
+            break;
+        case ID_TRAY_KEEP_CLIP:
+            g_keepClipboard = !g_keepClipboard;
+            SaveSettings();
+            if (g_keepClipboard) SaveClipPersist();
+            InvalidateAllNotches();
             break;
         case ID_TRAY_HOME_EDIT:
             // v8-home-custom: edit mode itself is NOT saved to
@@ -4673,7 +5939,7 @@ static LRESULT CALLBACK ManagerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
         case ID_TRAY_MEDIA_NEXT: SendMediaKey(VK_MEDIA_NEXT_TRACK); break;
         case ID_TRAY_ABOUT:
             MessageBoxW(hwnd,
-                L"OnyxNotch v8 (clipboard history + file shelf)\nMac-style notch for Windows.\nNative Win32 C++, no runtime, low memory.\nDirect2D/DirectWrite rendering on a layered\nwindow with per-pixel alpha; spring animation;\nblur is an OFF-by-default experimental tray\ntoggle with an opaque fallback.\n\nv4: premium UI — gradient surface, lighter\ntypography, circular media buttons, battery glyph,\ncalendar pill — reorganized in place: compact\ntwo-column body (media beside system stats),\nsection headers, stats rows with bars.\n\nv5-SMTC: with Media controls on, the Media tab\nshows the current track title and artist from\nWindows SMTC (read-only), and Home shows a\ncompact title line. No track, no title — the\nmedia buttons still work via media keys.\n\nv5-settings: size and toggles are saved to\n%APPDATA%\\OnyxNotch\\settings.ini and restored\nat startup. Start with Windows (tray menu) writes\nthe Run registry value for this .exe.\n\nThemes: tray menu Themes submenu — Onyx, Midnight,\nGraphite — applies instantly to all notches and is\nsaved to settings.ini as theme=onyx|midnight|graphite.\n\nClick the notch header to pin it open;\nclick again to unpin. The gear button in the\nexpanded header opens this menu from the notch.\n\nv6: wide card dashboard with a header bar,\ncard grid and a bottom icon dock. Home is a\ncompact summary; System, Clock, Calendar\nand Media show full card versions. Click a\ndock icon to switch. Close X collapses only.\n\nv8: clipboard history + file shelf, both OFF by\ndefault in the tray menu. Clipboard history is\nin-memory only (clears on quit, never written to\ndisk), capped at 50, with a password-manager\nheuristic skip that is NOT a guarantee. Click an\nitem to copy it back; drag text/files out to\nanother app (images: copy only). File shelf parks\nreferenced paths only; paths are saved in\n%APPDATA%\\OnyxNotch\\shelf.ini. No search box:\nthe notch must not steal keyboard focus, so\nfilters are mouse-click chips only.\n\nHome page: tray or gear menu, Customize Home page,\nopens an edit list on HOME (mouse clicks only):\ncheck up to 6 of the 8 cards (System, Calendar,\nClock, Media, Battery, Network, Clipboard, Shelf),\narrows reorder them, Done exits. Edit mode itself\nis not saved; the selection and order are saved in\nsettings.ini as home_cards= and home_order=.",
+                L"OnyxNotch v8 (clipboard history + file shelf)\nMac-style notch for Windows.\nNative Win32 C++, no runtime, low memory.\nDirect2D/DirectWrite rendering on a layered\nwindow with per-pixel alpha; spring animation;\nblur is an OFF-by-default experimental tray\ntoggle with an opaque fallback.\n\nv4: premium UI — gradient surface, lighter\ntypography, circular media buttons, battery glyph,\ncalendar pill — reorganized in place: compact\ntwo-column body (media beside system stats),\nsection headers, stats rows with bars.\n\nv5-SMTC: with Media controls on, the Media tab\nshows the current track title and artist from\nWindows SMTC (read-only), and Home shows a\ncompact title line. No track, no title — the\nmedia buttons still work via media keys.\n\nv5-settings: size and toggles are saved to\n%APPDATA%\\OnyxNotch\\settings.ini and restored\nat startup. Start with Windows (tray menu) writes\nthe Run registry value for this .exe.\n\nThemes: tray menu Themes submenu — Onyx, Midnight,\nGraphite — applies instantly to all notches and is\nsaved to settings.ini as theme=onyx|midnight|graphite.\n\nClick the notch header to pin it open;\nclick again to unpin. The gear button in the\nexpanded header opens this menu from the notch.\n\nv6: wide card dashboard with a header bar,\ncard grid and a bottom icon dock. Home is a\ncompact summary; System, Clock, Calendar\nand Media show full card versions. Click a\ndock icon to switch. Close X collapses only.\n\nv8: clipboard history + file shelf, both OFF by\ndefault in the tray menu. Clipboard history is\nin-memory by default (clears on quit unless the\nkeep-after-quit toggle is on), capped at 50, with a password-manager\nheuristic skip that is NOT a guarantee. Click an\nitem to copy it back; drag text/files out to\nanother app (images: drag/copy as thumbnails only). File shelf parks\nreferenced paths only; paths are saved in\n%APPDATA%\\OnyxNotch\\shelf.ini. No search box:\nthe notch must not steal keyboard focus, so\nfilters are mouse-click chips only.\n\nHome page: tray or gear menu, Customize Home page,\nopens an edit list on HOME (mouse clicks only):\ncheck up to 6 of the 11 cards (System, Calendar,\nClock, Media, Battery, Network, Clipboard, Shelf,\nTimer, Notes, Screen),\narrows reorder them, Done exits. Edit mode itself\nis not saved; the selection and order are saved in\nsettings.ini as home_cards= and home_order=.\n\nv8-continued: TIMER tab (stopwatch, countdown, focus;\npresets and steps, mouse only, in-memory, no sound),\nNOTES tab (local notes.ini; blank or from clipboard;\nedited in Notepad, never typed in the notch), SCREEN\ntab (exe names only, screentime.ini, OFF by default),\nSYSTEM volume buttons (wave-out) and WMI brightness\n(unavailable on displays WMI cannot control), clipboard\npersistence (OFF by default, text only, DPAPI file\nclipboard.dat), image drag-out (thumbnails only).\nPrivacy dots and Bluetooth battery were CUT: no\nreliable public native signal exists for either, and\nfaking them would be worse than omitting them.",
                 L"OnyxNotch", MB_OK | MB_ICONINFORMATION);
             break;
         }
@@ -4684,6 +5950,9 @@ static LRESULT CALLBACK ManagerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
         // blocks or shows UI, so this cannot delay shutdown.
         SaveSettings();
         SaveShelf();
+        SaveNotes();
+        SaveScreenTime();
+        SaveClipPersist();
         KillTimer(hwnd, ID_TIMER_CLOCK);
         Shell_NotifyIconW(NIM_DELETE, &g_nid);
         PostQuitMessage(0);
@@ -4737,6 +6006,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/,
     LoadSettings();
     LoadAutoStart();
     LoadShelf();
+    LoadNotes();
+    LoadScreenTime();
+    if (g_keepClipboard) LoadClipPersist();
 
     // Hidden manager window: owns the tray icon and the 1-second timer,
     // and creates one notch window per monitor in WM_CREATE.
