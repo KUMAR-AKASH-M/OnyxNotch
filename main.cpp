@@ -1,3 +1,12 @@
+// OnyxNotch v7 - Direct2D rewrite of v6 (see README v7 section).
+// Every v6 feature and behaviour is preserved; only the rendering
+// layer changed: GDI painting is replaced by Direct2D/DirectWrite
+// on a layered window with per-pixel alpha (see the v7 section
+// before PaintNotchD2D), and expand/collapse uses a damped
+// spring instead of ease-out cubic. Blur is an OFF-by-default
+// opt-in with an opaque fallback. Album-art tinting is out of
+// scope (SMTC gives title/artist, not art). NOT compiled or
+// tested on Windows in this VM.
 // OnyxNotch v6-unified-size - one expanded size for every tab
 // (in place, after the v6 flicker/icons/calendar fix).
 //  1. Unified height: ComputeLayout returns the MAXIMUM total
@@ -215,6 +224,8 @@
 #include <string.h> // v5-settings: strlen/strcmp in LoadSettings
 #include <iphlpapi.h> // v6: GetIfTable for network rates
 #include <mmsystem.h> // v6: waveOutGetVolume for system volume
+#include <d2d1.h> // v7: Direct2D rendering
+#include <dwrite.h> // v7: DirectWrite text
 // v5-SMTC: C++/WinRT headers for the local SMTC session manager.
 // These need the Windows SDK with C++/WinRT and /std:c++17 (see
 // build.bat). No other WinRT API is used; there is no network use.
@@ -235,6 +246,8 @@
 #pragma comment(lib, "advapi32.lib") // v5-settings: Reg* calls for auto-start
 #pragma comment(lib, "iphlpapi.lib") // v6: network counters
 #pragma comment(lib, "winmm.lib") // v6: waveOutGetVolume
+#pragma comment(lib, "d2d1.lib") // v7: Direct2D rendering
+#pragma comment(lib, "dwrite.lib") // v7: DirectWrite text
 
 #define ID_TRAY_ICON            1
 #define WM_TRAY                 (WM_APP + 1)
@@ -258,6 +271,7 @@
 #define ID_TRAY_THEME_ONYX      1015
 #define ID_TRAY_THEME_MIDNIGHT  1016
 #define ID_TRAY_THEME_GRAPHITE  1017
+#define ID_TRAY_BLUR            1018
 #define IDI_ONYXNOTCH_ICON      100
 
 static const wchar_t kNotchClass[] = L"OnyxNotch";
@@ -277,6 +291,10 @@ static bool g_animations = true;        // v3: ON by default, tray tick
 // The registry (see below) is its only source of truth, so this
 // starts OFF and is overwritten by LoadAutoStart() at startup.
 static bool g_startWithWindows = false; // v5-settings: OFF by default
+// v7: blur background, OFF by default (see ApplyBlur). Saved as
+// blur=0/1 in settings.ini. Never the default: an opaque panel
+// is the safe look, and blur on a layered window is untested.
+static bool g_blurEnabled = false;
 
 // ---------------------------------------------------------------------------
 // v5-themes: theme table. Onyx reproduces the v4 colours exactly
@@ -467,6 +485,8 @@ static void LoadSettings()
                     if (ParseBoolValue(val, b)) g_widgetCalendar = b;
                 } else if (StrEqualsIgnoreCase(key, "animations")) {
                     if (ParseBoolValue(val, b)) g_animations = b;
+                } else if (StrEqualsIgnoreCase(key, "blur")) {
+                    if (ParseBoolValue(val, b)) g_blurEnabled = b;
                 } else if (StrEqualsIgnoreCase(key, "theme")) {
                     // v5-themes: unknown/corrupt values are ignored,
                     // so the current value (Onyx by default) stands.
@@ -507,6 +527,7 @@ static void SaveSettings()
         "widget_stats=%d\r\n"
         "widget_calendar=%d\r\n"
         "animations=%d\r\n"
+        "blur=%d\r\n"
         "theme=%s\r\n",
         g_size,
         g_hideOnFullscreen ? 1 : 0,
@@ -514,6 +535,7 @@ static void SaveSettings()
         g_widgetStats ? 1 : 0,
         g_widgetCalendar ? 1 : 0,
         g_animations ? 1 : 0,
+        g_blurEnabled ? 1 : 0,
         ThemeKey(g_theme));
     if (len > 0) {
         DWORD written = 0;
@@ -606,10 +628,14 @@ struct Notch {
     RECT monitorRect = { 0, 0, 0, 0 }; // full monitor rect (fullscreen test)
     RECT workRect = { 0, 0, 0, 0 };    // work area (notch position)
     int dpi = 96;
-    HFONT hFontClock = NULL;
-    HFONT hFontBig = NULL;
-    HFONT hFontSmall = NULL;
-    HFONT hFontTiny = NULL;
+    // v7: no GDI fonts. DirectWrite formats are created per
+    // frame in PresentNotch from the notch DPI (see FontSizeFor).
+    bool blurActive = false; // v7: accent blur actually applied
+    // v7 spring state (see StepAnimation): position 0..~1 and
+    // velocity, integrated per timer tick from animLastTick.
+    double animSpringPos = 0.0;
+    double animSpringVel = 0.0;
+    ULONGLONG animLastTick = 0;
     bool expanded = false;
     bool pinned = false;
     bool trackingLeave = false;
@@ -989,16 +1015,18 @@ static Layout ComputeLayout(Notch* n, int clientW)
     return L;
 }
 
+// v7: layered windows have no region. The panel shape comes
+// from the alpha channel of the presented bitmap, so this is a
+// no-op by design (kept so size paths do not need restructuring).
 static void ApplyRegion(HWND hwnd, int w, int h, bool expanded)
 {
-    HRGN rgn = CreateRoundRectRgn(0, 0, w, h, 28, 28);
-    if (!expanded) {
-        HRGN top = CreateRectRgn(0, 0, w, 18);
-        CombineRgn(rgn, rgn, top, RGN_OR);
-        DeleteObject(top);
-    }
-    SetWindowRgn(hwnd, rgn, TRUE); // SetWindowRgn takes ownership of rgn.
+    (void)hwnd; (void)w; (void)h; (void)expanded;
 }
+
+// Forward declarations: the D2D present/blur functions live in
+// the v7 rendering section below, but size paths call them.
+static void PresentNotch(Notch* n);
+static void ApplyBlur(Notch* n);
 
 static void ApplyNotchSizeInstant(Notch* n, bool expanded)
 {
@@ -1018,13 +1046,24 @@ static void ApplyNotchSizeInstant(Notch* n, bool expanded)
     int y = n->workRect.top;
     SetWindowPos(n->hwnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
     ApplyRegion(n->hwnd, w, h, expanded);
+    // v7: layered windows present via UpdateLayeredWindow, not
+    // via WM_PAINT alone, so present explicitly after sizing.
+    PresentNotch(n);
 }
 
-// v3 animation: 220 ms, ease-out cubic, ~16 ms frames. The timer is
-// per-notch, started only for a size change and killed on finish,
-// so an idle notch has no animation timer at all.
-static const int kAnimDurationMs = 220;
+// v7 animation: a damped spring (Windhawk-inspired), integrated
+// per timer tick, instead of the v3 fixed 220 ms ease-out cubic.
+// Stiffness 170 / damping 20 is underdamped (damping ratio
+// ~0.77), so the panel settles with a small, natural overshoot
+// and then snaps exactly to target. The timer is still per-notch,
+// started only for a size change and killed on finish, so an idle
+// notch has no animation timer. Position is elapsed-based, so
+// the motion does not depend on the timer firing exactly on
+// schedule; the 16 ms cadence itself is still timer-limited
+// (no timeBeginPeriod, which would be a global side effect).
+// A 700 ms cap guarantees the snap even if the spring stalls.
 static const int kAnimIntervalMs = 16;
+static const int kAnimCapMs = 700;
 
 static void TargetSizeFor(Notch* n, bool expanded, int& outW, int& outH)
 {
@@ -1077,6 +1116,8 @@ static void ApplyTargetSize(Notch* n, bool targetExpanded)
     n->animFromW = fromW; n->animFromH = fromH;
     n->animToW = toW; n->animToH = toH;
     n->animStartTick = GetTickCount64();
+    n->animSpringPos = 0.0; n->animSpringVel = 0.0;
+    n->animLastTick = GetTickCount64();
     n->animActive = true;
     SetTimer(n->hwnd, ID_TIMER_ANIM, kAnimIntervalMs, NULL);
 }
@@ -1084,21 +1125,31 @@ static void ApplyTargetSize(Notch* n, bool targetExpanded)
 static void StepAnimation(Notch* n)
 {
     if (!n || !n->hwnd || !n->animActive) return;
-    ULONGLONG elapsed = GetTickCount64() - n->animStartTick;
-    if (elapsed >= (ULONGLONG)kAnimDurationMs) {
-        // Finish exactly on target: snap, then switch painting to
-        // the final state (this is where a collapse stops drawing
-        // expanded content).
+    ULONGLONG now = GetTickCount64();
+    ULONGLONG elapsed = now - n->animStartTick;
+    double dt = (double)(now - n->animLastTick) / 1000.0;
+    n->animLastTick = now;
+    if (dt < 0.001) dt = 0.001;
+    if (dt > 0.05) dt = 0.05;
+    // Damped spring towards 1.0 (target size). Interrupt-reversing
+    // falls out naturally: ApplyTargetSize restarts from the
+    // current window size with position reset to 0.
+    const double kStiffness = 170.0;
+    const double kDamping = 20.0;
+    double accel = kStiffness * (1.0 - n->animSpringPos) - kDamping * n->animSpringVel;
+    n->animSpringVel += accel * dt;
+    n->animSpringPos += n->animSpringVel * dt;
+    if (elapsed >= (ULONGLONG)kAnimCapMs ||
+        (n->animSpringPos >= 0.98 && fabs(n->animSpringVel) < 0.8)) {
         StopAnimation(n);
         n->paintExpanded = n->expanded;
         ApplyNotchSizeInstant(n, n->expanded);
         InvalidateRect(n->hwnd, NULL, FALSE);
         return;
     }
-    double t = (double)elapsed / (double)kAnimDurationMs;
-    double e = 1.0 - (1.0 - t) * (1.0 - t) * (1.0 - t); // ease-out cubic
-    int w = (int)(n->animFromW + (n->animToW - n->animFromW) * e + 0.5);
-    int h = (int)(n->animFromH + (n->animToH - n->animFromH) * e + 0.5);
+    double pos = n->animSpringPos;
+    int w = (int)(n->animFromW + (n->animToW - n->animFromW) * pos + 0.5);
+    int h = (int)(n->animFromH + (n->animToH - n->animFromH) * pos + 0.5);
     if (w < 1) w = 1;
     if (h < 1) h = 1;
     int workW = n->workRect.right - n->workRect.left;
@@ -1106,11 +1157,12 @@ static void StepAnimation(Notch* n)
     if (x < n->workRect.left) x = n->workRect.left;
     SetWindowPos(n->hwnd, HWND_TOPMOST, x, n->workRect.top, w, h,
                  SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    // Region follows the current height, so the shape stays rounded
-    // while tall and matches the v2 collapsed shape once short.
     ApplyRegion(n->hwnd, w, h, h > Scale(34, n->dpi) + 2);
+    // v7: present the new size immediately (layered windows do
+    // not paint through the screen DC), then invalidate so any
+    // other repaint path stays consistent.
+    PresentNotch(n);
     InvalidateRect(n->hwnd, NULL, FALSE);
-    UpdateWindow(n->hwnd);
 }
 
 static void SetNotchExpanded(Notch* n, bool expanded)
@@ -1130,30 +1182,9 @@ static void SetNotchExpanded(Notch* n, bool expanded)
     ApplyTargetSize(n, expanded);
 }
 
-static void RecreateFonts(Notch* n)
-{
-    if (n->hFontClock) DeleteObject(n->hFontClock);
-    if (n->hFontBig) DeleteObject(n->hFontBig);
-    if (n->hFontSmall) DeleteObject(n->hFontSmall);
-    if (n->hFontTiny) DeleteObject(n->hFontTiny);
-    int dpi = n->dpi;
-    // v4 typography: Segoe UI throughout, lighter weights for a
-    // premium feel. The big clock drops from semibold to light;
-    // the collapsed clock drops from medium to normal. Sizes are
-    // unchanged, so layout positions do not move for weight alone.
-    n->hFontClock = CreateFontW(Scale(20, dpi), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-        DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-    n->hFontBig = CreateFontW(Scale(36, dpi), 0, 0, 0, FW_LIGHT, FALSE, FALSE, FALSE,
-        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-        DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-    n->hFontSmall = CreateFontW(Scale(17, dpi), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-        DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-    n->hFontTiny = CreateFontW(Scale(14, dpi), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-        DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-}
+// v7: no RecreateFonts. DirectWrite formats are created per
+// frame in PresentNotch from the current notch DPI, so a DPI
+// change needs no font object recreation (see WM_DPICHANGED).
 
 // ---------------------------------------------------------------------------
 // Tray icon (owned by the hidden manager window, so it survives rebuilds).
@@ -1199,6 +1230,7 @@ static void ShowTrayMenuAt(POINT pt, UINT alignFlags)
     AppendCheck(menu, ID_TRAY_WIDGET_STATS, L"Widget: System stats", g_widgetStats);
     AppendCheck(menu, ID_TRAY_WIDGET_CALENDAR, L"Widget: Calendar", g_widgetCalendar);
     AppendCheck(menu, ID_TRAY_ANIMATIONS, L"Animations", g_animations);
+    AppendCheck(menu, ID_TRAY_BLUR, L"Blur background (experimental)", g_blurEnabled);
     AppendCheck(menu, ID_TRAY_AUTOSTART, L"Start with Windows", g_startWithWindows);
     // v5-themes: submenu, so it appears in both the tray menu and
     // the gear menu (the gear opens this same menu). Tick marks
@@ -1279,45 +1311,8 @@ static void FormatBattery(wchar_t* out, size_t count)
     swprintf(out, count, L"Battery: %d%%  %s", (int)sps.BatteryLifePercent, state);
 }
 
-static void DrawCenteredText(HDC hdc, HFONT font, const wchar_t* text,
-                             int x, int y, int w, int h, COLORREF color)
-{
-    HFONT old = (HFONT)SelectObject(hdc, font);
-    SetTextColor(hdc, color);
-    SetBkMode(hdc, TRANSPARENT);
-    RECT rc = { x, y, x + w, y + h };
-    DrawTextW(hdc, text, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-    SelectObject(hdc, old);
-}
-
-// v4 reorg: left-aligned section headers (MEDIA / SYSTEM / CALENDAR).
-static void DrawLeftText(HDC hdc, HFONT font, const wchar_t* text,
-                         int x, int y, int w, int h, COLORREF color)
-{
-    HFONT old = (HFONT)SelectObject(hdc, font);
-    SetTextColor(hdc, color);
-    SetBkMode(hdc, TRANSPARENT);
-    RECT rc = { x, y, x + w, y + h };
-    DrawTextW(hdc, text, -1, &rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    SelectObject(hdc, old);
-}
-
-// v5-SMTC: same as DrawLeftText, but text longer than the given
-// width is truncated with an ellipsis by GDI (DT_END_ELLIPSIS)
-// instead of being clipped silently. The width passed in is the
-// section width, so truncation is by pixels at the current font
-// and DPI, not by a character count; the stored strings are
-// additionally capped at 255 characters (see RefreshSmtc).
-static void DrawLeftEllipsisText(HDC hdc, HFONT font, const wchar_t* text,
-                                 int x, int y, int w, int h, COLORREF color)
-{
-    HFONT old = (HFONT)SelectObject(hdc, font);
-    SetTextColor(hdc, color);
-    SetBkMode(hdc, TRANSPARENT);
-    RECT rc = { x, y, x + w, y + h };
-    DrawTextW(hdc, text, -1, &rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
-    SelectObject(hdc, old);
-}
+// v7: GDI text helpers are gone. DirectWrite text lives in the
+// v7 rendering section (D2DText / D2DTextEllipsis / D2DMeasure).
 
 // ---------------------------------------------------------------------------
 // Media keys (plain Win32, no SMTC/WinRT dependency). The active player
@@ -1758,7 +1753,7 @@ static void RebuildNotches(HINSTANCE hInst)
         int workW = n->workRect.right - n->workRect.left;
         int x = n->workRect.left + (workW - w) / 2;
         HWND hwnd = CreateWindowExW(
-            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED,
             kNotchClass, kWindowTitle, WS_POPUP,
             x, n->workRect.top, w, 34,
             NULL, NULL, hInst, (LPVOID)n);
@@ -1972,237 +1967,394 @@ static int CalDayHitAt(Notch* n, int px, int py, bool usePaint)
     return row * 7 + col;
 }
 
-// v4 reorg: plain-GDI gear — 8 teeth, a solid ring, a dark centre
-// hole. No font glyph, no image asset. Colour follows the
-// current theme (gear / gearHover / gearPressed, gearHole
-// for the centre hole), matching the media buttons' hover
-// language in that theme.
-static void DrawGear(HDC hdc, int cx, int cy, int r, COLORREF color)
+// ===========================================================================
+// v7 Direct2D rendering layer. This section REPLACES the v6 GDI painting
+// (memory DC + BitBlt, GDI brushes/pens/fonts, hand-drawn GDI glyphs).
+// What changed, and what did not:
+//  - The window is now a LAYERED window (WS_EX_LAYERED, see the
+//    CreateWindowExW call). Its shape comes from the alpha channel
+//    of the bitmap we present with UpdateLayeredWindow, NOT from a
+//    window region: ApplyRegion is a no-op in v7, and corners are
+//    truly anti-aliased instead of region-stepped. The window is
+//    still topmost, toolwindow, and NOACTIVATE (no focus steal).
+//  - Each frame is rendered OFFSCREEN into a 32-bit premultiplied
+//    DIB with an ID2D1DCRenderTarget (Direct2D), then presented
+//    once with UpdateLayeredWindow. Nothing partial is ever shown:
+//    this is the v6 double-buffer idea, in D2D terms.
+//  - Text is DirectWrite (Segoe UI, same sizes/weights as v6).
+//    The render target DPI is fixed at 96, so D2D units are pixels
+//    and every Layout coordinate (already DPI-scaled by Scale())
+//    maps 1:1, exactly as in v6. Per-monitor DPI still works
+//    because Layout and font sizes are scaled by the notch DPI.
+//  - Glyphs are Direct2D geometry (paths/arcs), centred in the
+//    same hit areas, same hit order gear > X > dock > media > pin.
+//  - Cards get a soft shadow: a dark rounded rect offset 2 px
+//    below each card, alpha-blended, drawn before the card.
+//    The PANEL itself has no external shadow: the window bounds
+//    are exactly the panel bounds, so an outside shadow would be
+//    clipped by the bitmap. That is a deliberate omission, not
+//    a bug to paper over (see README v7 section).
+//  - Blur is OFF by default (see ApplyBlur). When on, the panel
+//    gradient is drawn at 0.88 alpha so the blur can show
+//    through; when off, or if the accent call fails, the panel
+//    is fully opaque exactly as in v6. Blur can never produce a
+//    black/transparent window here, because the layered bitmap
+//    always carries our own drawn content.
+//  - Album-art accent tinting is OUT of scope: SMTC gives
+//    title/artist, not album art, in our path. Nothing is faked.
+//  - This code is ORIGINAL to OnyxNotch, inspired by (not copied
+//    from) the Windhawk Dynamic Island mod's approach: native
+//    C++, Direct2D, layered/alpha presentation, spring animation.
+//    Windhawk code is MIT licensed, but no Windhawk code is in
+//    this file; the techniques were reimplemented for our
+//    layout, themes, and window manager.
+// ===========================================================================
+static ID2D1Factory* g_d2dFactory = NULL;
+static IDWriteFactory* g_dwFactory = NULL;
+
+static bool InitD2D()
 {
-    HBRUSH brush = CreateSolidBrush(color);
-    HBRUSH oldBrush = (HBRUSH)SelectObject(hdc, brush);
-    HPEN nullPen = (HPEN)GetStockObject(NULL_PEN);
-    HPEN oldPen = (HPEN)SelectObject(hdc, nullPen);
-    // Teeth: 8 small rectangles rotated around the centre, drawn
-    // first so the ring below covers their inner ends.
+    if (!g_d2dFactory) {
+        HRESULT hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, &g_d2dFactory);
+        if (FAILED(hr)) return false;
+    }
+    if (!g_dwFactory) {
+        HRESULT hr = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,
+            __uuidof(IDWriteFactory), reinterpret_cast<IUnknown**>(&g_dwFactory));
+        if (FAILED(hr)) return false;
+    }
+    return true;
+}
+
+static D2D1_COLOR_F D2DColor(COLORREF c, float a)
+{
+    return D2D1::ColorF((float)GetRValue(c) / 255.0f, (float)GetGValue(c) / 255.0f,
+        (float)GetBValue(c) / 255.0f, a);
+}
+
+static D2D1_RECT_F RectF(const RECT& r)
+{
+    return D2D1::RectF((float)r.left, (float)r.top, (float)r.right, (float)r.bottom);
+}
+
+static D2D1_RECT_F RectFF(float x, float y, float w, float h)
+{
+    return D2D1::RectF(x, y, x + w, y + h);
+}
+
+// Font kinds, matching the v6 GDI fonts (sizes in 96-DPI points,
+// scaled by the notch DPI at format creation, as v6 did).
+enum { kFontClock = 0, kFontBig = 1, kFontSmall = 2, kFontTiny = 3 };
+
+struct Canvas {
+    ID2D1DCRenderTarget* rt = NULL;
+    IDWriteFactory* dw = NULL;
+    int dpi = 96;
+    IDWriteTextFormat* fmt[4] = { NULL, NULL, NULL, NULL };
+    // Small per-frame solid-brush cache (colour+alpha -> brush),
+    // released at the end of every frame in ReleaseAll().
+    struct BrushEnt { UINT32 key; ID2D1SolidColorBrush* brush; };
+    BrushEnt brushes[64];
+    int brushCount = 0;
+
+    ID2D1SolidColorBrush* Brush(COLORREF c, float a)
+    {
+        UINT32 key = (UINT32)c | ((UINT32)(a * 255.0f) << 24);
+        for (int i = 0; i < brushCount; i++) if (brushes[i].key == key) return brushes[i].brush;
+        if (brushCount >= 64 || !rt) return NULL;
+        ID2D1SolidColorBrush* b = NULL;
+        if (FAILED(rt->CreateSolidColorBrush(D2DColor(c, a), &b))) return NULL;
+        brushes[brushCount].key = key;
+        brushes[brushCount].brush = b;
+        brushCount++;
+        return b;
+    }
+    void ReleaseAll()
+    {
+        for (int i = 0; i < brushCount; i++) if (brushes[i].brush) brushes[i].brush->Release();
+        brushCount = 0;
+        for (int i = 0; i < 4; i++) if (fmt[i]) { fmt[i]->Release(); fmt[i] = NULL; }
+    }
+    void FillRect(const RECT& r, COLORREF c, float a = 1.0f)
+    {
+        ID2D1SolidColorBrush* b = Brush(c, a);
+        if (b) rt->FillRectangle(RectF(r), b);
+    }
+    void FillRectF(float x, float y, float w, float h, COLORREF c, float a = 1.0f)
+    {
+        ID2D1SolidColorBrush* b = Brush(c, a);
+        if (b) rt->FillRectangle(RectFF(x, y, w, h), b);
+    }
+    void FillRounded(const RECT& r, COLORREF c, float radius, float a = 1.0f)
+    {
+        ID2D1SolidColorBrush* b = Brush(c, a);
+        if (b) rt->FillRoundedRectangle(D2D1::RoundedRect(RectF(r), radius, radius), b);
+    }
+    void StrokeRounded(const RECT& r, COLORREF c, float width, float radius)
+    {
+        ID2D1SolidColorBrush* b = Brush(c, 1.0f);
+        if (b) rt->DrawRoundedRectangle(D2D1::RoundedRect(RectF(r), radius, radius), b, width);
+    }
+    void FillEllipse(float cx, float cy, float rx, float ry, COLORREF c, float a = 1.0f)
+    {
+        ID2D1SolidColorBrush* b = Brush(c, a);
+        if (b) rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), rx, ry), b);
+    }
+    void StrokeEllipse(float cx, float cy, float rx, float ry, COLORREF c, float width)
+    {
+        ID2D1SolidColorBrush* b = Brush(c, 1.0f);
+        if (b) rt->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), rx, ry), b, width);
+    }
+    void Line(float x0, float y0, float x1, float y1, COLORREF c, float width)
+    {
+        ID2D1SolidColorBrush* b = Brush(c, 1.0f);
+        if (b) rt->DrawLine(D2D1::Point2F(x0, y0), D2D1::Point2F(x1, y1), b, width);
+    }
+    void FillPoly(const POINT* pts, int n, COLORREF c)
+    {
+        if (n < 3 || !g_d2dFactory) return;
+        ID2D1PathGeometry* geo = NULL;
+        if (FAILED(g_d2dFactory->CreatePathGeometry(&geo))) return;
+        ID2D1GeometrySink* sink = NULL;
+        if (SUCCEEDED(geo->Open(&sink))) {
+            sink->BeginFigure(D2D1::Point2F((float)pts[0].x, (float)pts[0].y), D2D1_FIGURE_BEGIN_FILLED);
+            for (int i = 1; i < n; i++) sink->AddLine(D2D1::Point2F((float)pts[i].x, (float)pts[i].y));
+            sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+            sink->Close();
+            sink->Release();
+            ID2D1SolidColorBrush* b = Brush(c, 1.0f);
+            if (b) rt->FillGeometry(geo, b);
+        }
+        geo->Release();
+    }
+    // Stroke an arc of a circle, clockwise from the top, covering
+    // pct percent (0 = nothing, 100 = full circle). Used by rings.
+    void StrokeArc(float cx, float cy, float r, int pct, COLORREF c, float width)
+    {
+        if (pct <= 0) return;
+        ID2D1SolidColorBrush* b = Brush(c, 1.0f);
+        if (!b) return;
+        if (pct >= 100) { rt->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), r, r), b, width); return; }
+        if (!g_d2dFactory) return;
+        const double kPi = 3.141592653589793;
+        double endA = -kPi / 2.0 + (double)pct * 2.0 * kPi / 100.0;
+        D2D1_POINT_2F start = D2D1::Point2F(cx, cy - r);
+        D2D1_POINT_2F end = D2D1::Point2F((float)(cx + r * cos(endA)), (float)(cy + r * sin(endA)));
+        ID2D1PathGeometry* geo = NULL;
+        if (FAILED(g_d2dFactory->CreatePathGeometry(&geo))) return;
+        ID2D1GeometrySink* sink = NULL;
+        if (SUCCEEDED(geo->Open(&sink))) {
+            sink->BeginFigure(start, D2D1_FIGURE_BEGIN_HOLLOW);
+            sink->AddArc(D2D1::ArcSegment(end, D2D1::SizeF(r, r), 0.0f,
+                pct > 50 ? D2D1_SWEEP_DIRECTION_CLOCKWISE : D2D1_SWEEP_DIRECTION_CLOCKWISE,
+                pct > 50 ? D2D1_ARC_SIZE_LARGE : D2D1_ARC_SIZE_SMALL));
+            sink->EndFigure(D2D1_FIGURE_END_OPEN);
+            sink->Close();
+            sink->Release();
+            rt->DrawGeometry(geo, b, width);
+        }
+        geo->Release();
+    }
+};
+
+// --- DirectWrite text helpers (replace GDI DrawText) -----------------------
+static int FontSizeFor(int kind, int dpi)
+{
+    int base = (kind == kFontClock) ? 20 : (kind == kFontBig) ? 36 : (kind == kFontSmall) ? 17 : 14;
+    return Scale(base, dpi);
+}
+
+static void D2DText(Canvas* cv, int kind, const wchar_t* text,
+                    float x, float y, float w, float h, COLORREF color, bool centred)
+{
+    if (!cv || !cv->rt || !cv->fmt[kind] || !text) return;
+    ID2D1SolidColorBrush* b = cv->Brush(color, 1.0f);
+    if (!b) return;
+    cv->fmt[kind]->SetTextAlignment(centred ? DWRITE_TEXT_ALIGNMENT_CENTER : DWRITE_TEXT_ALIGNMENT_LEADING);
+    cv->fmt[kind]->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    cv->rt->DrawText(text, (UINT32)wcslen(text), cv->fmt[kind],
+        D2D1::RectF(x, y, x + w, y + h), b);
+}
+
+// Ellipsis by measurement, not by an obscure trimming API: shorten
+// the string until it plus an ellipsis fits the given width.
+static void D2DTextEllipsis(Canvas* cv, int kind, const wchar_t* text,
+                            float x, float y, float w, float h, COLORREF color)
+{
+    if (!cv || !cv->dw || !cv->fmt[kind] || !text) return;
+    // Measure, and while too wide, drop the last non-ellipsis
+    // character and append an ellipsis.
+    {
+        wchar_t out[256];
+        wcsncpy_s(out, 256, text, _TRUNCATE);
+        for (int guard = 0; guard < 300; guard++) {
+            IDWriteTextLayout* lay = NULL;
+            if (FAILED(cv->dw->CreateTextLayout(out, (UINT32)wcslen(out), cv->fmt[kind], 10000.0f, 10000.0f, &lay))) break;
+            DWRITE_TEXT_METRICS m = { 0 };
+            lay->GetMetrics(&m);
+            lay->Release();
+            if (m.width <= w) break;
+            size_t len = wcslen(out);
+            if (len <= 1) { out[0] = L'\x2026'; out[1] = L'\0'; break; }
+            if (out[len - 1] == L'\x2026') out[len - 2] = L'\x2026', out[len - 1] = L'\0';
+            else { out[len - 1] = L'\x2026'; out[len] = L'\0'; }
+        }
+        D2DText(cv, kind, out, x, y, w, h, color, false);
+    }
+}
+
+static float D2DMeasure(Canvas* cv, int kind, const wchar_t* text)
+{
+    if (!cv || !cv->dw || !cv->fmt[kind] || !text) return 0.0f;
+    IDWriteTextLayout* lay = NULL;
+    if (FAILED(cv->dw->CreateTextLayout(text, (UINT32)wcslen(text), cv->fmt[kind], 10000.0f, 10000.0f, &lay))) return 0.0f;
+    DWRITE_TEXT_METRICS m = { 0 };
+    lay->GetMetrics(&m);
+    lay->Release();
+    return m.width;
+}
+
+// --- Glyphs, redrawn as Direct2D geometry ----------------------------------
+static void DrawGearD2D(Canvas* cv, int cx, int cy, int r, COLORREF color)
+{
     const double kPi = 3.141592653589793;
-    // v6-fix: chunkier teeth (radial 0.55r, width 0.45r) so the gear reads at 11 px.
     int toothW = r * 11 / 20; if (toothW < 3) toothW = 3;
     int toothH = r * 9 / 20; if (toothH < 2) toothH = 2;
     for (int i = 0; i < 8; i++) {
         double a = (double)i * kPi / 4.0;
         double ca = cos(a), sa = sin(a);
-        // Tooth rectangle, centred on the ring, long axis radial.
-        double hx = (double)r, hy = 0.0; // centre offset, unrotated
-        double hw = (double)toothH / 2.0, hh = (double)toothW / 2.0;
-        POINT pts[4];
+        double hx = (double)r, hw = (double)toothH / 2.0, hh = (double)toothW / 2.0;
         double corners[4][2] = { { hx - hh, -hw }, { hx + hh, -hw }, { hx + hh, hw }, { hx - hh, hw } };
+        POINT pts[4];
         for (int c = 0; c < 4; c++) {
             double x = corners[c][0], y = corners[c][1];
             pts[c].x = (LONG)(cx + x * ca - y * sa + 0.5);
             pts[c].y = (LONG)(cy + x * sa + y * ca + 0.5);
         }
-        Polygon(hdc, pts, 4);
+        cv->FillPoly(pts, 4, color);
     }
-    // Ring, then the dark centre hole (dark = notch background tone).
-    Ellipse(hdc, cx - r, cy - r, cx + r, cy + r);
-    HBRUSH holeBrush = CreateSolidBrush(CurrentTheme().gearHole);
-    HBRUSH prevBrush = (HBRUSH)SelectObject(hdc, holeBrush);
+    cv->FillEllipse((float)cx, (float)cy, (float)r, (float)r, color);
     int hr = r * 2 / 5; if (hr < 2) hr = 2;
-    Ellipse(hdc, cx - hr, cy - hr, cx + hr, cy + hr);
-    SelectObject(hdc, prevBrush);
-    DeleteObject(holeBrush);
-    SelectObject(hdc, oldPen);
-    SelectObject(hdc, oldBrush);
-    DeleteObject(brush);
+    cv->FillEllipse((float)cx, (float)cy, (float)hr, (float)hr, CurrentTheme().gearHole);
 }
 
-// v4 tabs: one media glyph (Prev / Play-Pause / Next), shared
-// by the full-size buttons on the MEDIA tab and the smaller
-// buttons on the HOME tab. The glyph brush must already be
-// selected into the DC by the caller.
-// v5-SMTC: playPauseMode (from SmtcPlayPauseGlyphMode) applies
-// only to idx 1: 0 = old combined triangle+bars, 1 = pause bars
-// only (currently playing, so the button pauses), 2 = play
-// triangle only (currently paused, so the button plays).
-static void DrawMediaGlyph(HDC hdc, int idx, int cx, int cy, int r, HBRUSH glyphBrush, int playPauseMode)
+static void DrawMediaGlyphD2D(Canvas* cv, int idx, int cx, int cy, int r, COLORREF color, int playPauseMode)
 {
-    int h = (2 * r) * 14 / 20; // v6-fix: 70% of the diameter, was 55%
+    int h = (2 * r) * 14 / 20; // 70% of the diameter, as in v6-fix
     int half = h / 2;
     if (idx == 0 || idx == 2) {
-        // Prev: bar + two triangles pointing left.
-        // Next: two triangles pointing right + bar (mirrored).
         int dir = (idx == 0) ? -1 : 1;
         int barW = h / 5; if (barW < 3) barW = 3;
         int triW = h / 2;
         int gap = 1;
         int totalW = barW + gap + 2 * triW + gap;
         int x0 = cx - totalW / 2;
-        RECT bar = { 0, 0, 0, 0 };
         if (dir < 0) {
-            bar = { x0, cy - half, x0 + barW, cy + half };
+            RECT bar = { x0, cy - half, x0 + barW, cy + half };
+            cv->FillRect(bar, color);
             POINT t1[3] = { { x0 + barW + gap + triW, cy - half }, { x0 + barW + gap + triW, cy + half }, { x0 + barW + gap, cy } };
             POINT t2[3] = { { x0 + barW + gap + 2 * triW + gap, cy - half }, { x0 + barW + gap + 2 * triW + gap, cy + half }, { x0 + barW + gap + triW + gap, cy } };
-            FillRect(hdc, &bar, glyphBrush);
-            Polygon(hdc, t1, 3);
-            Polygon(hdc, t2, 3);
+            cv->FillPoly(t1, 3, color);
+            cv->FillPoly(t2, 3, color);
         } else {
             POINT t1[3] = { { x0, cy - half }, { x0, cy + half }, { x0 + triW, cy } };
             POINT t2[3] = { { x0 + triW + gap, cy - half }, { x0 + triW + gap, cy + half }, { x0 + 2 * triW + gap, cy } };
-            bar = { x0 + 2 * triW + 2 * gap, cy - half, x0 + 2 * triW + 2 * gap + barW, cy + half };
-            Polygon(hdc, t1, 3);
-            Polygon(hdc, t2, 3);
-            FillRect(hdc, &bar, glyphBrush);
+            RECT bar = { x0 + 2 * triW + 2 * gap, cy - half, x0 + 2 * triW + 2 * gap + barW, cy + half };
+            cv->FillPoly(t1, 3, color);
+            cv->FillPoly(t2, 3, color);
+            cv->FillRect(bar, color);
         }
     } else if (playPauseMode == 1) {
-        // v5-SMTC, playing: pause bars only, centred.
         int barW = h / 5; if (barW < 3) barW = 3;
         int gap = h / 6; if (gap < 2) gap = 2;
         int totalW = 2 * barW + gap;
         int x0 = cx - totalW / 2;
-        RECT b1 = { x0, cy - half, x0 + barW, cy + half };
-        RECT b2 = { x0 + barW + gap, cy - half, x0 + 2 * barW + gap, cy + half };
-        FillRect(hdc, &b1, glyphBrush);
-        FillRect(hdc, &b2, glyphBrush);
+        cv->FillRect(RECT{ x0, cy - half, x0 + barW, cy + half }, color);
+        cv->FillRect(RECT{ x0 + barW + gap, cy - half, x0 + 2 * barW + gap, cy + half }, color);
     } else if (playPauseMode == 2) {
-        // v5-SMTC, paused: play triangle only, centred.
         int triW = h / 2;
         int x0 = cx - triW / 2;
         POINT tri[3] = { { x0, cy - half }, { x0, cy + half }, { x0 + triW, cy } };
-        Polygon(hdc, tri, 3);
+        cv->FillPoly(tri, 3, color);
     } else {
-        // Play/Pause: a play triangle on the left, pause bars
-        // on the right, so one button reads as the toggle.
         int triW = h / 2;
         int barW = h / 5; if (barW < 3) barW = 3;
         int gap = h / 6; if (gap < 2) gap = 2;
         int totalW = triW + gap + 2 * barW + gap;
         int x0 = cx - totalW / 2;
         POINT tri[3] = { { x0, cy - half }, { x0, cy + half }, { x0 + triW, cy } };
-        Polygon(hdc, tri, 3);
-        RECT b1 = { x0 + triW + gap, cy - half, x0 + triW + gap + barW, cy + half };
-        RECT b2 = { x0 + triW + gap + barW + gap, cy - half, x0 + triW + gap + 2 * barW + gap, cy + half };
-        FillRect(hdc, &b1, glyphBrush);
-        FillRect(hdc, &b2, glyphBrush);
+        cv->FillPoly(tri, 3, color);
+        cv->FillRect(RECT{ x0 + triW + gap, cy - half, x0 + triW + gap + barW, cy + half }, color);
+        cv->FillRect(RECT{ x0 + triW + gap + barW + gap, cy - half, x0 + triW + gap + 2 * barW + gap, cy + half }, color);
     }
 }
 
-// v4 premium surface helpers, now theme-driven (v5-themes). No
-// new allocations, no new timers: the gradient is drawn row by
-// row with plain GDI (the window region already clips it to the
-// pill shape), and the border and top highlight are single
-// strokes drawn over the content. All colours come from the
-// current theme; nothing here is hardcoded.
-static void PaintPremiumSurface(HDC hdc, const RECT& rc)
+// --- Surface, border, battery, cards ---------------------------------------
+static void PaintSurfaceD2D(Canvas* cv, Notch* n, const RECT& rc, float panelAlpha)
 {
-    // Vertical theme gradient: top colour at the top, bottom
-    // colour at the bottom, interpolated per row. Pure GDI, no
-    // GradientFill/msimg32 lib.
-    int h = rc.bottom - rc.top;
-    if (h < 1) h = 1;
+    if (!cv || !cv->rt) return;
     const Theme& th = CurrentTheme();
-    for (int y = 0; y < rc.bottom; y++) {
-        int t = y * 100 / h; // 0 at top, 100 at bottom
-        int r = GetRValue(th.gradTop) + (GetRValue(th.gradBottom) - GetRValue(th.gradTop)) * t / 100;
-        int g = GetGValue(th.gradTop) + (GetGValue(th.gradBottom) - GetGValue(th.gradTop)) * t / 100;
-        int b = GetBValue(th.gradTop) + (GetBValue(th.gradBottom) - GetBValue(th.gradTop)) * t / 100;
-        HBRUSH rowBrush = CreateSolidBrush(RGB(r, g, b));
-        RECT row = { rc.left, y, rc.right, y + 1 };
-        FillRect(hdc, &row, rowBrush);
-        DeleteObject(rowBrush);
+    ID2D1GradientStopCollection* stops = NULL;
+    D2D1_GRADIENT_STOP gs[2] = {
+        { 0.0f, D2DColor(th.gradTop, panelAlpha) },
+        { 1.0f, D2DColor(th.gradBottom, panelAlpha) }
+    };
+    bool painted = false;
+    if (SUCCEEDED(cv->rt->CreateGradientStopCollection(gs, 2, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP, &stops))) {
+        ID2D1LinearGradientBrush* gb = NULL;
+        D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES bp = D2D1::LinearGradientBrushProperties(
+            D2D1::Point2F((float)rc.left, (float)rc.top),
+            D2D1::Point2F((float)rc.left, (float)rc.bottom));
+        if (SUCCEEDED(cv->rt->CreateLinearGradientBrush(&bp, stops, &gb))) {
+            cv->rt->FillRoundedRectangle(D2D1::RoundedRect(RectF(rc), 14.0f, 14.0f), gb);
+            gb->Release();
+            painted = true;
+        }
+        stops->Release();
     }
+    // Fallback: if gradient creation ever fails, the panel must
+    // still be opaque, never transparent or black.
+    if (!painted) cv->FillRounded(rc, th.gradTop, 14.0f, panelAlpha);
+    (void)n;
 }
 
-static void PaintPremiumBorder(HDC hdc, const RECT& rc, int dpi, bool hover)
+static void PaintBorderD2D(Canvas* cv, const RECT& rc, int dpi, bool hover, Notch* n)
 {
-    // Subtle 1 px light border, a touch brighter on hover (the v3
-    // hover outline, restyled as the permanent premium border).
     COLORREF border = hover ? CurrentTheme().borderHover : CurrentTheme().border;
-    HPEN pen = CreatePen(PS_SOLID, 1, border);
-    HPEN oldPen = (HPEN)SelectObject(hdc, pen);
-    HBRUSH nullBrush = (HBRUSH)GetStockObject(NULL_BRUSH);
-    HBRUSH oldBrush = (HBRUSH)SelectObject(hdc, nullBrush);
-    RoundRect(hdc, 0, 0, rc.right, rc.bottom, 28, 28);
-    SelectObject(hdc, oldPen);
-    SelectObject(hdc, oldBrush);
-    DeleteObject(pen);
-    // Soft inner top highlight: a 1 px light line, inset so it
-    // never touches the rounded corners.
+    cv->StrokeRounded(rc, border, 1.0f, 14.0f);
     int inset = Scale(20, dpi);
-    HBRUSH hl = CreateSolidBrush(CurrentTheme().highlight);
-    RECT line = { inset, Scale(1, dpi), rc.right - inset, Scale(2, dpi) };
-    if (line.right > line.left) FillRect(hdc, &line, hl);
-    DeleteObject(hl);
+    int y0 = Scale(1, dpi), y1 = Scale(2, dpi);
+    if (rc.right - inset > inset) {
+        cv->FillRectF((float)inset, (float)y0, (float)(rc.right - 2 * inset), (float)(y1 - y0), CurrentTheme().highlight);
+    }
+    (void)n;
 }
 
-// Battery state for the v4 glyph. Returns false when there is no
-// battery (desktop / unknown), in which case only the outline is
-// drawn and the text stays "Battery: --" as before.
-static bool BatteryInfo(int& pct, bool& charging)
+static void DrawBatteryGlyphD2D(Canvas* cv, int x, int y, int w, int h, int pct, bool charging, bool known)
 {
-    SYSTEM_POWER_STATUS sps;
-    if (!GetSystemPowerStatus(&sps) || sps.BatteryLifePercent == 255) return false;
-    pct = (int)sps.BatteryLifePercent;
-    charging = (sps.ACLineStatus == 1 && (sps.BatteryFlag & 8) != 0);
-    return true;
-}
-
-static void DrawBatteryGlyph(HDC hdc, int x, int y, int w, int h, int pct, bool charging, bool known)
-{
-    HPEN pen = CreatePen(PS_SOLID, 1, CurrentTheme().batteryOutline);
-    HPEN oldPen = (HPEN)SelectObject(hdc, pen);
-    HBRUSH nullBrush = (HBRUSH)GetStockObject(NULL_BRUSH);
-    HBRUSH oldBrush = (HBRUSH)SelectObject(hdc, nullBrush);
-    RoundRect(hdc, x, y, x + w, y + h, 4, 4);
-    SelectObject(hdc, oldPen);
-    SelectObject(hdc, oldBrush);
-    DeleteObject(pen);
-    // Tip nub on the right.
+    const Theme& th = CurrentTheme();
+    cv->StrokeRounded(RECT{ x, y, x + w, y + h }, th.batteryOutline, 1.0f, 2.0f);
     int tipW = (w / 8 < 2) ? 2 : w / 8;
     int tipH = h / 2;
-    HBRUSH tipBrush = CreateSolidBrush(CurrentTheme().batteryOutline);
-    RECT tip = { x + w, y + (h - tipH) / 2, x + w + tipW, y + (h + tipH) / 2 };
-    FillRect(hdc, &tip, tipBrush);
-    DeleteObject(tipBrush);
+    cv->FillRect(RECT{ x + w, y + (h - tipH) / 2, x + w + tipW, y + (h + tipH) / 2 }, th.batteryOutline);
     if (!known) return;
-    // Fill by percentage, inset inside the outline.
-    int innerX = x + 2, innerY = y + 2;
-    int innerW = w - 4, innerH = h - 4;
+    int innerX = x + 2, innerY = y + 2, innerW = w - 4, innerH = h - 4;
     if (innerW > 0 && innerH > 0) {
         int fillW = innerW * pct / 100;
-        if (fillW > 0) {
-            HBRUSH fillBrush = CreateSolidBrush(CurrentTheme().batteryFill);
-            RECT fill = { innerX, innerY, innerX + fillW, innerY + innerH };
-            FillRect(hdc, &fill, fillBrush);
-            DeleteObject(fillBrush);
-        }
+        if (fillW > 0) cv->FillRect(RECT{ innerX, innerY, innerX + fillW, innerY + innerH }, th.batteryFill);
     }
     if (charging) {
-        // Lightning bolt in dark grey over the fill, centred.
         int cx = x + w / 2, cy = y + h / 2, bh = h * 3 / 4, bw = bh / 2;
         POINT bolt[6] = {
             { cx + bw / 2, cy - bh / 2 }, { cx - bw / 2, cy + 1 },
             { cx, cy + 1 }, { cx - bw / 2, cy + bh / 2 },
             { cx + bw / 2, cy - 1 }, { cx, cy - 1 }
         };
-        HBRUSH boltBrush = CreateSolidBrush(CurrentTheme().batteryBolt);
-        HBRUSH oldB = (HBRUSH)SelectObject(hdc, boltBrush);
-        HPEN nullP = (HPEN)GetStockObject(NULL_PEN);
-        HPEN oldP = (HPEN)SelectObject(hdc, nullP);
-        Polygon(hdc, bolt, 6);
-        SelectObject(hdc, oldP);
-        SelectObject(hdc, oldB);
-        DeleteObject(boltBrush);
+        cv->FillPoly(bolt, 6, th.batteryBolt);
     }
 }
 
-// ---------------------------------------------------------------------------
-// v6 card / ring / sparkline / dock-glyph painting helpers.
-// All colours come from the current theme. Card background is
-// the theme gradient top lightened slightly, so cards read as
-// raised panels on the darker panel gradient, in every theme.
-// ---------------------------------------------------------------------------
-static COLORREF CardColor()
+static COLORREF CardColorD2D()
 {
     const Theme& th = CurrentTheme();
     int r = GetRValue(th.gradTop) + 14; if (r > 255) r = 255;
@@ -2211,136 +2363,72 @@ static COLORREF CardColor()
     return RGB(r, g, b);
 }
 
-static void DrawCard(HDC hdc, const RECT& rc, const wchar_t* label, HFONT fontTiny)
+static void DrawCardD2D(Canvas* cv, const RECT& rc, const wchar_t* label)
 {
-    HPEN nullPen = (HPEN)GetStockObject(NULL_PEN);
-    HPEN oldPen = (HPEN)SelectObject(hdc, nullPen);
-    HBRUSH brush = CreateSolidBrush(CardColor());
-    HBRUSH oldBrush = (HBRUSH)SelectObject(hdc, brush);
-    RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, 18, 18);
-    SelectObject(hdc, oldPen);
-    SelectObject(hdc, oldBrush);
-    DeleteObject(brush);
-    if (label) DrawLeftText(hdc, fontTiny, label, rc.left + 14, rc.top + 10, rc.right - rc.left - 28, 16, CurrentTheme().muted);
+    // Soft shadow first: dark rounded rect 2 px below the card.
+    RECT shadow = rc; shadow.top += 2; shadow.bottom += 2;
+    cv->FillRounded(shadow, RGB(0, 0, 0), 9.0f, 0.30f);
+    cv->FillRounded(rc, CardColorD2D(), 9.0f, 1.0f);
+    if (label) D2DText(cv, kFontTiny, label, (float)rc.left + 14.0f, (float)rc.top + 10.0f,
+        (float)(rc.right - rc.left - 28), 16.0f, CurrentTheme().muted, false);
 }
 
-static void DrawRing(HDC hdc, int cx, int cy, int r, int pct, int dpi)
+static void DrawRingD2D(Canvas* cv, int cx, int cy, int r, int pct, int dpi)
 {
     const Theme& th = CurrentTheme();
-    HPEN trackPen = CreatePen(PS_SOLID, Scale(6, dpi), th.divider);
-    HPEN oldPen = (HPEN)SelectObject(hdc, trackPen);
-    HBRUSH nullBrush = (HBRUSH)GetStockObject(NULL_BRUSH);
-    HBRUSH oldBrush = (HBRUSH)SelectObject(hdc, nullBrush);
-    Ellipse(hdc, cx - r, cy - r, cx + r, cy + r);
-    DeleteObject(trackPen);
-    if (pct > 0) {
-        HPEN fillPen = CreatePen(PS_SOLID, Scale(6, dpi), th.accent);
-        SelectObject(hdc, fillPen);
-        const double kPi = 3.141592653589793;
-        double endA = -kPi / 2.0 + (double)pct * 2.0 * kPi / 100.0;
-        int x1 = (int)(cx + r * cos(-kPi / 2.0) + 0.5);
-        int y1 = (int)(cy + r * sin(-kPi / 2.0) + 0.5);
-        int x2 = (int)(cx + r * cos(endA) + 0.5);
-        int y2 = (int)(cy + r * sin(endA) + 0.5);
-        Arc(hdc, cx - r, cy - r, cx + r, cy + r, x1, y1, x2, y2);
-        DeleteObject(fillPen);
-    }
-    SelectObject(hdc, oldPen);
-    SelectObject(hdc, oldBrush);
+    cv->StrokeEllipse((float)cx, (float)cy, (float)r, (float)r, th.divider, (float)Scale(6, dpi));
+    if (pct > 0) cv->StrokeArc((float)cx, (float)cy, (float)r, pct, th.accent, (float)Scale(6, dpi));
 }
 
-static void DrawSparkline(HDC hdc, const RECT& rc, const int* hist, int count, COLORREF color)
+static void DrawSparklineD2D(Canvas* cv, const RECT& rc, const int* hist, int count, COLORREF color)
 {
     if (count < 2) return;
-    HPEN pen = CreatePen(PS_SOLID, 1, color);
-    HPEN oldPen = (HPEN)SelectObject(hdc, pen);
     int w = rc.right - rc.left, h = rc.bottom - rc.top;
     for (int i = 1; i < count; i++) {
-        int x0 = rc.left + (i - 1) * w / (count - 1);
-        int x1 = rc.left + i * w / (count - 1);
-        int y0 = rc.bottom - hist[i - 1] * h / 100;
-        int y1 = rc.bottom - hist[i] * h / 100;
-        MoveToEx(hdc, x0, y0, NULL);
-        LineTo(hdc, x1, y1);
+        float x0 = (float)rc.left + (float)(i - 1) * w / (count - 1);
+        float x1 = (float)rc.left + (float)i * w / (count - 1);
+        float y0 = (float)rc.bottom - (float)hist[i - 1] * h / 100.0f;
+        float y1 = (float)rc.bottom - (float)hist[i] * h / 100.0f;
+        cv->Line(x0, y0, x1, y1, color, 1.0f);
     }
-    SelectObject(hdc, oldPen);
-    DeleteObject(pen);
 }
 
-static void DrawBar(HDC hdc, const RECT& rc, int pct)
+static void DrawBarD2D(Canvas* cv, const RECT& rc, int pct)
 {
-    HBRUSH trackBrush = CreateSolidBrush(CurrentTheme().divider);
-    FillRect(hdc, &rc, trackBrush);
-    DeleteObject(trackBrush);
+    cv->FillRect(rc, CurrentTheme().divider);
     if (pct > 0) {
         RECT fill = rc;
         fill.right = rc.left + (rc.right - rc.left) * pct / 100;
-        if (fill.right > fill.left) {
-            HBRUSH fillBrush = CreateSolidBrush(CurrentTheme().accent);
-            FillRect(hdc, &fill, fillBrush);
-            DeleteObject(fillBrush);
-        }
+        if (fill.right > fill.left) cv->FillRect(fill, CurrentTheme().accent);
     }
 }
 
-// v6-fix icon system: redrawn GDI, NOT Segoe MDL2 Assets. MDL2 was
-// considered and rejected on purpose: its glyph codepoints cannot
-// be verified in this VM, and a wrong or missing glyph would render
-// as a tofu box on a user's machine. Hand-drawn glyphs are checked
-// against the same Layout hit areas that painting uses, take theme
-// colours directly, and need no font detection. One grid for every
-// icon: glyphs live in a circle of radius ir = 3/4 of the hit
-// radius, strokes are at least ir/5 thick, and every glyph is
-// centred on its hit centre. Dock active = white circle + dark
-// glyph (unchanged); inactive = muted, brighter on hover.
-static void DrawDockGlyph(HDC hdc, int tabId, int cx, int cy, int r, COLORREF color)
+static void DrawDockGlyphD2D(Canvas* cv, int tabId, int cx, int cy, int r, COLORREF color)
 {
     int ir = r * 3 / 4; if (ir < 4) ir = 4;
     int stroke = ir / 5; if (stroke < 2) stroke = 2;
-    HPEN pen = CreatePen(PS_SOLID, stroke, color);
-    HPEN oldPen = (HPEN)SelectObject(hdc, pen);
-    HBRUSH brush = CreateSolidBrush(color);
-    HBRUSH oldBrush = (HBRUSH)SelectObject(hdc, brush);
-    HPEN nullPen = (HPEN)GetStockObject(NULL_PEN);
-    HBRUSH nullBrush = (HBRUSH)GetStockObject(NULL_BRUSH);
     if (tabId == kTabHome) {
         POINT roof[3] = { { cx, cy - ir }, { cx - ir, cy - ir / 4 }, { cx + ir, cy - ir / 4 } };
-        Polygon(hdc, roof, 3);
-        RECT house = { cx - ir * 2 / 3, cy - ir / 4, cx + ir * 2 / 3, cy + ir };
-        FillRect(hdc, &house, brush);
+        cv->FillPoly(roof, 3, color);
+        cv->FillRect(RECT{ cx - ir * 2 / 3, cy - ir / 4, cx + ir * 2 / 3, cy + ir }, color);
     } else if (tabId == kTabSystem) {
-        SelectObject(hdc, nullPen);
-        DrawGear(hdc, cx, cy, ir, color);
-        SelectObject(hdc, pen);
+        DrawGearD2D(cv, cx, cy, ir, color);
     } else if (tabId == kTabMedia) {
         POINT tri[3] = { { cx - ir / 2, cy - ir * 2 / 3 }, { cx - ir / 2, cy + ir * 2 / 3 }, { cx + ir * 2 / 3, cy } };
-        Polygon(hdc, tri, 3);
+        cv->FillPoly(tri, 3, color);
     } else if (tabId == kTabClock) {
-        HBRUSH prevB = (HBRUSH)SelectObject(hdc, nullBrush);
-        Ellipse(hdc, cx - ir, cy - ir, cx + ir, cy + ir);
-        SelectObject(hdc, prevB);
-        MoveToEx(hdc, cx, cy, NULL); LineTo(hdc, cx, cy - ir / 2);
-        MoveToEx(hdc, cx, cy, NULL); LineTo(hdc, cx + ir / 2, cy);
+        cv->StrokeEllipse((float)cx, (float)cy, (float)ir, (float)ir, color, (float)stroke);
+        cv->Line((float)cx, (float)cy, (float)cx, (float)(cy - ir / 2), color, (float)stroke);
+        cv->Line((float)cx, (float)cy, (float)(cx + ir / 2), (float)cy, color, (float)stroke);
     } else if (tabId == kTabCalendar) {
         RECT cal = { cx - ir, cy - ir * 3 / 4, cx + ir, cy + ir };
-        HBRUSH prevB = (HBRUSH)SelectObject(hdc, nullBrush);
-        RoundRect(hdc, cal.left, cal.top, cal.right, cal.bottom, 4, 4);
-        SelectObject(hdc, prevB);
-        RECT bar = { cal.left, cal.top, cal.right, cal.top + ir / 3 };
-        FillRect(hdc, &bar, brush);
+        cv->StrokeRounded(cal, color, 1.0f, 2.0f);
+        cv->FillRect(RECT{ cal.left, cal.top, cal.right, cal.top + ir / 3 }, color);
     }
-    SelectObject(hdc, oldPen);
-    SelectObject(hdc, oldBrush);
-    DeleteObject(pen);
-    DeleteObject(brush);
 }
 
-static void DrawMediaButtonsRow(HDC hdc, Notch* n, const Layout& L, bool home)
+static void DrawMediaButtonsRowD2D(Canvas* cv, Notch* n, const Layout& L, bool home)
 {
-    HBRUSH glyphBrush = CreateSolidBrush(CurrentTheme().glyph);
-    HPEN nullPen = (HPEN)GetStockObject(NULL_PEN);
-    HPEN oldPen = (HPEN)SelectObject(hdc, nullPen);
-    HBRUSH oldBrush = (HBRUSH)GetCurrentObject(hdc, OBJ_BRUSH);
     for (int i = 0; i < 3; i++) {
         int cx, cy, r;
         if (home) HomeMediaButtonCircle(L, i, cx, cy, r);
@@ -2348,41 +2436,36 @@ static void DrawMediaButtonsRow(HDC hdc, Notch* n, const Layout& L, bool home)
         COLORREF bg = CurrentTheme().btnBg;
         if (i == n->pressedBtn) bg = CurrentTheme().btnPressed;
         else if (i == n->hoverBtn) bg = CurrentTheme().btnHover;
-        HBRUSH btnBrush = CreateSolidBrush(bg);
-        HBRUSH prevBrush = (HBRUSH)SelectObject(hdc, btnBrush);
-        Ellipse(hdc, cx - r, cy - r, cx + r, cy + r);
-        SelectObject(hdc, prevBrush);
-        DeleteObject(btnBrush);
+        cv->FillEllipse((float)cx, (float)cy, (float)r, (float)r, bg);
     }
-    SelectObject(hdc, glyphBrush);
     for (int i = 0; i < 3; i++) {
         int cx, cy, r;
         if (home) HomeMediaButtonCircle(L, i, cx, cy, r);
         else MediaButtonCircle(L, i, cx, cy, r);
-        DrawMediaGlyph(hdc, i, cx, cy, r, glyphBrush, SmtcPlayPauseGlyphMode());
+        DrawMediaGlyphD2D(cv, i, cx, cy, r, CurrentTheme().glyph, SmtcPlayPauseGlyphMode());
     }
-    SelectObject(hdc, oldPen);
-    SelectObject(hdc, oldBrush);
-    DeleteObject(glyphBrush);
 }
 
-static void PaintNotch(Notch* n, HDC hdc)
+// --- PaintNotch, Direct2D version -------------------------------------------
+// Layout, tab, calendar, SMTC, and hit-test logic are UNCHANGED from
+// v6: only the drawing calls differ. Panel alpha is 1.0 normally,
+// 0.88 when blur is active (see ApplyBlur), so blur can show
+// through the panel instead of being hidden behind opaque paint.
+static void PaintNotchD2D(Notch* n, Canvas* cv)
 {
     RECT rc; GetClientRect(n->hwnd, &rc);
-    PaintPremiumSurface(hdc, rc);
+    float panelAlpha = n->blurActive ? 0.88f : 1.0f;
+    PaintSurfaceD2D(cv, n, rc, panelAlpha);
     wchar_t clockText[32]; FormatClock(clockText, 32);
     int dpi = n->dpi;
     const Theme& th = CurrentTheme();
     if (!n->paintExpanded) {
-        DrawCenteredText(hdc, n->hFontClock, clockText, 0, 0, rc.right, rc.bottom, th.primary);
-        PaintPremiumBorder(hdc, rc, dpi, n->hoverNotch);
+        D2DText(cv, kFontClock, clockText, 0, 0, (float)rc.right, (float)rc.bottom, th.primary, true);
+        PaintBorderD2D(cv, rc, dpi, n->hoverNotch, n);
         return;
     }
     Layout L = ComputeLayout(n, rc.right);
     int effTab = EffectiveTab(n);
-    // v6 header bar: title left, subtitle under it, battery +
-    // gear + close X right. The old big clock/date/battery block
-    // is gone: that content now lives in cards below.
     static const wchar_t* kTabTitles[5] = { L"Home", L"Media", L"System", L"Calendar", L"Clock" };
     wchar_t subtitle[128] = { 0 };
     if (effTab == kTabHome) { FormatDate(subtitle, 128); }
@@ -2397,36 +2480,28 @@ static void PaintNotch(Notch* n, HDC hdc)
         else wcscpy_s(subtitle, 128, L"Media controls");
     }
     int margin = Scale(20, dpi);
-    DrawLeftText(hdc, n->hFontSmall, kTabTitles[effTab], margin, Scale(8, dpi), rc.right / 2, Scale(24, dpi), th.primary);
-    DrawLeftText(hdc, n->hFontTiny, subtitle, margin, Scale(30, dpi), rc.right / 2, Scale(20, dpi), th.secondary);
-    // Battery % + glyph, right-aligned before the gear.
+    D2DText(cv, kFontSmall, kTabTitles[effTab], (float)margin, (float)Scale(8, dpi), (float)rc.right / 2.0f, (float)Scale(24, dpi), th.primary, false);
+    D2DText(cv, kFontTiny, subtitle, (float)margin, (float)Scale(30, dpi), (float)rc.right / 2.0f, (float)Scale(20, dpi), th.secondary, false);
     {
         int pct = 0; bool charging = false; bool known = BatteryInfo(pct, charging);
         wchar_t batt[32];
         if (known) swprintf(batt, 32, L"%d%%", pct); else wcscpy_s(batt, 32, L"--");
-        HFONT oldF = (HFONT)SelectObject(hdc, n->hFontTiny);
-        SIZE sz = { 0, 0 }; GetTextExtentPoint32W(hdc, batt, lstrlenW(batt), &sz);
-        SelectObject(hdc, oldF);
+        float tw = D2DMeasure(cv, kFontTiny, batt);
         int glyphW = Scale(24, dpi), glyphH = Scale(13, dpi), gap = Scale(6, dpi);
-        int textX = L.gearCX - L.gearR - Scale(12, dpi) - gap - glyphW - gap - sz.cx;
+        int textX = (int)(L.gearCX - L.gearR - Scale(12, dpi) - gap - glyphW - gap - tw);
         if (textX < rc.right / 2) textX = rc.right / 2;
-        DrawLeftText(hdc, n->hFontTiny, batt, textX, L.headerH / 2 - Scale(10, dpi), sz.cx, Scale(20, dpi), th.secondary);
-        DrawBatteryGlyph(hdc, textX + sz.cx + gap, L.headerH / 2 - glyphH / 2, glyphW, glyphH, pct, charging, known);
+        D2DText(cv, kFontTiny, batt, (float)textX, (float)(L.headerH / 2 - Scale(10, dpi)), tw, (float)Scale(20, dpi), th.secondary, false);
+        DrawBatteryGlyphD2D(cv, (int)(textX + tw) + gap, L.headerH / 2 - glyphH / 2, glyphW, glyphH, pct, charging, known);
     }
-    // Gear + close X in the header.
     {
         COLORREF gearColor = th.gear;
         if (n->pressedGear) gearColor = th.gearPressed;
         else if (n->hoverGear) gearColor = th.gearHover;
-        DrawGear(hdc, L.gearCX, L.gearCY, L.gearR, gearColor);
+        DrawGearD2D(cv, L.gearCX, L.gearCY, L.gearR, gearColor);
         int xw = L.closeR / 4; if (xw < 2) xw = 2;
-        HPEN xPen = CreatePen(PS_SOLID, xw, n->hoverClose ? th.primary : th.secondary);
-        HPEN oldPen = (HPEN)SelectObject(hdc, xPen);
         int r = L.closeR;
-        MoveToEx(hdc, L.closeCX - r, L.closeCY - r, NULL); LineTo(hdc, L.closeCX + r, L.closeCY + r);
-        MoveToEx(hdc, L.closeCX + r, L.closeCY - r, NULL); LineTo(hdc, L.closeCX - r, L.closeCY + r);
-        SelectObject(hdc, oldPen);
-        DeleteObject(xPen);
+        cv->Line((float)(L.closeCX - r), (float)(L.closeCY - r), (float)(L.closeCX + r), (float)(L.closeCY + r), n->hoverClose ? th.primary : th.secondary, (float)xw);
+        cv->Line((float)(L.closeCX + r), (float)(L.closeCY - r), (float)(L.closeCX - r), (float)(L.closeCY + r), n->hoverClose ? th.primary : th.secondary, (float)xw);
     }
 
     SYSTEMTIME now; GetLocalTime(&now);
@@ -2435,7 +2510,7 @@ static void PaintNotch(Notch* n, HDC hdc)
             RECT c = L.homeCards[i];
             int id = L.homeCardIds[i];
             if (id == 0) {
-                DrawCard(hdc, c, L"SYSTEM", n->hFontTiny);
+                DrawCardD2D(cv, c, L"SYSTEM");
                 int vals[3] = { g_cpuPercent, g_memPercent, g_diskPercent };
                 static const wchar_t* names[3] = { L"CPU", L"RAM", L"DISK" };
                 int r = Scale(26, dpi);
@@ -2444,13 +2519,13 @@ static void PaintNotch(Notch* n, HDC hdc)
                 int cy = c.top + Scale(62, dpi);
                 for (int k = 0; k < 3; k++) {
                     int cx = x0 + k * (2 * r + Scale(16, dpi)) + r;
-                    DrawRing(hdc, cx, cy, r, vals[k], dpi);
+                    DrawRingD2D(cv, cx, cy, r, vals[k], dpi);
                     wchar_t pv[16]; swprintf(pv, 16, L"%d%%", vals[k]);
-                    DrawCenteredText(hdc, n->hFontTiny, pv, cx - r, cy - Scale(10, dpi), 2 * r, Scale(20, dpi), th.primary);
-                    DrawCenteredText(hdc, n->hFontTiny, names[k], cx - r, cy + r + Scale(4, dpi), 2 * r, Scale(16, dpi), th.muted);
+                    D2DText(cv, kFontTiny, pv, (float)(cx - r), (float)(cy - Scale(10, dpi)), (float)(2 * r), (float)Scale(20, dpi), th.primary, true);
+                    D2DText(cv, kFontTiny, names[k], (float)(cx - r), (float)(cy + r + Scale(4, dpi)), (float)(2 * r), (float)Scale(16, dpi), th.muted, true);
                 }
             } else if (id == 1) {
-                DrawCard(hdc, c, L"CALENDAR", n->hFontTiny);
+                DrawCardD2D(cv, c, L"CALENDAR");
                 FILETIME ft; SystemTimeToFileTime(&now, &ft);
                 ULARGE_INTEGER base; base.LowPart = ft.dwLowDateTime; base.HighPart = ft.dwHighDateTime;
                 int cellW = (c.right - c.left - Scale(28, dpi)) / 7;
@@ -2463,78 +2538,74 @@ static void PaintNotch(Notch* n, HDC hdc)
                     int x = c.left + Scale(14, dpi) + cc * cellW;
                     bool isToday = (cc == now.wDayOfWeek);
                     if (isToday) {
-                        HPEN nullP = (HPEN)GetStockObject(NULL_PEN); HPEN oldP = (HPEN)SelectObject(hdc, nullP);
-                        HBRUSH pill = CreateSolidBrush(th.accent); HBRUSH oldB = (HBRUSH)SelectObject(hdc, pill);
-                        RoundRect(hdc, x + 2, y + 1, x + cellW - 2, y + cellH - 1, cellH, cellH);
-                        SelectObject(hdc, oldP); SelectObject(hdc, oldB); DeleteObject(pill);
+                        cv->FillRounded(RECT{ x + 2, y + 1, x + cellW - 2, y + cellH - 1 }, th.accent, (float)cellH / 2.0f);
                     }
                     wchar_t dayText[8]; swprintf(dayText, 8, L"%d", cst.wDay);
-                    DrawCenteredText(hdc, n->hFontTiny, dayText, x, y, cellW, cellH, isToday ? th.pillText : th.secondary);
+                    D2DText(cv, kFontTiny, dayText, (float)x, (float)y, (float)cellW, (float)cellH, isToday ? th.pillText : th.secondary, true);
                 }
                 wchar_t weekLabel[64]; FormatDate(weekLabel, 64);
-                DrawCenteredText(hdc, n->hFontTiny, weekLabel, c.left + 14, c.top + Scale(84, dpi), c.right - c.left - 28, Scale(20, dpi), th.secondary);
+                D2DText(cv, kFontTiny, weekLabel, (float)(c.left + 14), (float)(c.top + Scale(84, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.secondary, true);
             } else if (id == 2) {
-                DrawCard(hdc, c, L"CLOCK", n->hFontTiny);
+                DrawCardD2D(cv, c, L"CLOCK");
                 wchar_t t12[32]; FormatTime12(now, t12, 32);
-                DrawCenteredText(hdc, n->hFontBig, t12, c.left, c.top + Scale(36, dpi), c.right - c.left, Scale(48, dpi), th.primary);
+                D2DText(cv, kFontBig, t12, (float)c.left, (float)(c.top + Scale(36, dpi)), (float)(c.right - c.left), (float)Scale(48, dpi), th.primary, true);
                 wchar_t dt[64]; FormatDate(dt, 64);
-                DrawCenteredText(hdc, n->hFontTiny, dt, c.left + 14, c.top + Scale(92, dpi), c.right - c.left - 28, Scale(20, dpi), th.secondary);
+                D2DText(cv, kFontTiny, dt, (float)(c.left + 14), (float)(c.top + Scale(92, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.secondary, true);
             } else if (id == 3) {
-                DrawCard(hdc, c, L"MEDIA", n->hFontTiny);
+                DrawCardD2D(cv, c, L"MEDIA");
                 if (g_smtcHasTrack) {
-                    DrawLeftEllipsisText(hdc, n->hFontTiny, g_smtcTitle, c.left + 14, L.homeMediaTitleY, c.right - c.left - 28, Scale(20, dpi), th.primary);
-                    if (g_smtcArtist[0] != L'\0') DrawLeftEllipsisText(hdc, n->hFontTiny, g_smtcArtist, c.left + 14, L.homeMediaTitleY + Scale(20, dpi), c.right - c.left - 28, Scale(20, dpi), th.secondary);
+                    D2DTextEllipsis(cv, kFontTiny, g_smtcTitle, (float)(c.left + 14), (float)L.homeMediaTitleY, (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.primary);
+                    if (g_smtcArtist[0] != L'\0') D2DTextEllipsis(cv, kFontTiny, g_smtcArtist, (float)(c.left + 14), (float)(L.homeMediaTitleY + Scale(20, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.secondary);
                 } else {
-                    DrawLeftText(hdc, n->hFontTiny, L"No track", c.left + 14, L.homeMediaTitleY, c.right - c.left - 28, Scale(20, dpi), th.secondary);
+                    D2DText(cv, kFontTiny, L"No track", (float)(c.left + 14), (float)L.homeMediaTitleY, (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.secondary, false);
                 }
-                DrawMediaButtonsRow(hdc, n, L, true);
+                DrawMediaButtonsRowD2D(cv, n, L, true);
             } else if (id == 4) {
-                DrawCard(hdc, c, L"BATTERY", n->hFontTiny);
+                DrawCardD2D(cv, c, L"BATTERY");
                 wchar_t bt[64]; FormatBattery(bt, 64);
                 int pct = 0; bool ch = false; bool known = BatteryInfo(pct, ch);
                 wchar_t big[16]; if (known) swprintf(big, 16, L"%d%%", pct); else wcscpy_s(big, 16, L"--");
-                DrawCenteredText(hdc, n->hFontBig, big, c.left, c.top + Scale(36, dpi), c.right - c.left, Scale(48, dpi), th.primary);
-                DrawCenteredText(hdc, n->hFontTiny, bt, c.left + 14, c.top + Scale(92, dpi), c.right - c.left - 28, Scale(20, dpi), th.secondary);
-                if (known) { RECT bar = { c.left + 14, c.bottom - Scale(18, dpi), c.right - 14, c.bottom - Scale(12, dpi) }; DrawBar(hdc, bar, pct); }
+                D2DText(cv, kFontBig, big, (float)c.left, (float)(c.top + Scale(36, dpi)), (float)(c.right - c.left), (float)Scale(48, dpi), th.primary, true);
+                D2DText(cv, kFontTiny, bt, (float)(c.left + 14), (float)(c.top + Scale(92, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.secondary, true);
+                if (known) { RECT bar = { c.left + 14, c.bottom - Scale(18, dpi), c.right - 14, c.bottom - Scale(12, dpi) }; DrawBarD2D(cv, bar, pct); }
             } else if (id == 5) {
-                DrawCard(hdc, c, L"NETWORK", n->hFontTiny);
+                DrawCardD2D(cv, c, L"NETWORK");
                 if (g_netOk) {
-                    DrawLeftEllipsisText(hdc, n->hFontTiny, g_netName, c.left + 14, c.top + Scale(36, dpi), c.right - c.left - 28, Scale(20, dpi), th.primary);
+                    D2DTextEllipsis(cv, kFontTiny, g_netName, (float)(c.left + 14), (float)(c.top + Scale(36, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.primary);
                     wchar_t rates[96];
                     swprintf(rates, 96, L"\x2193 %llu B/s  \x2191 %llu B/s", g_netDownBps, g_netUpBps);
-                    DrawLeftText(hdc, n->hFontTiny, rates, c.left + 14, c.top + Scale(62, dpi), c.right - c.left - 28, Scale(20, dpi), th.secondary);
+                    D2DText(cv, kFontTiny, rates, (float)(c.left + 14), (float)(c.top + Scale(62, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.secondary, false);
                 } else {
-                    DrawLeftText(hdc, n->hFontTiny, L"Network unavailable", c.left + 14, c.top + Scale(36, dpi), c.right - c.left - 28, Scale(20, dpi), th.secondary);
+                    D2DText(cv, kFontTiny, L"Network unavailable", (float)(c.left + 14), (float)(c.top + Scale(36, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.secondary, false);
                 }
             }
         }
     } else if (effTab == kTabSystem) {
-        // 0 Battery, 1 Network, 2 Performance, 3 Volume.
-        DrawCard(hdc, L.sysCards[0], L"BATTERY", n->hFontTiny);
+        DrawCardD2D(cv, L.sysCards[0], L"BATTERY");
         {
             RECT c = L.sysCards[0];
             int pct = 0; bool ch = false; bool known = BatteryInfo(pct, ch);
             wchar_t big[16]; if (known) swprintf(big, 16, L"%d%%", pct); else wcscpy_s(big, 16, L"--");
             wchar_t bt[64]; FormatBattery(bt, 64);
-            DrawLeftText(hdc, n->hFontBig, big, c.left + 14, c.top + Scale(36, dpi), c.right - c.left - 28, Scale(48, dpi), th.primary);
-            DrawLeftText(hdc, n->hFontTiny, bt, c.left + 14, c.top + Scale(92, dpi), c.right - c.left - 28, Scale(20, dpi), th.secondary);
-            if (known) { RECT bar = { c.left + 14, c.bottom - Scale(20, dpi), c.right - 14, c.bottom - Scale(12, dpi) }; DrawBar(hdc, bar, pct); }
+            D2DText(cv, kFontBig, big, (float)(c.left + 14), (float)(c.top + Scale(36, dpi)), (float)(c.right - c.left - 28), (float)Scale(48, dpi), th.primary, false);
+            D2DText(cv, kFontTiny, bt, (float)(c.left + 14), (float)(c.top + Scale(92, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.secondary, false);
+            if (known) { RECT bar = { c.left + 14, c.bottom - Scale(20, dpi), c.right - 14, c.bottom - Scale(12, dpi) }; DrawBarD2D(cv, bar, pct); }
         }
-        DrawCard(hdc, L.sysCards[1], L"NETWORK", n->hFontTiny);
+        DrawCardD2D(cv, L.sysCards[1], L"NETWORK");
         {
             RECT c = L.sysCards[1];
             if (g_netOk) {
-                DrawLeftEllipsisText(hdc, n->hFontSmall, g_netName, c.left + 14, c.top + Scale(36, dpi), c.right - c.left - 28, Scale(24, dpi), th.primary);
+                D2DTextEllipsis(cv, kFontSmall, g_netName, (float)(c.left + 14), (float)(c.top + Scale(36, dpi)), (float)(c.right - c.left - 28), (float)Scale(24, dpi), th.primary);
                 wchar_t rates[96];
                 swprintf(rates, 96, L"\x2193 %llu B/s", g_netDownBps);
-                DrawLeftText(hdc, n->hFontTiny, rates, c.left + 14, c.top + Scale(68, dpi), c.right - c.left - 28, Scale(20, dpi), th.secondary);
+                D2DText(cv, kFontTiny, rates, (float)(c.left + 14), (float)(c.top + Scale(68, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.secondary, false);
                 swprintf(rates, 96, L"\x2191 %llu B/s", g_netUpBps);
-                DrawLeftText(hdc, n->hFontTiny, rates, c.left + 14, c.top + Scale(92, dpi), c.right - c.left - 28, Scale(20, dpi), th.secondary);
+                D2DText(cv, kFontTiny, rates, (float)(c.left + 14), (float)(c.top + Scale(92, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.secondary, false);
             } else {
-                DrawLeftText(hdc, n->hFontTiny, L"Network unavailable", c.left + 14, c.top + Scale(36, dpi), c.right - c.left - 28, Scale(20, dpi), th.secondary);
+                D2DText(cv, kFontTiny, L"Network unavailable", (float)(c.left + 14), (float)(c.top + Scale(36, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.secondary, false);
             }
         }
-        DrawCard(hdc, L.sysCards[2], L"PERFORMANCE", n->hFontTiny);
+        DrawCardD2D(cv, L.sysCards[2], L"PERFORMANCE");
         {
             RECT c = L.sysCards[2];
             int vals[3] = { g_cpuPercent, g_memPercent, g_diskPercent };
@@ -2543,80 +2614,73 @@ static void PaintNotch(Notch* n, HDC hdc)
             for (int k = 0; k < 3; k++) {
                 int y = c.top + Scale(36, dpi) + k * Scale(38, dpi);
                 wchar_t row[48]; swprintf(row, 48, L"%s  %d%%", names[k], vals[k]);
-                DrawLeftText(hdc, n->hFontTiny, row, c.left + 14, y, Scale(90, dpi), Scale(20, dpi), th.secondary);
+                D2DText(cv, kFontTiny, row, (float)(c.left + 14), (float)y, (float)Scale(90, dpi), (float)Scale(20, dpi), th.secondary, false);
                 RECT sp = { c.left + Scale(110, dpi), y, c.right - 14, y + Scale(18, dpi) };
-                DrawSparkline(hdc, sp, hists[k], g_histCount, th.accent);
+                DrawSparklineD2D(cv, sp, hists[k], g_histCount, th.accent);
             }
         }
-        DrawCard(hdc, L.sysCards[3], L"VOLUME", n->hFontTiny);
+        DrawCardD2D(cv, L.sysCards[3], L"VOLUME");
         {
             RECT c = L.sysCards[3];
             if (g_volOk) {
                 wchar_t big[16]; swprintf(big, 16, L"%d%%", g_volPercent);
-                DrawLeftText(hdc, n->hFontBig, big, c.left + 14, c.top + Scale(36, dpi), c.right - c.left - 28, Scale(48, dpi), th.primary);
+                D2DText(cv, kFontBig, big, (float)(c.left + 14), (float)(c.top + Scale(36, dpi)), (float)(c.right - c.left - 28), (float)Scale(48, dpi), th.primary, false);
                 RECT track = { c.left + 14, c.top + Scale(100, dpi), c.right - 14, c.top + Scale(108, dpi) };
-                DrawBar(hdc, track, g_volPercent);
+                DrawBarD2D(cv, track, g_volPercent);
                 int knobX = track.left + (track.right - track.left) * g_volPercent / 100;
                 int knobY = (track.top + track.bottom) / 2;
-                HPEN nullPen = (HPEN)GetStockObject(NULL_PEN); HPEN oldPen = (HPEN)SelectObject(hdc, nullPen);
-                HBRUSH kb = CreateSolidBrush(th.primary); HBRUSH oldB = (HBRUSH)SelectObject(hdc, kb);
                 int kr = Scale(8, dpi);
-                Ellipse(hdc, knobX - kr, knobY - kr, knobX + kr, knobY + kr);
-                SelectObject(hdc, oldPen); SelectObject(hdc, oldB); DeleteObject(kb);
+                cv->FillEllipse((float)knobX, (float)knobY, (float)kr, (float)kr, th.primary);
             } else {
-                DrawLeftText(hdc, n->hFontTiny, L"Volume unavailable", c.left + 14, c.top + Scale(36, dpi), c.right - c.left - 28, Scale(20, dpi), th.secondary);
+                D2DText(cv, kFontTiny, L"Volume unavailable", (float)(c.left + 14), (float)(c.top + Scale(36, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.secondary, false);
             }
         }
     } else if (effTab == kTabClock) {
-        DrawCard(hdc, L.clockCard, L"CLOCK", n->hFontTiny);
+        DrawCardD2D(cv, L.clockCard, L"CLOCK");
         {
             RECT c = L.clockCard;
             wchar_t t12[32]; FormatTime12(now, t12, 32);
-            DrawCenteredText(hdc, n->hFontBig, t12, c.left, c.top + Scale(40, dpi), c.right - c.left, Scale(48, dpi), th.primary);
+            D2DText(cv, kFontBig, t12, (float)c.left, (float)(c.top + Scale(40, dpi)), (float)(c.right - c.left), (float)Scale(48, dpi), th.primary, true);
             wchar_t dt[64]; FormatDate(dt, 64);
-            DrawCenteredText(hdc, n->hFontTiny, dt, c.left + 14, c.top + Scale(100, dpi), c.right - c.left - 28, Scale(20, dpi), th.secondary);
-            DrawCenteredText(hdc, n->hFontTiny, L"Local", c.left + 14, c.top + Scale(124, dpi), c.right - c.left - 28, Scale(20, dpi), th.muted);
+            D2DText(cv, kFontTiny, dt, (float)(c.left + 14), (float)(c.top + Scale(100, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.secondary, true);
+            D2DText(cv, kFontTiny, L"Local", (float)(c.left + 14), (float)(c.top + Scale(124, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.muted, true);
         }
-        DrawCard(hdc, L.worldCard, L"WORLD CLOCKS", n->hFontTiny);
+        DrawCardD2D(cv, L.worldCard, L"WORLD CLOCKS");
         {
             RECT c = L.worldCard;
             struct City { const wchar_t* name; const wchar_t* key; };
             static const City cities[3] = { { L"New York", L"Eastern Standard Time" }, { L"London", L"GMT Standard Time" }, { L"Tokyo", L"Tokyo Standard Time" } };
             int y = c.top + Scale(36, dpi);
             wchar_t t12[32]; FormatTime12(now, t12, 32);
-            DrawLeftText(hdc, n->hFontTiny, L"Local", c.left + 14, y, Scale(120, dpi), Scale(20, dpi), th.secondary);
-            DrawLeftText(hdc, n->hFontTiny, t12, c.left + Scale(140, dpi), y, c.right - c.left - Scale(154, dpi), Scale(20, dpi), th.primary);
+            D2DText(cv, kFontTiny, L"Local", (float)(c.left + 14), (float)y, (float)Scale(120, dpi), (float)Scale(20, dpi), th.secondary, false);
+            D2DText(cv, kFontTiny, t12, (float)(c.left + Scale(140, dpi)), (float)y, (float)(c.right - c.left - Scale(154, dpi)), (float)Scale(20, dpi), th.primary, false);
             y += Scale(28, dpi);
             for (int k = 0; k < 3; k++) {
                 SYSTEMTIME ct; int off = 0;
                 if (!GetCityTime(cities[k].key, &ct, &off)) continue;
                 wchar_t ct12[32]; FormatTime12(ct, ct12, 32);
                 wchar_t offText[32]; FormatOffset(off, offText, 32);
-                DrawLeftText(hdc, n->hFontTiny, cities[k].name, c.left + 14, y, Scale(120, dpi), Scale(20, dpi), th.secondary);
-                DrawLeftText(hdc, n->hFontTiny, ct12, c.left + Scale(140, dpi), y, Scale(110, dpi), Scale(20, dpi), th.primary);
-                DrawLeftText(hdc, n->hFontTiny, offText, c.right - Scale(90, dpi), y, Scale(76, dpi), Scale(20, dpi), th.muted);
+                D2DText(cv, kFontTiny, cities[k].name, (float)(c.left + 14), (float)y, (float)Scale(120, dpi), (float)Scale(20, dpi), th.secondary, false);
+                D2DText(cv, kFontTiny, ct12, (float)(c.left + Scale(140, dpi)), (float)y, (float)Scale(110, dpi), (float)Scale(20, dpi), th.primary, false);
+                D2DText(cv, kFontTiny, offText, (float)(c.right - Scale(90, dpi)), (float)y, (float)Scale(76, dpi), (float)Scale(20, dpi), th.muted, false);
                 y += Scale(28, dpi);
             }
         }
     } else if (effTab == kTabCalendar) {
-        // v6-fix calendar: displayed month with prev/next arrows,
-        // a Today button, a fixed 6-week grid, faded adjacent-month
-        // days, muted weekends, today = accent pill, selected day =
-        // accent outline pill. Grid height never changes.
-        DrawCard(hdc, L.monthCard, L"CALENDAR", n->hFontTiny);
+        DrawCardD2D(cv, L.monthCard, L"CALENDAR");
         {
             RECT c = L.monthCard;
             int dispY = 0, dispM = 0; CalDisplayed(n, dispY, dispM);
             int selD = CalSelectedDay(n, dispY, dispM);
             static const wchar_t* kMonths[] = { L"January", L"February", L"March", L"April", L"May", L"June", L"July", L"August", L"September", L"October", L"November", L"December" };
             wchar_t monthText[64]; swprintf(monthText, 64, L"%s %d", kMonths[(dispM - 1) % 12], dispY);
-            DrawCenteredText(hdc, n->hFontSmall, monthText, c.left, c.top + Scale(10, dpi), c.right - c.left, Scale(28, dpi), th.primary);
+            D2DText(cv, kFontSmall, monthText, (float)c.left, (float)(c.top + Scale(10, dpi)), (float)(c.right - c.left), (float)Scale(28, dpi), th.primary, true);
             COLORREF prevC = (n->hoverCalArrow == -1) ? th.primary : th.secondary;
             COLORREF nextC = (n->hoverCalArrow == 1) ? th.primary : th.secondary;
-            DrawCenteredText(hdc, n->hFontSmall, L"<", L.calPrevRect.left, L.calPrevRect.top, L.calPrevRect.right - L.calPrevRect.left, L.calPrevRect.bottom - L.calPrevRect.top, prevC);
-            DrawCenteredText(hdc, n->hFontSmall, L">", L.calNextRect.left, L.calNextRect.top, L.calNextRect.right - L.calNextRect.left, L.calNextRect.bottom - L.calNextRect.top, nextC);
+            D2DText(cv, kFontSmall, L"<", (float)L.calPrevRect.left, (float)L.calPrevRect.top, (float)(L.calPrevRect.right - L.calPrevRect.left), (float)(L.calPrevRect.bottom - L.calPrevRect.top), prevC, true);
+            D2DText(cv, kFontSmall, L">", (float)L.calNextRect.left, (float)L.calNextRect.top, (float)(L.calNextRect.right - L.calNextRect.left), (float)(L.calNextRect.bottom - L.calNextRect.top), nextC, true);
             static const wchar_t* kWeek[] = { L"S", L"M", L"T", L"W", L"T", L"F", L"S" };
-            for (int cc = 0; cc < 7; cc++) DrawCenteredText(hdc, n->hFontTiny, kWeek[cc], c.left + Scale(14, dpi) + cc * L.calCellW, L.calWeekY, L.calCellW, Scale(20, dpi), th.muted);
+            for (int cc = 0; cc < 7; cc++) D2DText(cv, kFontTiny, kWeek[cc], (float)(c.left + Scale(14, dpi) + cc * L.calCellW), (float)L.calWeekY, (float)L.calCellW, (float)Scale(20, dpi), th.muted, true);
             for (int cell = 0; cell < 42; cell++) {
                 int cy2 = 0, cm2 = 0, cd2 = 0;
                 CalCellDate(L, dispY, dispM, cell, cy2, cm2, cd2);
@@ -2627,33 +2691,25 @@ static void PaintNotch(Notch* n, HDC hdc)
                 bool isWeekend = (col == 0 || col == 6);
                 bool isToday = (cy2 == now.wYear && cm2 == now.wMonth && cd2 == now.wDay);
                 bool isSelected = (cy2 == dispY && cm2 == dispM && cd2 == selD);
+                RECT cellRc = { x + Scale(4, dpi), y + Scale(2, dpi), x + L.calCellW - Scale(4, dpi), y + L.calCellH - Scale(2, dpi) };
                 if (isToday) {
-                    HPEN nullP = (HPEN)GetStockObject(NULL_PEN); HPEN oldP = (HPEN)SelectObject(hdc, nullP);
-                    HBRUSH pill = CreateSolidBrush(th.accent); HBRUSH oldB = (HBRUSH)SelectObject(hdc, pill);
-                    RoundRect(hdc, x + Scale(4, dpi), y + Scale(2, dpi), x + L.calCellW - Scale(4, dpi), y + L.calCellH - Scale(2, dpi), L.calCellH, L.calCellH);
-                    SelectObject(hdc, oldP); SelectObject(hdc, oldB); DeleteObject(pill);
+                    cv->FillRounded(cellRc, th.accent, (float)L.calCellH / 2.0f);
                 } else if (isSelected) {
-                    HPEN op = CreatePen(PS_SOLID, 2, th.accent); HPEN oldP = (HPEN)SelectObject(hdc, op);
-                    HBRUSH nullB = (HBRUSH)GetStockObject(NULL_BRUSH); HBRUSH oldB = (HBRUSH)SelectObject(hdc, nullB);
-                    RoundRect(hdc, x + Scale(4, dpi), y + Scale(2, dpi), x + L.calCellW - Scale(4, dpi), y + L.calCellH - Scale(2, dpi), L.calCellH, L.calCellH);
-                    SelectObject(hdc, oldP); SelectObject(hdc, oldB); DeleteObject(op);
+                    cv->StrokeRounded(cellRc, th.accent, 2.0f, (float)L.calCellH / 2.0f);
                 } else if (cell == n->hoverCalCell) {
-                    HPEN op = CreatePen(PS_SOLID, 1, th.muted); HPEN oldP = (HPEN)SelectObject(hdc, op);
-                    HBRUSH nullB = (HBRUSH)GetStockObject(NULL_BRUSH); HBRUSH oldB = (HBRUSH)SelectObject(hdc, nullB);
-                    RoundRect(hdc, x + Scale(4, dpi), y + Scale(2, dpi), x + L.calCellW - Scale(4, dpi), y + L.calCellH - Scale(2, dpi), L.calCellH, L.calCellH);
-                    SelectObject(hdc, oldP); SelectObject(hdc, oldB); DeleteObject(op);
+                    cv->StrokeRounded(cellRc, th.muted, 1.0f, (float)L.calCellH / 2.0f);
                 }
                 wchar_t dayText[8]; swprintf(dayText, 8, L"%d", cd2);
                 COLORREF tc = th.secondary;
                 if (isToday) tc = th.pillText;
                 else if (isSelected) tc = th.primary;
                 else if (!inMonth || isWeekend) tc = th.muted;
-                DrawCenteredText(hdc, n->hFontTiny, dayText, x, y, L.calCellW, L.calCellH, tc);
+                D2DText(cv, kFontTiny, dayText, (float)x, (float)y, (float)L.calCellW, (float)L.calCellH, tc, true);
             }
             COLORREF todayC = n->hoverCalToday ? th.primary : th.secondary;
-            DrawCenteredText(hdc, n->hFontTiny, L"Today", L.calTodayRect.left, L.calTodayRect.top, L.calTodayRect.right - L.calTodayRect.left, L.calTodayRect.bottom - L.calTodayRect.top, todayC);
+            D2DText(cv, kFontTiny, L"Today", (float)L.calTodayRect.left, (float)L.calTodayRect.top, (float)(L.calTodayRect.right - L.calTodayRect.left), (float)(L.calTodayRect.bottom - L.calTodayRect.top), todayC, true);
         }
-        DrawCard(hdc, L.agendaCard, L"AGENDA", n->hFontTiny);
+        DrawCardD2D(cv, L.agendaCard, L"AGENDA");
         {
             RECT c = L.agendaCard;
             int dispY = 0, dispM = 0; CalDisplayed(n, dispY, dispM);
@@ -2661,9 +2717,9 @@ static void PaintNotch(Notch* n, HDC hdc)
             SYSTEMTIME sel; sel.wYear = (WORD)dispY; sel.wMonth = (WORD)dispM; sel.wDay = (WORD)selD;
             sel.wHour = 0; sel.wMinute = 0; sel.wSecond = 0; sel.wMilliseconds = 0;
             wchar_t dt[64]; FormatDateFromSt(sel, dt, 64);
-            DrawLeftText(hdc, n->hFontSmall, dt, c.left + 14, c.top + Scale(30, dpi), c.right - c.left - 28, Scale(24, dpi), th.primary);
+            D2DText(cv, kFontSmall, dt, (float)(c.left + 14), (float)(c.top + Scale(30, dpi)), (float)(c.right - c.left - 28), (float)Scale(24, dpi), th.primary, false);
             bool selIsToday = (dispY == now.wYear && dispM == now.wMonth && selD == now.wDay);
-            DrawLeftText(hdc, n->hFontTiny, selIsToday ? L"Today" : L"Selected day", c.left + 14, c.top + Scale(58, dpi), c.right - c.left - 28, Scale(20, dpi), th.muted);
+            D2DText(cv, kFontTiny, selIsToday ? L"Today" : L"Selected day", (float)(c.left + 14), (float)(c.top + Scale(58, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.muted, false);
             FILETIME sft; SystemTimeToFileTime(&sel, &sft);
             ULARGE_INTEGER base; base.LowPart = sft.dwLowDateTime; base.HighPart = sft.dwHighDateTime;
             SYSTEMTIME withDow; FileTimeToSystemTime(&sft, &withDow);
@@ -2676,47 +2732,156 @@ static void PaintNotch(Notch* n, HDC hdc)
                 SYSTEMTIME cst; FileTimeToSystemTime(&cft, &cst);
                 wchar_t row[32]; swprintf(row, 32, L"%s  %d", kDays[cst.wDayOfWeek % 7], cst.wDay);
                 bool isSel = (cst.wYear == dispY && cst.wMonth == dispM && cst.wDay == selD);
-                DrawLeftText(hdc, n->hFontTiny, row, c.left + 14, y, c.right - c.left - 28, Scale(20, dpi), isSel ? th.primary : th.secondary);
+                D2DText(cv, kFontTiny, row, (float)(c.left + 14), (float)y, (float)(c.right - c.left - 28), (float)Scale(20, dpi), isSel ? th.primary : th.secondary, false);
                 y += Scale(20, dpi);
             }
-            DrawLeftText(hdc, n->hFontTiny, L"No events", c.left + 14, y + Scale(4, dpi), c.right - c.left - 28, Scale(20, dpi), th.muted);
+            D2DText(cv, kFontTiny, L"No events", (float)(c.left + 14), (float)(y + Scale(4, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.muted, false);
         }
     } else if (effTab == kTabMedia) {
-        DrawCard(hdc, L.mediaCard, L"MEDIA", n->hFontTiny);
-        // v6-fix: rows are reserved in the layout, so this block
-        // never changes the height, whatever SMTC reports.
+        DrawCardD2D(cv, L.mediaCard, L"MEDIA");
         if (g_smtcHasTrack) {
-            DrawLeftEllipsisText(hdc, n->hFontSmall, g_smtcTitle, L.mediaCard.left + 14, L.mediaTitleY, L.mediaCard.right - L.mediaCard.left - 28, Scale(22, dpi), th.primary);
-            if (g_smtcArtist[0] != L'\0') DrawLeftEllipsisText(hdc, n->hFontTiny, g_smtcArtist, L.mediaCard.left + 14, L.mediaArtistY, L.mediaCard.right - L.mediaCard.left - 28, Scale(20, dpi), th.secondary);
+            D2DTextEllipsis(cv, kFontSmall, g_smtcTitle, (float)(L.mediaCard.left + 14), (float)L.mediaTitleY, (float)(L.mediaCard.right - L.mediaCard.left - 28), (float)Scale(22, dpi), th.primary);
+            if (g_smtcArtist[0] != L'\0') D2DTextEllipsis(cv, kFontTiny, g_smtcArtist, (float)(L.mediaCard.left + 14), (float)L.mediaArtistY, (float)(L.mediaCard.right - L.mediaCard.left - 28), (float)Scale(20, dpi), th.secondary);
         } else {
-            DrawLeftText(hdc, n->hFontTiny, L"No track", L.mediaCard.left + 14, L.mediaTitleY, L.mediaCard.right - L.mediaCard.left - 28, Scale(20, dpi), th.secondary);
+            D2DText(cv, kFontTiny, L"No track", (float)(L.mediaCard.left + 14), (float)L.mediaTitleY, (float)(L.mediaCard.right - L.mediaCard.left - 28), (float)Scale(20, dpi), th.secondary, false);
         }
-        DrawMediaButtonsRow(hdc, n, L, false);
+        DrawMediaButtonsRowD2D(cv, n, L, false);
     }
-    // v6 bottom icon dock: centred pill, active icon is a white
-    // circle with a dark glyph, inactive glyphs are muted and
-    // brighten on hover. Dock clicks switch tabs only.
     {
-        HPEN nullPen = (HPEN)GetStockObject(NULL_PEN); HPEN oldPen = (HPEN)SelectObject(hdc, nullPen);
-        HBRUSH pillBrush = CreateSolidBrush(CardColor()); HBRUSH oldBrush = (HBRUSH)SelectObject(hdc, pillBrush);
-        RoundRect(hdc, L.dockPill.left, L.dockPill.top, L.dockPill.right, L.dockPill.bottom, 28, 28);
-        SelectObject(hdc, oldPen); SelectObject(hdc, oldBrush); DeleteObject(pillBrush);
+        RECT shadow = L.dockPill; shadow.top += 2; shadow.bottom += 2;
+        cv->FillRounded(shadow, RGB(0, 0, 0), 14.0f, 0.30f);
+        cv->FillRounded(L.dockPill, CardColorD2D(), 14.0f, 1.0f);
         for (int i = 0; i < L.dockCount; i++) {
             RECT dr = L.dockRects[i];
             int cx = (dr.left + dr.right) / 2, cy = (dr.top + dr.bottom) / 2, r = (dr.right - dr.left) / 2;
             int id = L.dockIds[i];
             if (id == effTab) {
-                HBRUSH wb = CreateSolidBrush(th.primary); HBRUSH pb = (HBRUSH)SelectObject(hdc, wb);
-                Ellipse(hdc, cx - r, cy - r, cx + r, cy + r);
-                SelectObject(hdc, pb); DeleteObject(wb);
-                DrawDockGlyph(hdc, id, cx, cy, r, th.pillText);
+                cv->FillEllipse((float)cx, (float)cy, (float)r, (float)r, th.primary);
+                DrawDockGlyphD2D(cv, id, cx, cy, r, th.pillText);
             } else {
                 COLORREF gc = (id == n->hoverDock) ? th.tabHover : th.muted;
-                DrawDockGlyph(hdc, id, cx, cy, r, gc);
+                DrawDockGlyphD2D(cv, id, cx, cy, r, gc);
             }
         }
     }
-    PaintPremiumBorder(hdc, rc, dpi, n->hoverNotch);
+    PaintBorderD2D(cv, rc, dpi, n->hoverNotch, n);
+}
+
+// --- Blur opt-in (OFF by default) and layered presentation ------------------
+// Blur uses the undocumented-but-widely-used SetWindowCompositionAttribute
+// accent API, resolved at runtime (no link-time dependency, no header
+// dependency). It is deliberately NOT the default, and it can never
+// black out the window: the layered bitmap always carries our own
+// drawn panel. If the accent call fails, or Windows ignores it on a
+// layered window (an untested interaction, see README), blurActive
+// stays false and the panel is fully opaque, exactly as in v6.
+// When blur IS active, the panel gradient is drawn at 0.88 alpha
+// (see PaintNotchD2D) so the blurred desktop can show through;
+// cards stay opaque. Blur also needs Windows Transparency effects
+// on; with them off, Windows shows a flat tint instead of blur,
+// and the panel still draws correctly (it is just translucent).
+// WCA_ACCENT_POLICY = 19. ACCENT_ENABLE_BLURBEHIND = 3.
+static void ApplyBlur(Notch* n)
+{
+    if (!n || !n->hwnd) return;
+    n->blurActive = false;
+    if (!g_blurEnabled) return;
+    typedef BOOL (WINAPI* SetWindowCompositionAttributeFn)(HWND, void*);
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    if (!user32) return;
+    SetWindowCompositionAttributeFn fn =
+        (SetWindowCompositionAttributeFn)GetProcAddress(user32, "SetWindowCompositionAttribute");
+    if (!fn) return;
+    struct AccentPolicy { int AccentState; int AccentFlags; int GradientColor; int AnimationId; };
+    struct CompositionData { int Attrib; void* Data; SIZE_T SizeOfData; };
+    AccentPolicy pol = { 3, 0, 0, 0 };
+    CompositionData data = { 19, &pol, sizeof(pol) };
+    BOOL ok = fn(n->hwnd, &data);
+    n->blurActive = (ok != FALSE);
+}
+
+static void ApplyBlurToAll()
+{
+    for (size_t i = 0; i < g_notches.size(); i++) {
+        Notch* an = g_notches[i];
+        if (an && an->hwnd) { ApplyBlur(an); InvalidateRect(an->hwnd, NULL, FALSE); }
+    }
+}
+
+// Present one frame: render offscreen with Direct2D into a 32-bit
+// premultiplied DIB, then UpdateLayeredWindow once. The window's
+// position/size are taken from GetWindowRect, so presentation
+// never moves or resizes the window on its own.
+static void PresentNotch(Notch* n)
+{
+    if (!n || !n->hwnd) return;
+    if (!InitD2D()) return;
+    RECT rc; GetClientRect(n->hwnd, &rc);
+    int w = rc.right, h = rc.bottom;
+    if (w < 1 || h < 1) return;
+    BITMAPINFO bi = { 0 };
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = w;
+    bi.bmiHeader.biHeight = -h; // top-down DIB
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    void* bits = NULL;
+    HBITMAP bmp = CreateDIBSection(NULL, &bi, DIB_RGB_COLORS, &bits, NULL, 0);
+    if (!bmp) return;
+    HDC mem = CreateCompatibleDC(NULL);
+    if (!mem) { DeleteObject(bmp); return; }
+    HBITMAP oldBmp = (HBITMAP)SelectObject(mem, bmp);
+    D2D1_RENDER_TARGET_PROPERTIES props = D2D1::RenderTargetProperties(
+        D2D1_RENDER_TARGET_TYPE_DEFAULT,
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED),
+        96.0f, 96.0f);
+    ID2D1DCRenderTarget* rt = NULL;
+    HRESULT hr = g_d2dFactory->CreateDCRenderTarget(&props, &rt);
+    bool frameOk = false;
+    if (SUCCEEDED(hr) && rt) {
+        RECT bind = { 0, 0, w, h };
+        hr = rt->BindDC(mem, &bind);
+        if (SUCCEEDED(hr)) {
+            frameOk = true;
+            Canvas cv;
+            cv.rt = rt;
+            cv.dw = g_dwFactory;
+            cv.dpi = n->dpi;
+            static const DWRITE_FONT_WEIGHT kWeights[4] = {
+                DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_LIGHT,
+                DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_NORMAL };
+            for (int i = 0; i < 4; i++) {
+                g_dwFactory->CreateTextFormat(L"Segoe UI", NULL, kWeights[i],
+                    DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
+                    (FLOAT)FontSizeFor(i, n->dpi), L"en-us", &cv.fmt[i]);
+            }
+            rt->BeginDraw();
+            rt->Clear(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.0f));
+            rt->SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+            PaintNotchD2D(n, &cv);
+            // A failed EndDraw means the frame is not trustworthy:
+            // do not present it (see the frameOk guard below).
+            frameOk = SUCCEEDED(rt->EndDraw());
+            cv.ReleaseAll();
+        }
+        rt->Release();
+    }
+    // Never present a blank bitmap: if the frame failed, the
+    // window keeps its previous content instead of going empty.
+    if (frameOk) {
+        RECT wr; GetWindowRect(n->hwnd, &wr);
+        POINT pos = { wr.left, wr.top };
+        SIZE sz = { w, h };
+        POINT src = { 0, 0 };
+        BLENDFUNCTION bf = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+        HDC screen = GetDC(NULL);
+        UpdateLayeredWindow(n->hwnd, screen, &pos, &sz, mem, &src, 0, &bf, ULW_ALPHA);
+        if (screen) ReleaseDC(NULL, screen);
+    }
+    SelectObject(mem, oldBmp);
+    DeleteObject(bmp);
+    DeleteDC(mem);
 }
 
 static LRESULT CALLBACK NotchWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -2733,7 +2898,10 @@ static LRESULT CALLBACK NotchWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             created->hwnd = hwnd;
             UINT dpi = GetDpiForWindow(hwnd);
             created->dpi = (dpi != 0) ? (int)dpi : 96;
-            RecreateFonts(created);
+            // v7: no font recreation (DirectWrite formats are
+            // per-frame); apply the saved blur setting to the
+            // new window so its first frame matches the others.
+            ApplyBlur(created);
             bool already = false;
             for (size_t i = 0; i < g_notches.size(); i++) if (g_notches[i] == created) already = true;
             if (!already) g_notches.push_back(created);
@@ -2746,7 +2914,6 @@ static LRESULT CALLBACK NotchWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
     case WM_DPICHANGED: {
         if (n) {
             n->dpi = HIWORD(wParam);
-            RecreateFonts(n);
             ApplyTargetSize(n, n->expanded);
         }
         return 0;
@@ -2919,31 +3086,14 @@ static LRESULT CALLBACK NotchWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         }
         return 0;
     case WM_PAINT: {
-        // v6-fix double buffering: the whole notch is painted into
-        // a memory DC and copied to the screen in one BitBlt, so
-        // the user never sees the gradient rows, cards, and text
-        // land in pieces. WM_ERASEBKGND already returns 1 and every
-        // InvalidateRect now passes FALSE, so nothing erases
-        // between frames either.
+        // v7: a layered window is presented with
+        // UpdateLayeredWindow, not by painting into the screen
+        // DC. BeginPaint/EndPaint only clear the paint queue;
+        // PresentNotch renders the whole frame offscreen with
+        // Direct2D and presents it once.
         PAINTSTRUCT ps;
-        HDC hdc = BeginPaint(hwnd, &ps);
-        if (n) {
-            RECT rc; GetClientRect(hwnd, &rc);
-            if (rc.right > 0 && rc.bottom > 0) {
-                HDC mem = CreateCompatibleDC(hdc);
-                HBITMAP bmp = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
-                if (mem && bmp) {
-                    HBITMAP oldBmp = (HBITMAP)SelectObject(mem, bmp);
-                    PaintNotch(n, mem);
-                    BitBlt(hdc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
-                    SelectObject(mem, oldBmp);
-                } else {
-                    PaintNotch(n, hdc);
-                }
-                if (bmp) DeleteObject(bmp);
-                if (mem) DeleteDC(mem);
-            }
-        }
+        BeginPaint(hwnd, &ps);
+        if (n) PresentNotch(n);
         EndPaint(hwnd, &ps);
         return 0;
     }
@@ -2952,10 +3102,6 @@ static LRESULT CALLBACK NotchWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
     case WM_DESTROY: {
         if (n) {
             KillTimer(hwnd, ID_TIMER_ANIM);
-            if (n->hFontClock) DeleteObject(n->hFontClock);
-            if (n->hFontBig) DeleteObject(n->hFontBig);
-            if (n->hFontSmall) DeleteObject(n->hFontSmall);
-            if (n->hFontTiny) DeleteObject(n->hFontTiny);
             for (size_t i = 0; i < g_notches.size(); i++) {
                 if (g_notches[i] == n) { g_notches.erase(g_notches.begin() + i); break; }
             }
@@ -3085,12 +3231,17 @@ static LRESULT CALLBACK ManagerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
         case ID_TRAY_THEME_ONYX: g_theme = 0; SaveSettings(); InvalidateAllNotches(); break;
         case ID_TRAY_THEME_MIDNIGHT: g_theme = 1; SaveSettings(); InvalidateAllNotches(); break;
         case ID_TRAY_THEME_GRAPHITE: g_theme = 2; SaveSettings(); InvalidateAllNotches(); break;
+        case ID_TRAY_BLUR:
+            g_blurEnabled = !g_blurEnabled;
+            SaveSettings();
+            ApplyBlurToAll();
+            break;
         case ID_TRAY_MEDIA_PREV: SendMediaKey(VK_MEDIA_PREV_TRACK); break;
         case ID_TRAY_MEDIA_PLAYPAUSE: SendMediaKey(VK_MEDIA_PLAY_PAUSE); break;
         case ID_TRAY_MEDIA_NEXT: SendMediaKey(VK_MEDIA_NEXT_TRACK); break;
         case ID_TRAY_ABOUT:
             MessageBoxW(hwnd,
-                L"OnyxNotch v6 (card + dock dashboard)\nMac-style notch for Windows.\nNative Win32 C++, no runtime, low memory.\n\nv4: premium UI — gradient surface, lighter\ntypography, circular media buttons, battery glyph,\ncalendar pill — reorganized in place: compact\ntwo-column body (media beside system stats),\nsection headers, stats rows with bars.\n\nv5-SMTC: with Media controls on, the Media tab\nshows the current track title and artist from\nWindows SMTC (read-only), and Home shows a\ncompact title line. No track, no title — the\nmedia buttons still work via media keys.\n\nv5-settings: size and toggles are saved to\n%APPDATA%\\OnyxNotch\\settings.ini and restored\nat startup. Start with Windows (tray menu) writes\nthe Run registry value for this .exe.\n\nThemes: tray menu Themes submenu — Onyx, Midnight,\nGraphite — applies instantly to all notches and is\nsaved to settings.ini as theme=onyx|midnight|graphite.\n\nClick the notch header to pin it open;\nclick again to unpin. The gear button in the\nexpanded header opens this menu from the notch.\n\nv6: wide card dashboard with a header bar,\ncard grid and a bottom icon dock. Home is a\ncompact summary; System, Clock, Calendar\nand Media show full card versions. Click a\ndock icon to switch. Close X collapses only.",
+                L"OnyxNotch v7 (Direct2D rewrite of v6)\nMac-style notch for Windows.\nNative Win32 C++, no runtime, low memory.\nDirect2D/DirectWrite rendering on a layered\nwindow with per-pixel alpha; spring animation;\nblur is an OFF-by-default experimental tray\ntoggle with an opaque fallback.\n\nv4: premium UI — gradient surface, lighter\ntypography, circular media buttons, battery glyph,\ncalendar pill — reorganized in place: compact\ntwo-column body (media beside system stats),\nsection headers, stats rows with bars.\n\nv5-SMTC: with Media controls on, the Media tab\nshows the current track title and artist from\nWindows SMTC (read-only), and Home shows a\ncompact title line. No track, no title — the\nmedia buttons still work via media keys.\n\nv5-settings: size and toggles are saved to\n%APPDATA%\\OnyxNotch\\settings.ini and restored\nat startup. Start with Windows (tray menu) writes\nthe Run registry value for this .exe.\n\nThemes: tray menu Themes submenu — Onyx, Midnight,\nGraphite — applies instantly to all notches and is\nsaved to settings.ini as theme=onyx|midnight|graphite.\n\nClick the notch header to pin it open;\nclick again to unpin. The gear button in the\nexpanded header opens this menu from the notch.\n\nv6: wide card dashboard with a header bar,\ncard grid and a bottom icon dock. Home is a\ncompact summary; System, Clock, Calendar\nand Media show full card versions. Click a\ndock icon to switch. Close X collapses only.",
                 L"OnyxNotch", MB_OK | MB_ICONINFORMATION);
             break;
         }

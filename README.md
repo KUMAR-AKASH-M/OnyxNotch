@@ -1,3 +1,185 @@
+# OnyxNotch v7 — Direct2D rewrite of v6
+
+Mac-style notch for Windows, in native C++ Win32. One source file, one
+`.exe`, no Electron, no Python, no .NET runtime.
+
+**Scope of this folder:** v7 keeps every v6 feature and behaviour
+and replaces ONLY the rendering layer: GDI painting is replaced by
+Direct2D/DirectWrite rendering on a layered window with per-pixel
+alpha, and expand/collapse animation uses a damped spring instead
+of ease-out cubic. Nothing else was added: no weather, no notes, no
+clipboard history, no screen-time tracking, no new data sources.
+Album-art accent tinting is deliberately OUT of scope (SMTC gives
+title/artist, not album art, in our path) and is not faked.
+
+## What's new in v7
+
+### 1. Direct2D rendering on a layered window (the headline)
+- The notch window is now `WS_EX_LAYERED` (still topmost,
+  toolwindow, and `WS_EX_NOACTIVATE`, so it still never steals
+  focus). Its shape comes from the alpha channel of the bitmap
+  presented with `UpdateLayeredWindow`, NOT from a window region:
+  the old `SetWindowRgn` path is gone, and corners are truly
+  anti-aliased instead of region-stepped.
+- Each frame is rendered offscreen into a 32-bit premultiplied
+  DIB with an `ID2D1DCRenderTarget`, then presented once with
+  `UpdateLayeredWindow`. This is the v6 double-buffer idea in
+  Direct2D terms: no partial frames, no erase flicker. If a frame
+  fails to render (BindDC or EndDraw error), the previous frame
+  is kept instead of presenting a blank bitmap.
+- The render target DPI is fixed at 96, so Direct2D units are
+  pixels and every Layout coordinate (already DPI-scaled) maps
+  1:1, exactly as in v6. Per-monitor DPI still works because
+  Layout and font sizes are scaled by the notch DPI.
+- Text is DirectWrite (Segoe UI, same sizes and weights as v6:
+  clock 20 normal, big 36 light, small 17 normal, tiny 14
+  normal, all DPI-scaled). Track titles and other long text are
+  truncated with an ellipsis by measurement, as in v6.
+- All glyphs (dock icons, gear, close X, media buttons, battery)
+  are redrawn as Direct2D geometry (paths and arcs), centred in
+  the same hit areas, with the same hit order: gear, then close
+  X, then dock, then media buttons, then pin.
+- Cards now have a soft shadow: a dark rounded rect offset 2 px
+  below each card (and under the dock pill), alpha-blended,
+  drawn before the card. The PANEL itself has no external shadow:
+  the window bounds are exactly the panel bounds, so an outside
+  shadow would be clipped by the bitmap. That omission is
+  deliberate and documented here, not a bug to paper over; a
+  full external shadow would need a transparent margin window
+  (window larger than the panel), which would shift every hit
+  test and is left as future work.
+- This rendering code is original to OnyxNotch, inspired by (not
+  copied from) the Windhawk Dynamic Island mod's approach:
+  native C++, Direct2D, layered/alpha presentation, spring
+  animation. Windhawk code is MIT licensed, but no Windhawk code
+  is in this file; the techniques were reimplemented for our
+  layout, themes, and window manager. A Windhawk mod also differs
+  in kind: it runs inside windhawk.exe with Windhawk's settings
+  panel, while OnyxNotch is a standalone .exe with its own tray
+  menu, settings file, auto-start, and multi-monitor windows.
+
+### 2. Spring animation (replaces ease-out cubic)
+Expand/collapse now uses a damped spring integrated per timer
+tick: stiffness 170, damping 20 (damping ratio about 0.77), so
+the panel settles with a small natural overshoot and then snaps
+exactly to target. Starting a new animation mid-flight restarts
+from the current window size, so reversing direction (expand,
+then collapse immediately) is smooth, not a jump. The timer is
+still per-notch, 16 ms, started only for a size change and
+killed on finish, with a 700 ms cap that guarantees the snap
+even if the spring stalls. Position is elapsed-based, so motion
+does not depend on the timer firing exactly on schedule; the
+16 ms cadence itself is still timer-limited (no `timeBeginPeriod`,
+which would be a global side effect), so on a high-refresh
+display the animation is smoother than v6's but is not yet
+locked to the display refresh rate. Tab switch still only
+repaints (no size animation). Animations OFF still restores
+instant behaviour everywhere.
+
+### 3. Blur background — OFF by default, experimental
+A new tray toggle, "Blur background (experimental)", saved as
+`blur=0/1` in settings.ini (default 0). When on, it calls the
+runtime-resolved `SetWindowCompositionAttribute` accent API
+(blur-behind) for each notch window. Safety rules:
+- When off, or if the accent call fails, the panel is fully
+  opaque exactly as in v6. Blur can never black out the window,
+  because the layered bitmap always carries our own drawn panel.
+- When blur is active, the panel gradient is drawn at 0.88
+  alpha so the blurred desktop can show through; cards stay
+  opaque. With an opaque panel, blur would be invisible, which
+  is why the alpha change is part of the toggle.
+- Blur needs Windows Transparency effects on; with them off,
+  Windows shows a flat tint instead of blur, and the panel
+  still draws correctly (it is just translucent).
+- Layered window + accent blur together is UNTESTED on real
+  Windows: Windows may ignore the accent on a layered window,
+  in which case the panel will simply look like a translucent
+  dark panel. That is an acceptable fallback, not a failure
+  mode to hide: please report what you actually see.
+- Blur is in the tray menu (and therefore the gear menu, which
+  opens the same menu), like every other toggle.
+
+### 4. What was preserved, exactly
+Multi-monitor (one notch per monitor, per-monitor DPI, rebuild
+on display change); hide-on-fullscreen OFF opt-in; custom tray
+icon; media controls OFF opt-in with SMTC titles (header-only
+C++/WinRT, media-keys-only control, exact v4 fallback on any
+SMTC failure); widgets OFF opt-in (stats, calendar); saved
+settings in `%APPDATA%\OnyxNotch\settings.ini` (now also
+`blur`); auto-start OFF via HKCU Run (registry is source of
+truth); themes Onyx/Midnight/Graphite (colour-only, through
+Direct2D brushes, no layout change per theme); card+dock look
+(about 840 px at 96 DPI, clamped to work width minus 32, 320
+floor); HOME 3-column grid; SYSTEM (Battery, Network,
+Performance sparklines, Volume read-only); CLOCK (big clock +
+Local/New York/London/Tokyo, unresolvable city omitted);
+CALENDAR (fixed 6-week grid, prev/next arrows, Today button,
+28 px cells, faded adjacent-month days, muted weekends, accent
+today pill, outlined selected day, honest "No events",
+selection resets to today on tab leave/collapse, not saved);
+unified tab size (max over visible tabs, header/dock at the
+same Y every tab, shorter tabs centred, tab switch repaints
+only, feature toggle may change the unified height via the
+animated path); tray/gear menus; no taskbar; no focus steal;
+1-second timer; Animations ON by default.
+
+### 5. Build on Windows (MSVC only)
+From a Visual Studio Developer Command Prompt, in this folder,
+run `build.bat`:
+
+```bat
+rc /nologo onyxnotch.rc
+cl /nologo /std:c++17 /EHsc /O2 /MT /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS main.cpp onyxnotch.res user32.lib gdi32.lib shell32.lib windowsapp.lib advapi32.lib iphlpapi.lib winmm.lib d2d1.lib dwrite.lib /link /SUBSYSTEM:WINDOWS /OUT:OnyxNotch.exe
+```
+
+New over v6: `d2d1.lib` (Direct2D) and `dwrite.lib`
+(DirectWrite). Both are also listed as `#pragma comment(lib)`
+in main.cpp, so the build works from the cl line alone as
+well. `gdi32.lib` is still linked: the offscreen bitmap is a
+GDI DIB selected into a memory DC for the Direct2D DC render
+target, and `UpdateLayeredWindow` takes that DC. MinGW cannot
+build v7 (C++/WinRT SMTC part, as in v5/v6). `build.bat` keeps
+its safety properties: goto error labels, zero parenthesis
+characters anywhere, and the coroutine silence macro guarded
+with `#ifndef` in code (never also on the cl line). Quit any
+running OnyxNotch first (tray Quit, or
+`taskkill /F /IM OnyxNotch.exe`) or the link will fail with
+LNK1104 because it cannot overwrite the running .exe.
+
+### 6. Honest list of what was NOT verified on Windows
+- NOT compiled on Windows. This Linux VM has no Windows
+  toolchain, so `cl`/`rc` were never run on v7. Static checks
+  passed (braces/parens/brackets balance; no GDI paint calls
+  remain except the DIB memory DC and the screen DC for
+  `UpdateLayeredWindow`; `build.bat` has zero parenthesis
+  characters), but a compile error is still possible until
+  the first Windows build. The most likely risk areas, in
+  order, are: Direct2D/DirectWrite API signatures, the
+  `SetWindowCompositionAttribute` runtime resolution, and the
+  layered-window presentation path.
+- Whether Direct2D + layered window + NOACTIVATE actually work
+  together on a real display is untested: the notch could in
+  principle show nothing, show without input, or flicker on
+  first show if `WM_PAINT` semantics for layered windows differ
+  from what was assumed. Mitigations already in the code:
+  explicit presentation after every size change (not only on
+  `WM_PAINT`), and never presenting a failed frame.
+- Blur safety and appearance are untested (see section 3):
+  please test with the toggle on and off, with Transparency
+  effects on and off, and report whether blur appears, the
+  panel looks translucent-dark, or anything goes black.
+- Animation smoothness, spring overshoot feel, and the 16 ms
+  cadence on a high-refresh display are untested, as are DPI
+  behaviour (per-monitor scaling of the Direct2D frame) and
+  the under-10 MB idle target (a target, not a measurement).
+- Icon legibility in Direct2D (thicker geometry vs the old
+  GDI glyphs) and calendar/day hit alignment are untested on
+  screen, although painting and hit tests still share the
+  same Layout computation.
+- If v7 does not run at all, v6 (commit ce42cbf, unified tab
+  size, GDI painting) remains the known-good fallback: it is
+  untouched in `~/workspace/onyxnotch-v6/`.
+
 # OnyxNotch v6 — Card + dock dashboard look, existing data only
 
 Mac-style notch for Windows, in native C++ Win32. One source file, one

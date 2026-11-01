@@ -1,10 +1,12 @@
 @echo off
-REM OnyxNotch v6 - card plus dock dashboard look, existing data only - build on Windows.
+REM OnyxNotch v7 - Direct2D rewrite of v6, card plus dock dashboard look - build on Windows.
 REM Run this from a Visual Studio Developer Command Prompt, or from the x64 Native Tools Command Prompt for VS.
 REM Requires Visual Studio with Desktop development with C++ and the Windows SDK with C++/WinRT headers.
 REM The SMTC code needs C++17 and windowsapp.lib. Those are the only new build requirements over v4.
 REM v5-settings adds advapi32.lib only, for the Reg auto-start calls.
 REM v6 adds iphlpapi.lib for GetIfTable network counters and winmm.lib for waveOutGetVolume.
+REM v7 adds d2d1.lib for Direct2D rendering and dwrite.lib for DirectWrite text.
+REM v7 links are also in main.cpp as pragma comment lib lines, so the cl line below lists them for clarity.
 REM File I/O uses the already-linked Win32 APIs, so no other library is new.
 REM MinGW CANNOT build the C++/WinRT SMTC part, so there is no MinGW command for v5 - MSVC is the supported path.
 REM Output is OnyxNotch.exe in this folder. No installer, no runtime needed.
@@ -13,7 +15,7 @@ REM Note on cmd parsing: this script deliberately uses no parenthesised if block
 setlocal
 rc /nologo onyxnotch.rc
 if errorlevel 1 goto rc_failed
-cl /nologo /std:c++17 /EHsc /O2 /MT /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS main.cpp onyxnotch.res user32.lib gdi32.lib shell32.lib windowsapp.lib advapi32.lib iphlpapi.lib winmm.lib /link /SUBSYSTEM:WINDOWS /OUT:OnyxNotch.exe
+cl /nologo /std:c++17 /EHsc /O2 /MT /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS main.cpp onyxnotch.res user32.lib gdi32.lib shell32.lib windowsapp.lib advapi32.lib iphlpapi.lib winmm.lib d2d1.lib dwrite.lib /link /SUBSYSTEM:WINDOWS /OUT:OnyxNotch.exe
 if errorlevel 1 goto cl_failed
 echo.
 echo Built: OnyxNotch.exe
