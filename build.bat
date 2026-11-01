@@ -13,7 +13,7 @@ REM Note on cmd parsing: this script deliberately uses no parenthesised if block
 setlocal
 rc /nologo onyxnotch.rc
 if errorlevel 1 goto rc_failed
-cl /nologo /std:c++17 /EHsc /O2 /MT /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS /D_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS main.cpp onyxnotch.res user32.lib gdi32.lib shell32.lib windowsapp.lib advapi32.lib iphlpapi.lib winmm.lib /link /SUBSYSTEM:WINDOWS /OUT:OnyxNotch.exe
+cl /nologo /std:c++17 /EHsc /O2 /MT /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS main.cpp onyxnotch.res user32.lib gdi32.lib shell32.lib windowsapp.lib advapi32.lib iphlpapi.lib winmm.lib /link /SUBSYSTEM:WINDOWS /OUT:OnyxNotch.exe
 if errorlevel 1 goto cl_failed
 echo.
 echo Built: OnyxNotch.exe

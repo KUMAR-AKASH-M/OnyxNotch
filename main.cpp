@@ -191,7 +191,9 @@
 // VS 2022/2026 cppwinrt headers still pull in the deprecated
 // experimental coroutine header, which fails with C2338 unless
 // this silence macro is defined before the first winrt include.
+#ifndef _SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS
 #define _SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS
+#endif
 #include <winrt/base.h>
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Media.Control.h>
@@ -1304,6 +1306,7 @@ static int SmtcPlayPauseGlyphMode()
 // ---------------------------------------------------------------------------
 // System stats (sampled only while the widget is on, on the 1s timer).
 // ---------------------------------------------------------------------------
+static void SampleDiskNetVolume();
 static ULONGLONG FileTimeToU64(const FILETIME& ft)
 {
     ULARGE_INTEGER v; v.LowPart = ft.dwLowDateTime; v.HighPart = ft.dwHighDateTime;
@@ -1391,9 +1394,9 @@ static void SampleDiskNetVolume()
                 if (row.dwType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
                 inTotal += row.dwInOctets;
                 outTotal += row.dwOutOctets;
-                if (!g_netOk && row.bDescrLength > 0) {
+                if (!g_netOk && row.dwDescrLen > 0) {
                     char desc[256] = { 0 };
-                    DWORD dl = row.bDescrLength < 255 ? row.bDescrLength : 255;
+                    DWORD dl = row.dwDescrLen < 255 ? row.dwDescrLen : 255;
                     for (DWORD k = 0; k < dl; k++) desc[k] = (char)row.bDescr[k];
                     MultiByteToWideChar(CP_ACP, 0, desc, -1, g_netName, 64);
                     g_netOk = true;
