@@ -1,0 +1,6 @@
+OnyxNotch.exe
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
