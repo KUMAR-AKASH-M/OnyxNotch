@@ -1,3 +1,19 @@
+// OnyxNotch v6-fix - flicker, icons, calendar (in place, after v6).
+//  1. Double-buffered painting: WM_PAINT renders into a memory DC
+//     and BitBlts once; no erase-on-invalidate anywhere, so the
+//     16 ms animation frames and the 1-second tick no longer flash.
+//  2. Stable heights: the calendar card is always 6 weeks tall and
+//     the MEDIA tab always reserves title+artist rows, so a track
+//     starting/stopping or a month change never snaps the height.
+//  3. Icons redrawn on one thicker, centred GDI grid (see DrawDockGlyph
+//     and DrawMediaGlyph). Segoe MDL2 Assets was deliberately NOT
+//     used: its glyph codepoints are unverifiable in this VM and a
+//     wrong or missing glyph would show as tofu; hand-drawn glyphs
+//     match their hit areas exactly and take theme colours.
+//  4. Calendar: prev/next month arrows, a Today button, clickable
+//     days (selected = outlined pill), faded adjacent-month days,
+//     weekend days muted, and an agenda that follows the selection.
+//     No events are invented: the agenda says No events.
 // OnyxNotch v6 - card + dock dashboard look, existing data only.
 // Wide expanded panel: header bar, card grid, bottom icon dock.
 // No weather, no notes, no clipboard history, no screen-time
@@ -602,6 +618,11 @@ struct Notch {
     int hoverTab = -1;
     int hoverDock = -1; // v6: dock tab id hovered, or -1
     bool hoverClose = false; // v6: close X hovered
+    int lastClockMinute = -1; // v6-fix: collapsed repaints only on a minute change
+    int calYear = 0, calMonth = 0, calDay = 0;
+    int hoverCalArrow = 0; // v6-fix: -1 prev, 0 none, 1 next
+    bool hoverCalToday = false;
+    int hoverCalCell = -1; // v6-fix: 0..41 cell in the displayed grid, or -1
     bool animActive = false;
     ULONGLONG animStartTick = 0;
     int animFromW = 0, animFromH = 0;
@@ -696,6 +717,11 @@ struct Layout {
     RECT agendaCard = { 0, 0, 0, 0 };
     int calendarY = 0;
     int calendarH = 0;
+    RECT calPrevRect = { 0, 0, 0, 0 };
+    RECT calNextRect = { 0, 0, 0, 0 };
+    RECT calTodayRect = { 0, 0, 0, 0 };
+    int calCellW = 0, calCellH = 0, calWeekY = 0, calGridY = 0;
+    int calFirstWeekday = 0, calDays = 0, calPrevDays = 0;
 };
 
 static int DaysInMonth(int year, int month)
@@ -706,6 +732,18 @@ static int DaysInMonth(int year, int month)
         return leap ? 29 : 28;
     }
     return kDays[(month - 1) % 12];
+}
+
+// v6-fix: the month the calendar tab is showing. 0/0 means the
+// current month (the default, and the reset state on leaving the
+// tab or collapsing). Displayed month is per-notch state.
+static void CalDisplayed(Notch* n, int& year, int& month)
+{
+    if (n && n->calYear > 0 && n->calMonth >= 1 && n->calMonth <= 12) {
+        year = n->calYear; month = n->calMonth; return;
+    }
+    SYSTEMTIME st; GetLocalTime(&st);
+    year = st.wYear; month = st.wMonth;
 }
 
 // v6: the tab actually shown. Clock is always valid. A selected
@@ -803,10 +841,11 @@ static Layout ComputeLayout(Notch* n, int clientW)
     } else if (effTab == kTabMedia) {
         L.mediaCard = { margin, L.bodyY, margin + bodyW, L.bodyY + Scale(120, dpi) };
         int y = L.bodyY + Scale(36, dpi);
-        if (g_smtcHasTrack) {
-            L.mediaTitleY = y; y += Scale(22, dpi);
-            if (g_smtcArtist[0] != L'\0') { L.mediaArtistY = y; y += Scale(20, dpi); }
-        }
+        // v6-fix: ALWAYS reserve both rows when media is on, whether
+        // or not a track is playing, so a track starting or stopping
+        // never snaps the card or panel height.
+        L.mediaTitleY = y; y += Scale(22, dpi);
+        L.mediaArtistY = y; y += Scale(20, dpi);
         L.mediaButtonH = Scale(32, dpi);
         L.mediaButtonY = y + Scale(6, dpi);
         int bw = (bodyW - 2 * btnGap) / 3;
@@ -817,18 +856,37 @@ static Layout ComputeLayout(Notch* n, int clientW)
         bodyH = L.mediaButtonY + L.mediaButtonH + Scale(12, dpi) - L.bodyY;
         L.mediaCard.bottom = L.mediaButtonY + L.mediaButtonH + Scale(12, dpi);
     } else if (effTab == kTabCalendar) {
-        SYSTEMTIME st; GetLocalTime(&st);
-        int firstWeekday = (int)((st.wDayOfWeek - (st.wDay - 1) % 7) % 7);
-        if (firstWeekday < 0) firstWeekday += 7;
-        int cells = firstWeekday + DaysInMonth(st.wYear, st.wMonth);
-        int rows = (cells + 6) / 7;
+        // v6-fix: FIXED 6-week height, whatever the month.
+        int dispY = 0, dispM = 0; CalDisplayed(n, dispY, dispM);
+        SYSTEMTIME first; first.wYear = (WORD)dispY; first.wMonth = (WORD)dispM; first.wDay = 1;
+        first.wHour = 0; first.wMinute = 0; first.wSecond = 0; first.wMilliseconds = 0;
+        FILETIME fft; SystemTimeToFileTime(&first, &fft); FileTimeToSystemTime(&fft, &first);
+        int firstWeekday = (int)first.wDayOfWeek;
+        int days = DaysInMonth(dispY, dispM);
+        int prevY = dispM == 1 ? dispY - 1 : dispY;
+        int prevM = dispM == 1 ? 12 : dispM - 1;
+        int prevDays = DaysInMonth(prevY, prevM);
         int monthW = bodyW * 60 / 100;
         int agendaW = bodyW - monthW - gap;
-        int monthH = Scale(36, dpi) + Scale(20, dpi) + rows * Scale(20, dpi) + Scale(16, dpi);
+        int monthH = Scale(262, dpi);
         L.monthCard = { margin, L.bodyY, margin + monthW, L.bodyY + monthH };
         L.agendaCard = { margin + monthW + gap, L.bodyY, margin + monthW + gap + agendaW, L.bodyY + monthH };
         L.calendarY = L.bodyY;
         L.calendarH = monthH;
+        L.calFirstWeekday = firstWeekday;
+        L.calDays = days;
+        L.calPrevDays = prevDays;
+        L.calCellW = (monthW - Scale(28, dpi)) / 7;
+        L.calCellH = Scale(28, dpi);
+        L.calWeekY = L.bodyY + Scale(40, dpi);
+        L.calGridY = L.calWeekY + Scale(20, dpi);
+        L.calPrevRect = { margin + Scale(14, dpi), L.bodyY + Scale(10, dpi),
+                          margin + Scale(42, dpi), L.bodyY + Scale(38, dpi) };
+        L.calNextRect = { margin + monthW - Scale(42, dpi), L.bodyY + Scale(10, dpi),
+                          margin + monthW - Scale(14, dpi), L.bodyY + Scale(38, dpi) };
+        int todayW = Scale(64, dpi);
+        L.calTodayRect = { margin + (monthW - todayW) / 2, L.bodyY + Scale(230, dpi),
+                           margin + (monthW + todayW) / 2, L.bodyY + Scale(252, dpi) };
         bodyH = monthH;
     }
     // Bottom icon dock: centred pill, one icon per dock tab.
@@ -922,7 +980,7 @@ static void ApplyTargetSize(Notch* n, bool targetExpanded)
         StopAnimation(n);
         n->paintExpanded = targetExpanded;
         ApplyNotchSizeInstant(n, targetExpanded);
-        InvalidateRect(n->hwnd, NULL, TRUE);
+        InvalidateRect(n->hwnd, NULL, FALSE);
         return;
     }
     RECT cur = { 0, 0, 0, 0 };
@@ -933,7 +991,7 @@ static void ApplyTargetSize(Notch* n, bool targetExpanded)
         StopAnimation(n);
         n->paintExpanded = targetExpanded;
         ApplyNotchSizeInstant(n, targetExpanded);
-        InvalidateRect(n->hwnd, NULL, TRUE);
+        InvalidateRect(n->hwnd, NULL, FALSE);
         return;
     }
     if (targetExpanded) n->paintExpanded = true; // collapsing keeps
@@ -956,7 +1014,7 @@ static void StepAnimation(Notch* n)
         StopAnimation(n);
         n->paintExpanded = n->expanded;
         ApplyNotchSizeInstant(n, n->expanded);
-        InvalidateRect(n->hwnd, NULL, TRUE);
+        InvalidateRect(n->hwnd, NULL, FALSE);
         return;
     }
     double t = (double)elapsed / (double)kAnimDurationMs;
@@ -989,7 +1047,8 @@ static void SetNotchExpanded(Notch* n, bool expanded)
     n->expanded = expanded;
     // v4 tabs: expanding always starts on HOME (a collapse
     // resets the tab on the next expand, never mid-collapse).
-    if (expanded) n->activeTab = kTabHome;
+    // v6-fix: the calendar display resets with it.
+    if (expanded) { n->activeTab = kTabHome; n->calYear = 0; n->calMonth = 0; n->calDay = 0; }
     ApplyTargetSize(n, expanded);
 }
 
@@ -1112,6 +1171,20 @@ static void FormatDate(wchar_t* out, size_t count)
     static const wchar_t* kMonths[] = { L"January", L"February", L"March", L"April", L"May", L"June",
         L"July", L"August", L"September", L"October", L"November", L"December" };
     SYSTEMTIME st; GetLocalTime(&st);
+    swprintf(out, count, L"%s, %d %s %d", kDays[st.wDayOfWeek % 7], st.wDay,
+             kMonths[(st.wMonth - 1) % 12], st.wYear);
+}
+
+// v6-fix: FormatDate for an arbitrary date (the agenda's selected
+// day), not just today. Weekday is recovered via FILETIME so it is
+// correct for any displayed month, not assumed from today.
+static void FormatDateFromSt(SYSTEMTIME st, wchar_t* out, size_t count)
+{
+    static const wchar_t* kDays[] = { L"Sunday", L"Monday", L"Tuesday", L"Wednesday",
+        L"Thursday", L"Friday", L"Saturday" };
+    static const wchar_t* kMonths[] = { L"January", L"February", L"March", L"April", L"May", L"June",
+        L"July", L"August", L"September", L"October", L"November", L"December" };
+    FILETIME ft; SystemTimeToFileTime(&st, &ft); FileTimeToSystemTime(&ft, &st);
     swprintf(out, count, L"%s, %d %s %d", kDays[st.wDayOfWeek % 7], st.wDay,
              kMonths[(st.wMonth - 1) % 12], st.wYear);
 }
@@ -1528,9 +1601,21 @@ static void UpdateFullscreenAndVisibility()
 static void InvalidateAllNotches()
 {
     for (size_t i = 0; i < g_notches.size(); i++) {
-        if (g_notches[i]->hwnd && !g_notches[i]->hiddenByFullscreen) {
-            InvalidateRect(g_notches[i]->hwnd, NULL, FALSE);
+        Notch* nn = g_notches[i];
+        if (!nn->hwnd || nn->hiddenByFullscreen) continue;
+        // v6-fix, provably safe dirty-region cut: a collapsed notch
+        // shows only the clock (HH:MM), so a 1-second tick that does
+        // not change the minute paints nothing new. Expanded notches
+        // still repaint every tick (stats, sparklines, SMTC, clock
+        // card all move per second) — now into the double buffer,
+        // so that repaint no longer flashes.
+        if (!nn->expanded) {
+            SYSTEMTIME st; GetLocalTime(&st);
+            int minute = st.wHour * 60 + st.wMinute;
+            if (nn->lastClockMinute == minute) continue;
+            nn->lastClockMinute = minute;
         }
+        InvalidateRect(nn->hwnd, NULL, FALSE);
     }
 }
 
@@ -1731,6 +1816,84 @@ static bool GearHitAt(Notch* n, int px, int py, bool usePaint)
     return dx * dx + dy * dy <= r * r;
 }
 
+// v6-fix calendar helpers. CalSelected: the day the agenda follows.
+// 0 (default) means today when the displayed month is the current
+// month, else day 1; an explicit day is clamped to the displayed
+// month's length. CalCellDate maps a 0..41 grid cell to a real date,
+// including faded adjacent-month days.
+static int CalSelectedDay(Notch* n, int dispY, int dispM)
+{
+    SYSTEMTIME now; GetLocalTime(&now);
+    if (n && n->calDay > 0) {
+        int d = n->calDay;
+        int maxD = DaysInMonth(dispY, dispM);
+        return d > maxD ? maxD : d;
+    }
+    if (dispY == now.wYear && dispM == now.wMonth) return now.wDay;
+    return 1;
+}
+
+static void CalCellDate(const Layout& L, int dispY, int dispM, int cell,
+                        int& outY, int& outM, int& outD)
+{
+    int idx = cell - L.calFirstWeekday;
+    if (idx < 0) {
+        int py = dispM == 1 ? dispY - 1 : dispY;
+        int pm = dispM == 1 ? 12 : dispM - 1;
+        outY = py; outM = pm; outD = L.calPrevDays + idx + 1;
+    } else if (idx >= L.calDays) {
+        int ny = dispM == 12 ? dispY + 1 : dispY;
+        int nm = dispM == 12 ? 1 : dispM + 1;
+        outY = ny; outM = nm; outD = idx - L.calDays + 1;
+    } else {
+        outY = dispY; outM = dispM; outD = idx + 1;
+    }
+}
+
+static bool CalPrevHitAt(Notch* n, int px, int py, bool usePaint)
+{
+    if (usePaint ? !n->paintExpanded : !n->expanded) return false;
+    if (EffectiveTab(n) != kTabCalendar) return false;
+    RECT rc; GetClientRect(n->hwnd, &rc);
+    Layout L = ComputeLayout(n, rc.right);
+    return px >= L.calPrevRect.left && px < L.calPrevRect.right &&
+           py >= L.calPrevRect.top && py < L.calPrevRect.bottom;
+}
+
+static bool CalNextHitAt(Notch* n, int px, int py, bool usePaint)
+{
+    if (usePaint ? !n->paintExpanded : !n->expanded) return false;
+    if (EffectiveTab(n) != kTabCalendar) return false;
+    RECT rc; GetClientRect(n->hwnd, &rc);
+    Layout L = ComputeLayout(n, rc.right);
+    return px >= L.calNextRect.left && px < L.calNextRect.right &&
+           py >= L.calNextRect.top && py < L.calNextRect.bottom;
+}
+
+static bool CalTodayHitAt(Notch* n, int px, int py, bool usePaint)
+{
+    if (usePaint ? !n->paintExpanded : !n->expanded) return false;
+    if (EffectiveTab(n) != kTabCalendar) return false;
+    RECT rc; GetClientRect(n->hwnd, &rc);
+    Layout L = ComputeLayout(n, rc.right);
+    return px >= L.calTodayRect.left && px < L.calTodayRect.right &&
+           py >= L.calTodayRect.top && py < L.calTodayRect.bottom;
+}
+
+static int CalDayHitAt(Notch* n, int px, int py, bool usePaint)
+{
+    if (usePaint ? !n->paintExpanded : !n->expanded) return -1;
+    if (EffectiveTab(n) != kTabCalendar) return -1;
+    RECT rc; GetClientRect(n->hwnd, &rc);
+    Layout L = ComputeLayout(n, rc.right);
+    if (L.calCellW <= 0 || L.calCellH <= 0) return -1;
+    int x0 = L.monthCard.left + Scale(14, n->dpi);
+    int col = (px - x0) / L.calCellW;
+    int row = (py - L.calGridY) / L.calCellH;
+    if (col < 0 || col > 6 || row < 0 || row > 5) return -1;
+    return row * 7 + col;
+}
+
 // v4 reorg: plain-GDI gear — 8 teeth, a solid ring, a dark centre
 // hole. No font glyph, no image asset. Colour follows the
 // current theme (gear / gearHover / gearPressed, gearHole
@@ -1745,8 +1908,9 @@ static void DrawGear(HDC hdc, int cx, int cy, int r, COLORREF color)
     // Teeth: 8 small rectangles rotated around the centre, drawn
     // first so the ring below covers their inner ends.
     const double kPi = 3.141592653589793;
-    int toothW = r * 2 / 5; if (toothW < 3) toothW = 3;
-    int toothH = r / 3; if (toothH < 2) toothH = 2;
+    // v6-fix: chunkier teeth (radial 0.55r, width 0.45r) so the gear reads at 11 px.
+    int toothW = r * 11 / 20; if (toothW < 3) toothW = 3;
+    int toothH = r * 9 / 20; if (toothH < 2) toothH = 2;
     for (int i = 0; i < 8; i++) {
         double a = (double)i * kPi / 4.0;
         double ca = cos(a), sa = sin(a);
@@ -1785,13 +1949,13 @@ static void DrawGear(HDC hdc, int cx, int cy, int r, COLORREF color)
 // triangle only (currently paused, so the button plays).
 static void DrawMediaGlyph(HDC hdc, int idx, int cx, int cy, int r, HBRUSH glyphBrush, int playPauseMode)
 {
-    int h = (2 * r) * 11 / 20; // glyph height, as in v3
+    int h = (2 * r) * 14 / 20; // v6-fix: 70% of the diameter, was 55%
     int half = h / 2;
     if (idx == 0 || idx == 2) {
         // Prev: bar + two triangles pointing left.
         // Next: two triangles pointing right + bar (mirrored).
         int dir = (idx == 0) ? -1 : 1;
-        int barW = h / 6; if (barW < 2) barW = 2;
+        int barW = h / 5; if (barW < 3) barW = 3;
         int triW = h / 2;
         int gap = 1;
         int totalW = barW + gap + 2 * triW + gap;
@@ -1814,8 +1978,8 @@ static void DrawMediaGlyph(HDC hdc, int idx, int cx, int cy, int r, HBRUSH glyph
         }
     } else if (playPauseMode == 1) {
         // v5-SMTC, playing: pause bars only, centred.
-        int barW = h / 6; if (barW < 2) barW = 2;
-        int gap = h / 8; if (gap < 2) gap = 2;
+        int barW = h / 5; if (barW < 3) barW = 3;
+        int gap = h / 6; if (gap < 2) gap = 2;
         int totalW = 2 * barW + gap;
         int x0 = cx - totalW / 2;
         RECT b1 = { x0, cy - half, x0 + barW, cy + half };
@@ -1832,8 +1996,8 @@ static void DrawMediaGlyph(HDC hdc, int idx, int cx, int cy, int r, HBRUSH glyph
         // Play/Pause: a play triangle on the left, pause bars
         // on the right, so one button reads as the toggle.
         int triW = h / 2;
-        int barW = h / 6; if (barW < 2) barW = 2;
-        int gap = h / 8; if (gap < 2) gap = 2;
+        int barW = h / 5; if (barW < 3) barW = 3;
+        int gap = h / 6; if (gap < 2) gap = 2;
         int totalW = triW + gap + 2 * barW + gap;
         int x0 = cx - totalW / 2;
         POINT tri[3] = { { x0, cy - half }, { x0, cy + half }, { x0 + triW, cy } };
@@ -2041,39 +2205,50 @@ static void DrawBar(HDC hdc, const RECT& rc, int pct)
     }
 }
 
+// v6-fix icon system: redrawn GDI, NOT Segoe MDL2 Assets. MDL2 was
+// considered and rejected on purpose: its glyph codepoints cannot
+// be verified in this VM, and a wrong or missing glyph would render
+// as a tofu box on a user's machine. Hand-drawn glyphs are checked
+// against the same Layout hit areas that painting uses, take theme
+// colours directly, and need no font detection. One grid for every
+// icon: glyphs live in a circle of radius ir = 3/4 of the hit
+// radius, strokes are at least ir/5 thick, and every glyph is
+// centred on its hit centre. Dock active = white circle + dark
+// glyph (unchanged); inactive = muted, brighter on hover.
 static void DrawDockGlyph(HDC hdc, int tabId, int cx, int cy, int r, COLORREF color)
 {
-    HPEN pen = CreatePen(PS_SOLID, 1, color);
+    int ir = r * 3 / 4; if (ir < 4) ir = 4;
+    int stroke = ir / 5; if (stroke < 2) stroke = 2;
+    HPEN pen = CreatePen(PS_SOLID, stroke, color);
     HPEN oldPen = (HPEN)SelectObject(hdc, pen);
     HBRUSH brush = CreateSolidBrush(color);
     HBRUSH oldBrush = (HBRUSH)SelectObject(hdc, brush);
     HPEN nullPen = (HPEN)GetStockObject(NULL_PEN);
+    HBRUSH nullBrush = (HBRUSH)GetStockObject(NULL_BRUSH);
     if (tabId == kTabHome) {
-        POINT roof[3] = { { cx, cy - r }, { cx - r, cy }, { cx + r, cy } };
+        POINT roof[3] = { { cx, cy - ir }, { cx - ir, cy - ir / 4 }, { cx + ir, cy - ir / 4 } };
         Polygon(hdc, roof, 3);
-        RECT house = { cx - r * 2 / 3, cy, cx + r * 2 / 3, cy + r };
+        RECT house = { cx - ir * 2 / 3, cy - ir / 4, cx + ir * 2 / 3, cy + ir };
         FillRect(hdc, &house, brush);
     } else if (tabId == kTabSystem) {
         SelectObject(hdc, nullPen);
-        DrawGear(hdc, cx, cy, r * 2 / 3, color);
+        DrawGear(hdc, cx, cy, ir, color);
         SelectObject(hdc, pen);
     } else if (tabId == kTabMedia) {
-        POINT tri[3] = { { cx - r / 2, cy - r * 2 / 3 }, { cx - r / 2, cy + r * 2 / 3 }, { cx + r * 2 / 3, cy } };
+        POINT tri[3] = { { cx - ir / 2, cy - ir * 2 / 3 }, { cx - ir / 2, cy + ir * 2 / 3 }, { cx + ir * 2 / 3, cy } };
         Polygon(hdc, tri, 3);
     } else if (tabId == kTabClock) {
-        HBRUSH nullBrush = (HBRUSH)GetStockObject(NULL_BRUSH);
         HBRUSH prevB = (HBRUSH)SelectObject(hdc, nullBrush);
-        Ellipse(hdc, cx - r * 2 / 3, cy - r * 2 / 3, cx + r * 2 / 3, cy + r * 2 / 3);
+        Ellipse(hdc, cx - ir, cy - ir, cx + ir, cy + ir);
         SelectObject(hdc, prevB);
-        MoveToEx(hdc, cx, cy, NULL); LineTo(hdc, cx, cy - r / 2);
-        MoveToEx(hdc, cx, cy, NULL); LineTo(hdc, cx + r / 3, cy);
+        MoveToEx(hdc, cx, cy, NULL); LineTo(hdc, cx, cy - ir / 2);
+        MoveToEx(hdc, cx, cy, NULL); LineTo(hdc, cx + ir / 2, cy);
     } else if (tabId == kTabCalendar) {
-        RECT cal = { cx - r * 2 / 3, cy - r / 2, cx + r * 2 / 3, cy + r * 2 / 3 };
-        HBRUSH nullBrush = (HBRUSH)GetStockObject(NULL_BRUSH);
+        RECT cal = { cx - ir, cy - ir * 3 / 4, cx + ir, cy + ir };
         HBRUSH prevB = (HBRUSH)SelectObject(hdc, nullBrush);
         RoundRect(hdc, cal.left, cal.top, cal.right, cal.bottom, 4, 4);
         SelectObject(hdc, prevB);
-        RECT bar = { cal.left, cal.top, cal.right, cal.top + r / 3 };
+        RECT bar = { cal.left, cal.top, cal.right, cal.top + ir / 3 };
         FillRect(hdc, &bar, brush);
     }
     SelectObject(hdc, oldPen);
@@ -2136,9 +2311,9 @@ static void PaintNotch(Notch* n, HDC hdc)
     else if (effTab == kTabSystem) { wcscpy_s(subtitle, 128, L"Power \x00B7 Network \x00B7 Audio"); }
     else if (effTab == kTabClock) { wcscpy_s(subtitle, 128, L"Local Time & Date"); }
     else if (effTab == kTabCalendar) {
-        SYSTEMTIME st; GetLocalTime(&st);
+        int dy = 0, dm = 0; CalDisplayed(n, dy, dm);
         static const wchar_t* kMonths[] = { L"January", L"February", L"March", L"April", L"May", L"June", L"July", L"August", L"September", L"October", L"November", L"December" };
-        swprintf(subtitle, 128, L"%s %d", kMonths[(st.wMonth - 1) % 12], st.wYear);
+        swprintf(subtitle, 128, L"%s %d", kMonths[(dm - 1) % 12], dy);
     } else if (effTab == kTabMedia) {
         if (g_smtcHasTrack && g_smtcArtist[0] != L'\0') wcsncpy_s(subtitle, 128, g_smtcArtist, _TRUNCATE);
         else wcscpy_s(subtitle, 128, L"Media controls");
@@ -2166,7 +2341,8 @@ static void PaintNotch(Notch* n, HDC hdc)
         if (n->pressedGear) gearColor = th.gearPressed;
         else if (n->hoverGear) gearColor = th.gearHover;
         DrawGear(hdc, L.gearCX, L.gearCY, L.gearR, gearColor);
-        HPEN xPen = CreatePen(PS_SOLID, 2, n->hoverClose ? th.primary : th.secondary);
+        int xw = L.closeR / 4; if (xw < 2) xw = 2;
+        HPEN xPen = CreatePen(PS_SOLID, xw, n->hoverClose ? th.primary : th.secondary);
         HPEN oldPen = (HPEN)SelectObject(hdc, xPen);
         int r = L.closeR;
         MoveToEx(hdc, L.closeCX - r, L.closeCY - r, NULL); LineTo(hdc, L.closeCX + r, L.closeCY + r);
@@ -2345,63 +2521,97 @@ static void PaintNotch(Notch* n, HDC hdc)
             }
         }
     } else if (effTab == kTabCalendar) {
+        // v6-fix calendar: displayed month with prev/next arrows,
+        // a Today button, a fixed 6-week grid, faded adjacent-month
+        // days, muted weekends, today = accent pill, selected day =
+        // accent outline pill. Grid height never changes.
         DrawCard(hdc, L.monthCard, L"CALENDAR", n->hFontTiny);
         {
             RECT c = L.monthCard;
+            int dispY = 0, dispM = 0; CalDisplayed(n, dispY, dispM);
+            int selD = CalSelectedDay(n, dispY, dispM);
             static const wchar_t* kMonths[] = { L"January", L"February", L"March", L"April", L"May", L"June", L"July", L"August", L"September", L"October", L"November", L"December" };
-            wchar_t monthText[64]; swprintf(monthText, 64, L"%s %d", kMonths[(now.wMonth - 1) % 12], now.wYear);
-            DrawCenteredText(hdc, n->hFontSmall, monthText, c.left, c.top + Scale(30, dpi), c.right - c.left, Scale(24, dpi), th.primary);
-            int cellW = (c.right - c.left - Scale(28, dpi)) / 7;
-            int cellH = Scale(20, dpi);
-            int weekY = c.top + Scale(58, dpi);
+            wchar_t monthText[64]; swprintf(monthText, 64, L"%s %d", kMonths[(dispM - 1) % 12], dispY);
+            DrawCenteredText(hdc, n->hFontSmall, monthText, c.left, c.top + Scale(10, dpi), c.right - c.left, Scale(28, dpi), th.primary);
+            COLORREF prevC = (n->hoverCalArrow == -1) ? th.primary : th.secondary;
+            COLORREF nextC = (n->hoverCalArrow == 1) ? th.primary : th.secondary;
+            DrawCenteredText(hdc, n->hFontSmall, L"<", L.calPrevRect.left, L.calPrevRect.top, L.calPrevRect.right - L.calPrevRect.left, L.calPrevRect.bottom - L.calPrevRect.top, prevC);
+            DrawCenteredText(hdc, n->hFontSmall, L">", L.calNextRect.left, L.calNextRect.top, L.calNextRect.right - L.calNextRect.left, L.calNextRect.bottom - L.calNextRect.top, nextC);
             static const wchar_t* kWeek[] = { L"S", L"M", L"T", L"W", L"T", L"F", L"S" };
-            for (int cc = 0; cc < 7; cc++) DrawCenteredText(hdc, n->hFontTiny, kWeek[cc], c.left + Scale(14, dpi) + cc * cellW, weekY, cellW, cellH, th.muted);
-            int firstWeekday = (int)((now.wDayOfWeek - (now.wDay - 1) % 7) % 7);
-            if (firstWeekday < 0) firstWeekday += 7;
-            int days = DaysInMonth(now.wYear, now.wMonth);
-            for (int d = 1; d <= days; d++) {
-                int idx = firstWeekday + d - 1;
-                int col = idx % 7, row = idx / 7;
-                int x = c.left + Scale(14, dpi) + col * cellW;
-                int y = weekY + cellH + row * cellH;
-                bool isToday = (d == now.wDay);
+            for (int cc = 0; cc < 7; cc++) DrawCenteredText(hdc, n->hFontTiny, kWeek[cc], c.left + Scale(14, dpi) + cc * L.calCellW, L.calWeekY, L.calCellW, Scale(20, dpi), th.muted);
+            for (int cell = 0; cell < 42; cell++) {
+                int cy2 = 0, cm2 = 0, cd2 = 0;
+                CalCellDate(L, dispY, dispM, cell, cy2, cm2, cd2);
+                int col = cell % 7, row = cell / 7;
+                int x = c.left + Scale(14, dpi) + col * L.calCellW;
+                int y = L.calGridY + row * L.calCellH;
+                bool inMonth = (cy2 == dispY && cm2 == dispM);
+                bool isWeekend = (col == 0 || col == 6);
+                bool isToday = (cy2 == now.wYear && cm2 == now.wMonth && cd2 == now.wDay);
+                bool isSelected = (cy2 == dispY && cm2 == dispM && cd2 == selD);
                 if (isToday) {
                     HPEN nullP = (HPEN)GetStockObject(NULL_PEN); HPEN oldP = (HPEN)SelectObject(hdc, nullP);
                     HBRUSH pill = CreateSolidBrush(th.accent); HBRUSH oldB = (HBRUSH)SelectObject(hdc, pill);
-                    RoundRect(hdc, x + 2, y + 1, x + cellW - 2, y + cellH - 1, cellH, cellH);
+                    RoundRect(hdc, x + Scale(4, dpi), y + Scale(2, dpi), x + L.calCellW - Scale(4, dpi), y + L.calCellH - Scale(2, dpi), L.calCellH, L.calCellH);
                     SelectObject(hdc, oldP); SelectObject(hdc, oldB); DeleteObject(pill);
+                } else if (isSelected) {
+                    HPEN op = CreatePen(PS_SOLID, 2, th.accent); HPEN oldP = (HPEN)SelectObject(hdc, op);
+                    HBRUSH nullB = (HBRUSH)GetStockObject(NULL_BRUSH); HBRUSH oldB = (HBRUSH)SelectObject(hdc, nullB);
+                    RoundRect(hdc, x + Scale(4, dpi), y + Scale(2, dpi), x + L.calCellW - Scale(4, dpi), y + L.calCellH - Scale(2, dpi), L.calCellH, L.calCellH);
+                    SelectObject(hdc, oldP); SelectObject(hdc, oldB); DeleteObject(op);
+                } else if (cell == n->hoverCalCell) {
+                    HPEN op = CreatePen(PS_SOLID, 1, th.muted); HPEN oldP = (HPEN)SelectObject(hdc, op);
+                    HBRUSH nullB = (HBRUSH)GetStockObject(NULL_BRUSH); HBRUSH oldB = (HBRUSH)SelectObject(hdc, nullB);
+                    RoundRect(hdc, x + Scale(4, dpi), y + Scale(2, dpi), x + L.calCellW - Scale(4, dpi), y + L.calCellH - Scale(2, dpi), L.calCellH, L.calCellH);
+                    SelectObject(hdc, oldP); SelectObject(hdc, oldB); DeleteObject(op);
                 }
-                wchar_t dayText[8]; swprintf(dayText, 8, L"%d", d);
-                DrawCenteredText(hdc, n->hFontTiny, dayText, x, y, cellW, cellH, isToday ? th.pillText : th.secondary);
+                wchar_t dayText[8]; swprintf(dayText, 8, L"%d", cd2);
+                COLORREF tc = th.secondary;
+                if (isToday) tc = th.pillText;
+                else if (isSelected) tc = th.primary;
+                else if (!inMonth || isWeekend) tc = th.muted;
+                DrawCenteredText(hdc, n->hFontTiny, dayText, x, y, L.calCellW, L.calCellH, tc);
             }
+            COLORREF todayC = n->hoverCalToday ? th.primary : th.secondary;
+            DrawCenteredText(hdc, n->hFontTiny, L"Today", L.calTodayRect.left, L.calTodayRect.top, L.calTodayRect.right - L.calTodayRect.left, L.calTodayRect.bottom - L.calTodayRect.top, todayC);
         }
         DrawCard(hdc, L.agendaCard, L"AGENDA", n->hFontTiny);
         {
             RECT c = L.agendaCard;
-            wchar_t dt[64]; FormatDate(dt, 64);
+            int dispY = 0, dispM = 0; CalDisplayed(n, dispY, dispM);
+            int selD = CalSelectedDay(n, dispY, dispM);
+            SYSTEMTIME sel; sel.wYear = (WORD)dispY; sel.wMonth = (WORD)dispM; sel.wDay = (WORD)selD;
+            sel.wHour = 0; sel.wMinute = 0; sel.wSecond = 0; sel.wMilliseconds = 0;
+            wchar_t dt[64]; FormatDateFromSt(sel, dt, 64);
             DrawLeftText(hdc, n->hFontSmall, dt, c.left + 14, c.top + Scale(30, dpi), c.right - c.left - 28, Scale(24, dpi), th.primary);
-            DrawLeftText(hdc, n->hFontTiny, L"Today", c.left + 14, c.top + Scale(58, dpi), c.right - c.left - 28, Scale(20, dpi), th.muted);
-            static const wchar_t* kDays[] = { L"Sun", L"Mon", L"Tue", L"Wed", L"Thu", L"Fri", L"Sat" };
-            FILETIME ft; SystemTimeToFileTime(&now, &ft);
-            ULARGE_INTEGER base; base.LowPart = ft.dwLowDateTime; base.HighPart = ft.dwHighDateTime;
+            bool selIsToday = (dispY == now.wYear && dispM == now.wMonth && selD == now.wDay);
+            DrawLeftText(hdc, n->hFontTiny, selIsToday ? L"Today" : L"Selected day", c.left + 14, c.top + Scale(58, dpi), c.right - c.left - 28, Scale(20, dpi), th.muted);
+            FILETIME sft; SystemTimeToFileTime(&sel, &sft);
+            ULARGE_INTEGER base; base.LowPart = sft.dwLowDateTime; base.HighPart = sft.dwHighDateTime;
+            SYSTEMTIME withDow; FileTimeToSystemTime(&sft, &withDow);
             int y = c.top + Scale(84, dpi);
+            static const wchar_t* kDays[] = { L"Sun", L"Mon", L"Tue", L"Wed", L"Thu", L"Fri", L"Sat" };
             for (int cc = 0; cc < 7; cc++) {
-                ULARGE_INTEGER v; v.QuadPart = base.QuadPart + (ULONGLONG)((LONGLONG)(cc - now.wDayOfWeek) * 864000000000LL);
+                ULONGLONG off = (ULONGLONG)((LONGLONG)(cc - withDow.wDayOfWeek) * 864000000000LL);
+                ULARGE_INTEGER v; v.QuadPart = base.QuadPart + off;
                 FILETIME cft; cft.dwLowDateTime = v.LowPart; cft.dwHighDateTime = v.HighPart;
                 SYSTEMTIME cst; FileTimeToSystemTime(&cft, &cst);
                 wchar_t row[32]; swprintf(row, 32, L"%s  %d", kDays[cst.wDayOfWeek % 7], cst.wDay);
-                DrawLeftText(hdc, n->hFontTiny, row, c.left + 14, y, c.right - c.left - 28, Scale(20, dpi), cc == now.wDayOfWeek ? th.primary : th.secondary);
+                bool isSel = (cst.wYear == dispY && cst.wMonth == dispM && cst.wDay == selD);
+                DrawLeftText(hdc, n->hFontTiny, row, c.left + 14, y, c.right - c.left - 28, Scale(20, dpi), isSel ? th.primary : th.secondary);
                 y += Scale(20, dpi);
             }
             DrawLeftText(hdc, n->hFontTiny, L"No events", c.left + 14, y + Scale(4, dpi), c.right - c.left - 28, Scale(20, dpi), th.muted);
         }
     } else if (effTab == kTabMedia) {
         DrawCard(hdc, L.mediaCard, L"MEDIA", n->hFontTiny);
-        if (g_smtcHasTrack && L.mediaTitleY >= 0) {
+        // v6-fix: rows are reserved in the layout, so this block
+        // never changes the height, whatever SMTC reports.
+        if (g_smtcHasTrack) {
             DrawLeftEllipsisText(hdc, n->hFontSmall, g_smtcTitle, L.mediaCard.left + 14, L.mediaTitleY, L.mediaCard.right - L.mediaCard.left - 28, Scale(22, dpi), th.primary);
-            if (g_smtcArtist[0] != L'\0' && L.mediaArtistY >= 0) DrawLeftEllipsisText(hdc, n->hFontTiny, g_smtcArtist, L.mediaCard.left + 14, L.mediaArtistY, L.mediaCard.right - L.mediaCard.left - 28, Scale(20, dpi), th.secondary);
+            if (g_smtcArtist[0] != L'\0') DrawLeftEllipsisText(hdc, n->hFontTiny, g_smtcArtist, L.mediaCard.left + 14, L.mediaArtistY, L.mediaCard.right - L.mediaCard.left - 28, Scale(20, dpi), th.secondary);
         } else {
-            DrawLeftText(hdc, n->hFontTiny, L"No track", L.mediaCard.left + 14, L.mediaCard.top + Scale(36, dpi), L.mediaCard.right - L.mediaCard.left - 28, Scale(20, dpi), th.secondary);
+            DrawLeftText(hdc, n->hFontTiny, L"No track", L.mediaCard.left + 14, L.mediaTitleY, L.mediaCard.right - L.mediaCard.left - 28, Scale(20, dpi), th.secondary);
         }
         DrawMediaButtonsRow(hdc, n, L, false);
     }
@@ -2490,6 +2700,19 @@ static LRESULT CALLBACK NotchWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                 n->hoverClose = close;
                 InvalidateRect(hwnd, NULL, FALSE);
             }
+            // v6-fix calendar hover (arrows, Today, day cells).
+            if (n->paintExpanded && EffectiveTab(n) == kTabCalendar) {
+                int arrow = CalPrevHitAt(n, pt.x, pt.y, true) ? -1 : (CalNextHitAt(n, pt.x, pt.y, true) ? 1 : 0);
+                bool today = CalTodayHitAt(n, pt.x, pt.y, true);
+                int cell = CalDayHitAt(n, pt.x, pt.y, true);
+                if (arrow != n->hoverCalArrow || today != n->hoverCalToday || cell != n->hoverCalCell) {
+                    n->hoverCalArrow = arrow; n->hoverCalToday = today; n->hoverCalCell = cell;
+                    InvalidateRect(hwnd, NULL, FALSE);
+                }
+            } else if (n->hoverCalArrow != 0 || n->hoverCalToday || n->hoverCalCell != -1) {
+                n->hoverCalArrow = 0; n->hoverCalToday = false; n->hoverCalCell = -1;
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
         }
         if (n && !n->expanded) SetNotchExpanded(n, true);
         if (n && !n->trackingLeave) {
@@ -2513,6 +2736,7 @@ static LRESULT CALLBACK NotchWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             n->hoverTab = -1;
             n->hoverDock = -1;
             n->hoverClose = false;
+            n->hoverCalArrow = 0; n->hoverCalToday = false; n->hoverCalCell = -1;
             if (n->expanded && !n->pinned) SetNotchExpanded(n, false);
         }
         return 0;
@@ -2547,12 +2771,52 @@ static LRESULT CALLBACK NotchWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         int dockTab = DockIndexAt(n, pt.x, pt.y, false);
         if (dockTab >= 0) {
             if (dockTab != n->activeTab) {
+                // v6-fix: leaving the calendar tab resets its
+                // displayed month, so returning to it always starts
+                // at the current month (documented choice).
+                if (n->activeTab == kTabCalendar) { n->calYear = 0; n->calMonth = 0; n->calDay = 0; }
                 n->activeTab = dockTab;
                 ApplyTargetSize(n, true);
             } else {
                 InvalidateRect(hwnd, NULL, FALSE);
             }
             return 0;
+        }
+        // v6-fix calendar: prev/next month, Today, and day
+        // selection. Inserted after dock and before media/pin, so
+        // the documented order (gear, X, dock, media, pin) is
+        // unchanged for those controls; calendar clicks simply
+        // never reach the pin fallback.
+        if (EffectiveTab(n) == kTabCalendar) {
+            if (CalPrevHitAt(n, pt.x, pt.y, false) || CalNextHitAt(n, pt.x, pt.y, false)) {
+                int delta = CalPrevHitAt(n, pt.x, pt.y, false) ? -1 : 1;
+                int dy = 0, dm = 0; CalDisplayed(n, dy, dm);
+                int oldSel = CalSelectedDay(n, dy, dm);
+                int ny = dy, nm = dm + delta;
+                if (nm < 1) { nm = 12; ny--; }
+                if (nm > 12) { nm = 1; ny++; }
+                n->calYear = ny; n->calMonth = nm;
+                int maxD = DaysInMonth(ny, nm);
+                n->calDay = oldSel > maxD ? maxD : oldSel;
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 0;
+            }
+            if (CalTodayHitAt(n, pt.x, pt.y, false)) {
+                n->calYear = 0; n->calMonth = 0; n->calDay = 0;
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 0;
+            }
+            int cell = CalDayHitAt(n, pt.x, pt.y, false);
+            if (cell >= 0) {
+                RECT rc2; GetClientRect(hwnd, &rc2);
+                Layout Lc = ComputeLayout(n, rc2.right);
+                int dy = 0, dm = 0; CalDisplayed(n, dy, dm);
+                int cy2 = 0, cm2 = 0, cd2 = 0;
+                CalCellDate(Lc, dy, dm, cell, cy2, cm2, cd2);
+                n->calYear = cy2; n->calMonth = cm2; n->calDay = cd2;
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 0;
+            }
         }
         WORD vk = 0;
         if (MediaButtonHit(n, pt.x, pt.y, vk)) {
@@ -2573,9 +2837,31 @@ static LRESULT CALLBACK NotchWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         }
         return 0;
     case WM_PAINT: {
+        // v6-fix double buffering: the whole notch is painted into
+        // a memory DC and copied to the screen in one BitBlt, so
+        // the user never sees the gradient rows, cards, and text
+        // land in pieces. WM_ERASEBKGND already returns 1 and every
+        // InvalidateRect now passes FALSE, so nothing erases
+        // between frames either.
         PAINTSTRUCT ps;
         HDC hdc = BeginPaint(hwnd, &ps);
-        if (n) PaintNotch(n, hdc);
+        if (n) {
+            RECT rc; GetClientRect(hwnd, &rc);
+            if (rc.right > 0 && rc.bottom > 0) {
+                HDC mem = CreateCompatibleDC(hdc);
+                HBITMAP bmp = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
+                if (mem && bmp) {
+                    HBITMAP oldBmp = (HBITMAP)SelectObject(mem, bmp);
+                    PaintNotch(n, mem);
+                    BitBlt(hdc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
+                    SelectObject(mem, oldBmp);
+                } else {
+                    PaintNotch(n, hdc);
+                }
+                if (bmp) DeleteObject(bmp);
+                if (mem) DeleteDC(mem);
+            }
+        }
         EndPaint(hwnd, &ps);
         return 0;
     }
@@ -2621,11 +2907,11 @@ static LRESULT CALLBACK ManagerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             // existing animation path; a title-text-only change
             // keeps the same height and is just a repaint below.
             RefreshSmtc();
-            int newKey = SmtcLayoutKey();
-            if (newKey != g_smtcLayoutKey) {
-                g_smtcLayoutKey = newKey;
-                ApplySizeToAll();
-            }
+            // v6-fix: no resize here any more. The MEDIA layout
+            // always reserves title+artist rows, so a track
+            // appearing or disappearing is just a repaint (below),
+            // never a height snap.
+            g_smtcLayoutKey = SmtcLayoutKey();
             SampleStats();
             UpdateFullscreenAndVisibility();
             InvalidateAllNotches();
@@ -2705,7 +2991,7 @@ static LRESULT CALLBACK ManagerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
                         StopAnimation(an);
                         an->paintExpanded = an->expanded;
                         ApplyNotchSizeInstant(an, an->expanded);
-                        InvalidateRect(an->hwnd, NULL, TRUE);
+                        InvalidateRect(an->hwnd, NULL, FALSE);
                     }
                 }
             }

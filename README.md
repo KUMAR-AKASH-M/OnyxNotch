@@ -161,6 +161,132 @@ is shown. That was true for v2–v4 and is superseded by the v5-SMTC
 section below: with Media controls on, titles/artists are now shown
 when SMTC reports them.
 
+## What's new in v6 — Flicker, icons, and calendar fix (in place, after the v6 push)
+
+This is a fix release inside v6, not a v7. It answers the report
+"it's ui fluctuate and make icons ui and calendar ui better".
+
+### 1. What caused the fluctuation, and what changed
+
+Three causes were found in code, not in the user's machine:
+
+- **Painting went straight to the screen, in pieces.** Every
+  `WM_PAINT` drew the gradient row by row, then cards, text, and
+  icons directly into the screen DC, so a 16 ms animation frame
+  (and the 1-second tick) was visible half-drawn. Fix: `WM_PAINT`
+  now paints the whole notch into a memory DC with a compatible
+  bitmap sized to the client area, then copies it to the screen in
+  a single `BitBlt`. Nothing partial is ever shown.
+- **Erase-on-invalidate was still on in the size path.**
+  `ApplyTargetSize`, the animation finish step, and one manager
+  toggle path passed `TRUE` to `InvalidateRect`, marking the
+  window for background erase between frames. `WM_ERASEBKGND`
+  already returned 1, but the flag is now `FALSE` everywhere, so
+  no erase step runs at all.
+- **Heights snapped.** The calendar card was 4, 5, or 6 weeks tall
+  depending on the month, and the MEDIA card grew or shrank when
+  a track appeared or disappeared. Both are now fixed-height:
+  the calendar card is always 6 weeks (blank rows for short
+  months), and the MEDIA layout always reserves title + artist
+  rows whenever media is on, showing "No track" when nothing
+  plays. The manager timer therefore no longer resizes anything
+  on an SMTC change; it just repaints. Sparklines, history, and
+  network speeds were already inside fixed-height cards and are
+  unchanged in that respect.
+
+One cheap, provably safe dirty-region cut was also made: a
+collapsed notch shows only the clock (HH:MM), so the 1-second
+timer now skips repainting a collapsed notch unless the minute
+changed. Expanded notches still repaint every tick (stats,
+sparklines, SMTC, and the clock card all move per second) — into
+the double buffer, so that repaint no longer flashes. Nothing was
+skipped where content could go stale.
+
+The window region is still updated per animation frame, because
+the window itself changes size; with painting offscreen, that
+update no longer shows partial frames.
+
+### 2. Icons — redrawn GDI on one grid, not MDL2
+
+Segoe MDL2 Assets was considered and deliberately NOT used: its
+glyph codepoints cannot be verified in the Linux VM, and a wrong
+or missing glyph would render as a tofu box on a user's machine.
+Hand-drawn GDI glyphs were redrawn instead, on one system: every
+glyph lives in a circle of radius 3/4 of its hit radius, strokes
+are at least 1/5 of that radius thick, and every glyph is centred
+on its hit centre. That covers the dock icons, the header gear
+(chunkier teeth: radial 0.55r, width 0.45r), the close X (stroke
+now scales with its radius instead of a fixed 2 px), and the
+media glyphs (now 70% of the button diameter, was 55%, with
+thicker bars). Hit areas are unchanged in size and still match
+the drawn glyphs exactly: gear first, then close X, then dock,
+then media buttons, then pin. Dock active is still a white
+circle with a dark glyph; inactive icons are muted and brighten
+on hover.
+
+### 3. Calendar — navigation, selection, fixed height
+
+- **Header:** month + year centred, with clickable `<` and `>`
+  arrows at the sides (hover brightens them) that move the
+  displayed month, per notch. A centred **Today** button below
+  the grid returns to the current month, as does clicking the
+  today pill when it is visible.
+- **Grid:** fixed 6 weeks, 28 px cells (was 20 px), weekday header
+  (S M T W T F S) in muted grey, larger cells with more breathing
+  room. Days of adjacent months are shown faded (muted) instead
+  of blank cells, weekend days are muted, today is a strong
+  theme-accent pill with dark text, the selected day is an
+  accent outline pill, and a hovered day gets a muted outline.
+- **Selection:** clicking any day selects it, including an
+  adjacent-month day, which also moves the display to that month.
+  The agenda side card follows the selection: it shows the
+  selected date and weekday, "Today" or "Selected day", that
+  week's days with the selected day highlighted, and an honest
+  "No events" line. No holidays or events are invented.
+- **Reset choice (documented):** leaving the calendar tab, or
+  collapsing the panel, resets the displayed month to the current
+  month and the selection to today, so returning to the calendar
+  always starts at today. The selection is not saved to
+  settings.ini.
+
+### 4. What did not change
+
+Themes, tabs/dock order and visibility, the Home grid, the
+System/Clock/Media cards, the tray/gear menus, saved settings,
+auto-start, the SMTC fallback, and `build.bat` (goto labels, zero
+parenthesis characters, C++17, `/EHsc`, coroutine silence macro)
+are all unchanged. Only `main.cpp` and this README changed in
+this fix.
+
+### 5. Build
+
+Unchanged from v6: from a Visual Studio Developer Command Prompt,
+in this folder, run `build.bat` (MSVC only; MinGW cannot build
+the WinRT part). It links `windowsapp.lib`, `advapi32.lib`,
+`iphlpapi.lib`, and `winmm.lib`.
+
+### Honest limits — v6-fix (not verified on Windows)
+
+- **Not compiled on Windows.** This Linux VM has no Windows
+  toolchain, so `cl`/`rc` were never run on the fixed code.
+  Static checks passed (braces, parentheses, and brackets all
+  balance; no `InvalidateRect` with `TRUE` remains; `build.bat`
+  still has zero parenthesis characters), but a compile error is
+  still possible until the first Windows build.
+- **Whether the flicker is actually gone on a real display is
+  untested.** Double buffering plus no-erase should remove the
+  visible flashing, but animation-frame tearing, region-update
+  interaction, and high-DPI behaviour have not been observed.
+  If any flicker remains, the Animations tray tick is still the
+  instant fallback (it stops the animation path entirely).
+- **Icon legibility and calendar clicks are untested on screen:**
+  the thicker glyphs, the 28 px calendar cells, and the arrow /
+  Today / day hit areas have not been clicked through on a real
+  display, and the world-clock, network, and volume readings are
+  unchanged from v6 in that respect.
+- **Heights are arithmetic, not measurements**, and under-10 MB
+  idle remains a target, not a measurement.
+
 ## What it does (v1, unchanged)
 
 - Black notch, top-centre of the screen, always on top.
