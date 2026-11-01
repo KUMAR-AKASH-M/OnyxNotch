@@ -585,19 +585,70 @@ static void PaintNotch(Notch* n, HDC hdc)
     if (g_mediaEnabled) {
         DrawCenteredText(hdc, n->hFontSmall, L"Media controls (media keys)",
                          0, L.mediaLabelY, rc.right, Scale(20, dpi), RGB(170, 170, 170));
-        // Buttons: dark-grey boxes with white labels. The hit test in
-        // MediaButtonHit uses exactly these rects.
+        // Buttons: rounded dark-grey boxes with white vector glyphs
+        // (no text labels, no font dependence, no image files).
+        // The hit test in MediaButtonHit uses exactly these rects,
+        // so only the drawing changes here, not the clickable area.
         HBRUSH btnBrush = CreateSolidBrush(RGB(38, 38, 38));
-        const wchar_t* labels[3] = { L"Prev", L"Play / Pause", L"Next" };
+        HBRUSH glyphBrush = CreateSolidBrush(RGB(255, 255, 255));
+        HPEN nullPen = (HPEN)GetStockObject(NULL_PEN);
+        HPEN oldPen = (HPEN)SelectObject(hdc, nullPen);
+        HBRUSH oldBrush = (HBRUSH)SelectObject(hdc, btnBrush);
         RECT btns[3] = { L.btnPrev, L.btnPlay, L.btnNext };
         for (int i = 0; i < 3; i++) {
-            FillRect(hdc, &btns[i], btnBrush);
-            DrawCenteredText(hdc, n->hFontTiny, labels[i],
-                             btns[i].left, btns[i].top,
-                             btns[i].right - btns[i].left, btns[i].bottom - btns[i].top,
-                             RGB(255, 255, 255));
+            RoundRect(hdc, btns[i].left, btns[i].top, btns[i].right, btns[i].bottom, 8, 8);
         }
+        SelectObject(hdc, glyphBrush);
+        for (int i = 0; i < 3; i++) {
+            int cx = (btns[i].left + btns[i].right) / 2;
+            int cy = (btns[i].top + btns[i].bottom) / 2;
+            int h = (btns[i].bottom - btns[i].top) * 11 / 20; // glyph height
+            int half = h / 2;
+            if (i == 0 || i == 2) {
+                // Prev: bar + two triangles pointing left.
+                // Next: two triangles pointing right + bar (mirrored).
+                int dir = (i == 0) ? -1 : 1;
+                int barW = h / 6; if (barW < 2) barW = 2;
+                int triW = h / 2;
+                int gap = 1;
+                int totalW = barW + gap + 2 * triW + gap;
+                int x0 = cx - totalW / 2;
+                RECT bar = { 0, 0, 0, 0 };
+                if (dir < 0) {
+                    bar = { x0, cy - half, x0 + barW, cy + half };
+                    POINT t1[3] = { { x0 + barW + gap + triW, cy - half }, { x0 + barW + gap + triW, cy + half }, { x0 + barW + gap, cy } };
+                    POINT t2[3] = { { x0 + barW + gap + 2 * triW + gap, cy - half }, { x0 + barW + gap + 2 * triW + gap, cy + half }, { x0 + barW + gap + triW + gap, cy } };
+                    FillRect(hdc, &bar, glyphBrush);
+                    Polygon(hdc, t1, 3);
+                    Polygon(hdc, t2, 3);
+                } else {
+                    POINT t1[3] = { { x0, cy - half }, { x0, cy + half }, { x0 + triW, cy } };
+                    POINT t2[3] = { { x0 + triW + gap, cy - half }, { x0 + triW + gap, cy + half }, { x0 + 2 * triW + gap, cy } };
+                    bar = { x0 + 2 * triW + 2 * gap, cy - half, x0 + 2 * triW + 2 * gap + barW, cy + half };
+                    Polygon(hdc, t1, 3);
+                    Polygon(hdc, t2, 3);
+                    FillRect(hdc, &bar, glyphBrush);
+                }
+            } else {
+                // Play/Pause: a play triangle on the left, pause bars
+                // on the right, so one button reads as the toggle.
+                int triW = h / 2;
+                int barW = h / 6; if (barW < 2) barW = 2;
+                int gap = h / 8; if (gap < 2) gap = 2;
+                int totalW = triW + gap + 2 * barW + gap;
+                int x0 = cx - totalW / 2;
+                POINT tri[3] = { { x0, cy - half }, { x0, cy + half }, { x0 + triW, cy } };
+                Polygon(hdc, tri, 3);
+                RECT b1 = { x0 + triW + gap, cy - half, x0 + triW + gap + barW, cy + half };
+                RECT b2 = { x0 + triW + gap + barW + gap, cy - half, x0 + triW + gap + 2 * barW + gap, cy + half };
+                FillRect(hdc, &b1, glyphBrush);
+                FillRect(hdc, &b2, glyphBrush);
+            }
+        }
+        SelectObject(hdc, oldPen);
+        SelectObject(hdc, oldBrush);
         DeleteObject(btnBrush);
+        DeleteObject(glyphBrush);
     }
 
     if (g_widgetStats) {
