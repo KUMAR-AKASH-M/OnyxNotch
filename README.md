@@ -1,3 +1,152 @@
+# OnyxNotch v6 — Card + dock dashboard look, existing data only
+
+Mac-style notch for Windows, in native C++ Win32. One source file, one
+`.exe`, no Electron, no Python, no .NET runtime.
+
+**Scope of this folder:** v6 is a visual redesign to the reference
+dashboard look the user chose: a wide expanded panel with a header
+bar, a card grid, and a bottom icon dock. It uses only data already
+available locally. Everything from v5 (SMTC titles, saved settings,
+auto-start, themes, animations, tabs) is otherwise unchanged in
+behaviour, except that text tabs are replaced by the dock and the
+old clock/date/battery header block is replaced by the header bar
+plus cards.
+
+## What's new in v6
+
+### 1. Wide expanded panel — about 840 px at 96 DPI
+The expanded panel is about 840 px wide at 96 DPI, DPI-scaled, and
+clamped to the monitor work width minus margins so it never
+overflows a narrow monitor. The collapsed notch is unchanged: a
+clock pill only. Height is computed from the card layout per tab
+and animates through the existing 220 ms animation path. The Size
+menu still controls only the collapsed width, as before.
+
+### 2. Header bar
+The top of the expanded view is now a header bar, not the old big
+clock/date/battery block. Left: the tab title (Home, System, Clock,
+Calendar, Media) with a subtitle under it — Home shows the current
+date, System shows "Power · Network · Audio", Clock shows
+"Local Time & Date", Calendar shows the current month and year,
+Media shows the SMTC artist or "Media controls". Right: battery %
+with the existing battery glyph, the settings gear, and a close X.
+The close X collapses the panel back to the clock pill only; it
+does NOT quit the app. Quit stays in the tray menu only. The big
+clock, date, and battery content now lives in cards below, not
+duplicated in the header.
+
+### 3. Bottom icon dock — replaces the text tab bar
+A centred pill-shaped dock at the bottom of the expanded view, with
+plain-GDI icon glyphs (no image or font glyphs) in this order:
+Home, System, Media, Clock, Calendar. Home and Clock are always
+present; System appears only if the stats widget is on, Media only
+if media controls are on, Calendar only if the calendar widget is
+on. The active icon is a white circle with a dark glyph; inactive
+icons are muted grey and brighten on hover. Clicking a dock icon
+switches tabs exactly as the old text tabs did. Hit order is gear
+first, then close X, then dock, then media buttons, then pin, so a
+dock click never pins and never fires a media key. Tab selection
+still resets to HOME on collapse and falls back to HOME if a
+feature is toggled off.
+
+### 4. Cards
+Every body section is now a dark rounded-rectangle card, slightly
+lighter than the panel background, with a small uppercase muted-grey
+label, a big near-white number, and a muted secondary line — the
+reference's visual language. Card colours come from the current
+theme, so the accent is the theme accent (Onyx near-white, Midnight
+blue, Graphite light grey), not always blue. All cards are drawn in
+plain GDI only.
+
+### 5. HOME tab — 3-column card grid, summaries only
+Home is a 3-column grid (2 rows when everything is on) of summary
+cards, one per enabled feature, and it stays a summary — never the
+full detailed sections. Cards: System (CPU/RAM/Disk rings with %
+in the centre), Calendar (current week only, today pill), Clock
+(current time in 12-hour format + date), Media (SMTC title/artist
+or "No track" + functional mini media buttons), Battery (%,
+state, accent bar), Network (adapter name + up/down speeds).
+System, Battery, and Network cards appear only if the stats widget
+is on; the Media card only if media controls are on; Clock and
+Calendar cards follow their own availability (Clock always,
+Calendar only if the calendar widget is on). The grid reflows when
+cards are absent.
+
+### 6. Detailed tabs — existing/local data only
+- **SYSTEM:** Battery card (%, state, accent bar), Network card
+  (adapter name + up/down speeds), Performance card (CPU/RAM/Disk
+  % with small sparkline graphs from a 30-sample history buffer),
+  Volume card (system volume % with an accent slider bar).
+  The volume bar is read-only display: the notch is no-activate,
+  so it is not a draggable slider in v6.
+- **CLOCK:** a big digital clock card (12-hour time, date, Local
+  label) plus a World clocks card (Local, New York, London, Tokyo
+  with times and UTC offsets, computed from Windows timezone data).
+  A city whose timezone cannot be resolved is omitted, never shown
+  with a wrong time.
+- **CALENDAR:** a month grid card (as before, today pill) plus an
+  agenda side card (today's date, the current week's days, and an
+  honest "No events" line). No holidays or events are invented.
+- **MEDIA:** SMTC title/artist (large) + full-size media buttons,
+  as in v5.
+
+### 7. New local data and their fallbacks
+- **Disk %:** `GetDiskFreeSpaceEx` on the system drive (C:),
+  % used plus used/total GB, sampled on the existing 1-second
+  timer only while the stats widget is on.
+- **Network up/down:** local interface byte counters via
+  `GetIfTable`, rates from 1-second deltas, only while the stats
+  widget is on. If counters are unavailable, the cards show
+  "Network unavailable" rather than fake speeds.
+- **Volume %:** default playback device level via `waveOutGetVolume`
+  (plain Win32, no COM). If it cannot be read, the Volume card
+  shows "Volume unavailable" rather than a fake value.
+- **Sparklines:** at most 30 samples, sampled only while the stats
+  widget is on, so idle cost does not grow when everything is off.
+  No new timers, no polling beyond the existing 1-second timer,
+  no network calls.
+
+### 8. What was deliberately NOT added in v6
+No weather (needs network and a weather API), no notes (needs a
+local store and text input in a no-activate window), no clipboard
+history, no screen-time tracking. Those were the other cards in
+the reference screenshots and were explicitly excluded by the
+user's "existing data only" choice. Tray menu, gear menu, Themes
+submenu, saved settings, and auto-start are unchanged from v5.
+The Clock tab needs no toggle: it is always available when
+expanded.
+
+### 9. Build
+From a Visual Studio Developer Command Prompt, in this folder, run
+`build.bat`. It is MSVC only (C++17, `/EHsc`, and the coroutine
+silence macro from the v5 build fix, all preserved). New libraries
+over v5: `iphlpapi.lib` (network counters) and `winmm.lib`
+(volume). `build.bat` keeps the goto-label, zero-parenthesis
+property from the v5 build fix: there are no parenthesis
+characters anywhere in the file, so a build failure can no longer
+trigger a "was unexpected" cmd parsing error that masks the real
+error.
+
+### Honest limits — v6 additions (not verified on Windows)
+- Not compiled on Windows: this Linux VM has no Windows toolchain,
+  so `cl`/`rc` were never run on the v6 code, especially the new
+  Win32 APIs (`GetIfTable`, `waveOutGetVolume`,
+  `EnumDynamicTimeZoneInformation` /
+  `SystemTimeToTzSpecificLocalTimeEx`) and the new `iphlpapi.lib` /
+  `winmm.lib` links. A compile or link error is still possible
+  until the first Windows build.
+- Card/dock balance at 840 px, icon glyph legibility at small
+  size, ring/sparkline rendering, and the header/close-X layout
+  have not been seen on a real display and may need tuning.
+- World-clock correctness (especially daylight-saving offsets),
+  network up/down readings, and volume readings have not been
+  verified against a real machine; a city that cannot be resolved
+  is omitted by design, which may look like a missing row.
+- Sparklines, DPI behaviour, and animation interplay (height
+  changes on dock switching) are untested on screen; the
+  Animations tray tick remains the instant fallback.
+- Under-10 MB idle remains a target, not a measurement.
+
 # OnyxNotch v5 — SMTC titles + saved settings / auto-start + themes (features 1, 2 and 3 of v5)
 
 Mac-style notch for Windows, in native C++ Win32. One source file, one

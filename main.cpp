@@ -1,3 +1,9 @@
+// OnyxNotch v6 - card + dock dashboard look, existing data only.
+// Wide expanded panel: header bar, card grid, bottom icon dock.
+// No weather, no notes, no clipboard history, no screen-time
+// tracking in v6 - those were deliberately excluded by the user.
+// New local data only: Disk percent, Network up/down rates,
+// system volume percent, all sampled on the existing 1s timer.
 // OnyxNotch v5 (features 1 + 2 + 3: SMTC track titles, saved
 // settings + auto-start, themes) - Mac-style notch for Windows,
 // native Win32 C++.
@@ -177,6 +183,8 @@
 #include <cmath>
 #include <stdio.h> // v5-settings: sprintf_s in SaveSettings
 #include <string.h> // v5-settings: strlen/strcmp in LoadSettings
+#include <iphlpapi.h> // v6: GetIfTable for network rates
+#include <mmsystem.h> // v6: waveOutGetVolume for system volume
 // v5-SMTC: C++/WinRT headers for the local SMTC session manager.
 // These need the Windows SDK with C++/WinRT and /std:c++17 (see
 // build.bat). No other WinRT API is used; there is no network use.
@@ -193,6 +201,8 @@
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "windowsapp.lib")
 #pragma comment(lib, "advapi32.lib") // v5-settings: Reg* calls for auto-start
+#pragma comment(lib, "iphlpapi.lib") // v6: network counters
+#pragma comment(lib, "winmm.lib") // v6: waveOutGetVolume
 
 #define ID_TRAY_ICON            1
 #define WM_TRAY                 (WM_APP + 1)
@@ -588,6 +598,8 @@ struct Notch {
     // 2 = SYSTEM, 3 = CALENDAR) and hovered tab (-1 = none).
     int activeTab = 0;
     int hoverTab = -1;
+    int hoverDock = -1; // v6: dock tab id hovered, or -1
+    bool hoverClose = false; // v6: close X hovered
     bool animActive = false;
     ULONGLONG animStartTick = 0;
     int animFromW = 0, animFromH = 0;
@@ -615,40 +627,49 @@ static int CollapsedWidth(int dpi)
     return Scale(base, dpi);
 }
 
+// v6: expanded panel is about 840 px at 96 DPI, clamped to the
+// monitor work width minus margins so it never overflows a
+// narrow monitor. Collapsed width is unchanged.
+static int ExpandedWidth(Notch* n)
+{
+    int dpi = n->dpi;
+    int w = Scale(840, dpi);
+    int workW = n->workRect.right - n->workRect.left;
+    int maxW = workW - Scale(32, dpi);
+    if (w > maxW) w = maxW;
+    if (w < Scale(320, dpi)) w = workW > 0 ? workW : Scale(320, dpi);
+    if (w < 1) w = 1;
+    return w;
+}
+
 // ---------------------------------------------------------------------------
 // Expanded layout. One shared computation drives both painting and the
 // media-button hit test, so the clickable buttons match what is drawn.
 // ---------------------------------------------------------------------------
+// v6 tab ids: Clock is new and always available, since clock
+// data needs no toggle. Dock order is Home, System, Media,
+// Clock, Calendar.
+static const int kTabHome = 0;
+static const int kTabMedia = 1;
+static const int kTabSystem = 2;
+static const int kTabCalendar = 3;
+static const int kTabClock = 4;
+
 struct Layout {
     int totalH = 0;
+    int headerH = 0;
     int gearCX = 0, gearCY = 0, gearR = 0;
-    // v4 tabs: tab bar below the header divider. showTabs is
-    // false when no feature is enabled (header-only view).
-    bool showTabs = false;
-    int tabY = 0, tabH = 0, tabCount = 0;
-    int tabIds[4] = { 0, 0, 0, 0 };
-    RECT tabRects[4] = { { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 } };
+    int closeCX = 0, closeCY = 0, closeR = 0;
     int bodyY = 0;
-    // Detailed sections (full width on their own tab).
-    int mediaX = 0, mediaW = 0;
-    int mediaLabelY = 0;
-    // v5-SMTC: title/artist lines between the MEDIA label and the
-    // buttons. -1 = line not shown (no track, or no artist).
-    int mediaTitleY = -1, mediaArtistY = -1;
-    int mediaButtonY = 0;
-    int mediaButtonH = 0;
-    RECT btnPrev = { 0, 0, 0, 0 };
-    RECT btnPlay = { 0, 0, 0, 0 };
-    RECT btnNext = { 0, 0, 0, 0 };
-    int statsX = 0, statsW = 0;
-    int statsLabelY = 0;
-    int cpuLabelY = 0, cpuBarY = 0;
-    int ramLabelY = 0, ramBarY = 0;
-    int calendarY = 0;
-    int calendarH = 0;
-    // HOME summaries (compact, stacked).
-    // v5-SMTC: one compact title line above the HOME media buttons.
-    // -1 = not shown (no track).
+    int dockY = 0, dockH = 0, dockCount = 0;
+    int dockIds[5] = { 0, 0, 0, 0, 0 };
+    RECT dockRects[5] = { { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 } };
+    RECT dockPill = { 0, 0, 0, 0 };
+    // HOME grid cards. homeCardIds: 0 System, 1 Calendar, 2 Clock,
+    // 3 Media, 4 Battery, 5 Network.
+    int homeCardCount = 0;
+    int homeCardIds[6] = { 0, 0, 0, 0, 0, 0 };
+    RECT homeCards[6] = { { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 } };
     int homeMediaTitleY = -1;
     int homeMediaButtonY = 0, homeMediaButtonH = 0;
     RECT homeBtnPrev = { 0, 0, 0, 0 };
@@ -656,11 +677,28 @@ struct Layout {
     RECT homeBtnNext = { 0, 0, 0, 0 };
     int homeStatsY = 0;
     int homeWeekY = 0;
+    // MEDIA card.
+    RECT mediaCard = { 0, 0, 0, 0 };
+    int mediaTitleY = -1, mediaArtistY = -1;
+    int mediaButtonY = 0, mediaButtonH = 0;
+    RECT btnPrev = { 0, 0, 0, 0 };
+    RECT btnPlay = { 0, 0, 0, 0 };
+    RECT btnNext = { 0, 0, 0, 0 };
+    // SYSTEM cards: 0 Battery, 1 Network, 2 Performance, 3 Volume.
+    RECT sysCards[4] = { { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 } };
+    // CLOCK cards.
+    RECT clockCard = { 0, 0, 0, 0 };
+    RECT worldCard = { 0, 0, 0, 0 };
+    // CALENDAR cards.
+    RECT monthCard = { 0, 0, 0, 0 };
+    RECT agendaCard = { 0, 0, 0, 0 };
+    int calendarY = 0;
+    int calendarH = 0;
 };
 
 static int DaysInMonth(int year, int month)
 {
-    static const int kDays[] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    static const int kDays[] = { 31, 28, 31, 30, 31, 30, 31, 30, 31, 30, 31, 30, 31 };
     if (month == 2) {
         bool leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
         return leap ? 29 : 28;
@@ -668,157 +706,148 @@ static int DaysInMonth(int year, int month)
     return kDays[(month - 1) % 12];
 }
 
-static const int kTabHome = 0;
-static const int kTabMedia = 1;
-static const int kTabSystem = 2;
-static const int kTabCalendar = 3;
-
-// v4 tabs: the tab actually shown. A selected tab whose feature
-// was toggled off falls back to HOME, so layout, painting and
-// hit tests can never show a dead tab.
+// v6: the tab actually shown. Clock is always valid. A selected
+// tab whose feature was toggled off falls back to HOME.
 static int EffectiveTab(Notch* n)
 {
-    if (!g_mediaEnabled && !g_widgetStats && !g_widgetCalendar) return kTabHome;
     int t = n->activeTab;
     if (t == kTabMedia && !g_mediaEnabled) return kTabHome;
     if (t == kTabSystem && !g_widgetStats) return kTabHome;
     if (t == kTabCalendar && !g_widgetCalendar) return kTabHome;
+    if (t != kTabHome && t != kTabMedia && t != kTabSystem && t != kTabCalendar && t != kTabClock) return kTabHome;
     return t;
+}
+
+// v6 dock ids in dock order, given the toggles.
+static int DockIds(int* out)
+{
+    int c = 0;
+    out[c++] = kTabHome;
+    if (g_widgetStats) out[c++] = kTabSystem;
+    if (g_mediaEnabled) out[c++] = kTabMedia;
+    out[c++] = kTabClock;
+    if (g_widgetCalendar) out[c++] = kTabCalendar;
+    return c;
 }
 
 static Layout ComputeLayout(Notch* n, int clientW)
 {
     Layout L;
     int dpi = n->dpi;
-    // Header geometry is unchanged: gear in the header's
-    // top-right corner, divider at y 118, body at y 126 when
-    // there is no tab bar. With a tab bar, the body moves
-    // below it (see below).
-    L.gearR = Scale(11, dpi);
-    L.gearCX = clientW - Scale(16, dpi) - L.gearR;
-    L.gearCY = Scale(24, dpi);
-    int margin = Scale(16, dpi);
+    int margin = Scale(20, dpi);
+    int gap = Scale(12, dpi);
     int bodyW = clientW - 2 * margin;
     if (bodyW < 40) bodyW = 40;
-    bool anyFeature = g_mediaEnabled || g_widgetStats || g_widgetCalendar;
-    if (!anyFeature) {
-        L.showTabs = false;
-        L.bodyY = Scale(126, dpi);
-        L.totalH = L.bodyY + Scale(12, dpi);
-        return L;
-    }
-    // Tab bar: below the header divider (y 118), above the body.
-    // Tabs are evenly spaced across the body width, in order:
-    // HOME first, then each enabled feature.
-    L.showTabs = true;
-    L.tabY = Scale(126, dpi);
-    L.tabH = Scale(24, dpi);
-    L.bodyY = L.tabY + L.tabH + Scale(8, dpi);
-    int ids[4] = { kTabHome, kTabMedia, kTabSystem, kTabCalendar };
-    bool tabOn[4] = { true, g_mediaEnabled, g_widgetStats, g_widgetCalendar };
-    int count = 0;
-    for (int i = 0; i < 4; i++) if (tabOn[i]) count++;
-    L.tabCount = count;
-    int segW = bodyW / count;
-    int ti = 0;
-    for (int i = 0; i < 4; i++) if (tabOn[i]) {
-        L.tabIds[ti] = ids[i];
-        L.tabRects[ti] = { margin + ti * segW, L.tabY, margin + (ti + 1) * segW, L.tabY + L.tabH };
-        ti++;
-    }
+    L.headerH = Scale(56, dpi);
+    // Header right cluster: gear, then close X at the edge.
+    L.closeR = Scale(10, dpi);
+    L.closeCX = clientW - margin - L.closeR;
+    L.closeCY = L.headerH / 2;
+    L.gearR = Scale(11, dpi);
+    L.gearCX = L.closeCX - Scale(40, dpi);
+    L.gearCY = L.headerH / 2;
+    L.bodyY = L.headerH + Scale(8, dpi);
     int effTab = EffectiveTab(n);
+    int bodyH = 0;
     int btnGap = Scale(8, dpi);
     if (effTab == kTabHome) {
-        // HOME: compact summaries, stacked, each section only
-        // as tall as it needs (media buttons 20 px, stats line
-        // 20 px, week row 20 px, 8 px gaps between sections).
-        int y = L.bodyY;
-        int lastBottom = y;
-        if (g_mediaEnabled) {
-            // v5-SMTC: compact title line above the mini buttons,
-            // only when a track is known. It costs one 20 px row
-            // plus a 4 px gap; with no track the layout is exactly
-            // the v4 HOME layout.
-            if (g_smtcHasTrack) {
-                L.homeMediaTitleY = y;
-                y += Scale(20, dpi) + Scale(4, dpi);
-            }
-            L.homeMediaButtonY = y;
-            L.homeMediaButtonH = Scale(20, dpi);
-            int bw = (bodyW - 2 * btnGap) / 3;
+        int ids[6] = { 0, 1, 2, 3, 4, 5 };
+        bool on[6] = { g_widgetStats, g_widgetCalendar, true, g_mediaEnabled, g_widgetStats, g_widgetStats };
+        int count = 0;
+        for (int i = 0; i < 6; i++) if (on[i]) { L.homeCardIds[count] = ids[i]; count++; }
+        L.homeCardCount = count;
+        int cols = 3;
+        int cardW = (bodyW - (cols - 1) * gap) / cols;
+        int cardH = Scale(140, dpi);
+        int rows = (count + cols - 1) / cols;
+        for (int i = 0; i < count; i++) {
+            int col = i % cols, row = i / cols;
+            int x = margin + col * (cardW + gap);
+            int y = L.bodyY + row * (cardH + gap);
+            L.homeCards[i] = { x, y, x + cardW, y + cardH };
+        }
+        bodyH = rows * cardH + (rows > 0 ? (rows - 1) * gap : 0);
+        // Media card buttons: bottom of that card, 24 px circles.
+        for (int i = 0; i < count; i++) if (L.homeCardIds[i] == 3) {
+            RECT c = L.homeCards[i];
+            L.homeMediaButtonH = Scale(24, dpi);
+            L.homeMediaButtonY = c.bottom - Scale(12, dpi) - L.homeMediaButtonH;
+            L.homeMediaTitleY = c.top + Scale(36, dpi);
+            int innerW = (c.right - c.left) - 2 * Scale(16, dpi);
+            int bw = (innerW - 2 * btnGap) / 3;
             if (bw < 20) bw = 20;
-            L.homeBtnPrev = { margin, y, margin + bw, y + L.homeMediaButtonH };
-            L.homeBtnPlay = { margin + bw + btnGap, y, margin + 2 * bw + btnGap, y + L.homeMediaButtonH };
-            L.homeBtnNext = { margin + 2 * bw + 2 * btnGap, y, margin + 3 * bw + 2 * btnGap, y + L.homeMediaButtonH };
-            lastBottom = y + L.homeMediaButtonH;
-            y = lastBottom + Scale(8, dpi);
+            int x0 = c.left + Scale(16, dpi);
+            L.homeBtnPrev = { x0, L.homeMediaButtonY, x0 + bw, L.homeMediaButtonY + L.homeMediaButtonH };
+            L.homeBtnPlay = { x0 + bw + btnGap, L.homeMediaButtonY, x0 + 2 * bw + btnGap, L.homeMediaButtonY + L.homeMediaButtonH };
+            L.homeBtnNext = { x0 + 2 * bw + 2 * btnGap, L.homeMediaButtonY, x0 + 3 * bw + 2 * btnGap, L.homeMediaButtonY + L.homeMediaButtonH };
         }
-        if (g_widgetStats) {
-            L.homeStatsY = y;
-            lastBottom = y + Scale(20, dpi);
-            y = lastBottom + Scale(8, dpi);
+    } else if (effTab == kTabSystem) {
+        int cardW = (bodyW - gap) / 2;
+        int cardH = Scale(160, dpi);
+        for (int i = 0; i < 4; i++) {
+            int col = i % 2, row = i / 2;
+            int x = margin + col * (cardW + gap);
+            int y = L.bodyY + row * (cardH + gap);
+            L.sysCards[i] = { x, y, x + cardW, y + cardH };
         }
-        if (g_widgetCalendar) {
-            L.homeWeekY = y;
-            lastBottom = y + Scale(20, dpi);
-        }
-        L.totalH = lastBottom + Scale(12, dpi);
-        return L;
-    }
-    if (effTab == kTabMedia) {
-        // Full media section, full body width (as before the
-        // reorganization's two-column row, but behind its tab).
-        L.mediaX = margin;
-        L.mediaW = bodyW;
-        L.mediaLabelY = L.bodyY;
-        // v5-SMTC: title line, then artist line (only if an
-        // artist string exists), then the buttons. Each line is
-        // 20 px plus a 4 px gap before the buttons; with no track
-        // the buttons sit at the old v4 offset, unchanged.
+        bodyH = 2 * cardH + gap;
+    } else if (effTab == kTabClock) {
+        int clockW = bodyW * 55 / 100;
+        int worldW = bodyW - clockW - gap;
+        int cardH = Scale(190, dpi);
+        L.clockCard = { margin, L.bodyY, margin + clockW, L.bodyY + cardH };
+        L.worldCard = { margin + clockW + gap, L.bodyY, margin + clockW + gap + worldW, L.bodyY + cardH };
+        bodyH = cardH;
+    } else if (effTab == kTabMedia) {
+        L.mediaCard = { margin, L.bodyY, margin + bodyW, L.bodyY + Scale(120, dpi) };
+        int y = L.bodyY + Scale(36, dpi);
         if (g_smtcHasTrack) {
-            int y = L.bodyY + Scale(20, dpi);
-            L.mediaTitleY = y;
-            y += Scale(20, dpi);
-            if (g_smtcArtist[0] != L'\0') {
-                L.mediaArtistY = y;
-                y += Scale(20, dpi);
-            }
-            L.mediaButtonY = y + Scale(4, dpi);
-        } else {
-            L.mediaButtonY = L.bodyY + Scale(22, dpi);
+            L.mediaTitleY = y; y += Scale(22, dpi);
+            if (g_smtcArtist[0] != L'\0') { L.mediaArtistY = y; y += Scale(20, dpi); }
         }
-        L.mediaButtonH = Scale(28, dpi);
+        L.mediaButtonH = Scale(32, dpi);
+        L.mediaButtonY = y + Scale(6, dpi);
         int bw = (bodyW - 2 * btnGap) / 3;
         if (bw < 20) bw = 20;
         L.btnPrev = { margin, L.mediaButtonY, margin + bw, L.mediaButtonY + L.mediaButtonH };
         L.btnPlay = { margin + bw + btnGap, L.mediaButtonY, margin + 2 * bw + btnGap, L.mediaButtonY + L.mediaButtonH };
         L.btnNext = { margin + 2 * bw + 2 * btnGap, L.mediaButtonY, margin + 3 * bw + 2 * btnGap, L.mediaButtonY + L.mediaButtonH };
-        L.totalH = L.mediaButtonY + L.mediaButtonH + Scale(12, dpi);
-        return L;
+        bodyH = L.mediaButtonY + L.mediaButtonH + Scale(12, dpi) - L.bodyY;
+        L.mediaCard.bottom = L.mediaButtonY + L.mediaButtonH + Scale(12, dpi);
+    } else if (effTab == kTabCalendar) {
+        SYSTEMTIME st; GetLocalTime(&st);
+        int firstWeekday = (int)((st.wDayOfWeek - (st.wDay - 1) % 7) % 7);
+        if (firstWeekday < 0) firstWeekday += 7;
+        int cells = firstWeekday + DaysInMonth(st.wYear, st.wMonth);
+        int rows = (cells + 6) / 7;
+        int monthW = bodyW * 60 / 100;
+        int agendaW = bodyW - monthW - gap;
+        int monthH = Scale(36, dpi) + Scale(20, dpi) + rows * Scale(20, dpi) + Scale(16, dpi);
+        L.monthCard = { margin, L.bodyY, margin + monthW, L.bodyY + monthH };
+        L.agendaCard = { margin + monthW + gap, L.bodyY, margin + monthW + gap + agendaW, L.bodyY + monthH };
+        L.calendarY = L.bodyY;
+        L.calendarH = monthH;
+        bodyH = monthH;
     }
-    if (effTab == kTabSystem) {
-        // Full stats section, full body width: header, CPU row
-        // + bar, RAM row + bar (same geometry as the reorg).
-        L.statsX = margin;
-        L.statsW = bodyW;
-        L.statsLabelY = L.bodyY;
-        L.cpuLabelY = L.bodyY + Scale(20, dpi);
-        L.cpuBarY = L.cpuLabelY + Scale(18, dpi);
-        L.ramLabelY = L.cpuBarY + Scale(10, dpi);
-        L.ramBarY = L.ramLabelY + Scale(18, dpi);
-        L.totalH = L.ramBarY + Scale(6, dpi) + Scale(12, dpi);
-        return L;
+    // Bottom icon dock: centred pill, one icon per dock tab.
+    L.dockH = Scale(56, dpi);
+    L.dockY = L.bodyY + bodyH + Scale(8, dpi);
+    int dockIds[5];
+    int dc = DockIds(dockIds);
+    L.dockCount = dc;
+    int iconStep = Scale(48, dpi);
+    int pillW = dc * iconStep + Scale(16, dpi);
+    int pillX = (clientW - pillW) / 2;
+    if (pillX < margin) pillX = margin;
+    L.dockPill = { pillX, L.dockY, pillX + pillW, L.dockY + L.dockH };
+    for (int i = 0; i < dc; i++) {
+        L.dockIds[i] = dockIds[i];
+        int cx = pillX + Scale(8, dpi) + i * iconStep + iconStep / 2;
+        int cy = L.dockY + L.dockH / 2;
+        int r = Scale(20, dpi);
+        L.dockRects[i] = { cx - r, cy - r, cx + r, cy + r };
     }
-    // Full calendar section, full body width: month header +
-    // weekday row + all weeks (same geometry as the reorg).
-    SYSTEMTIME st; GetLocalTime(&st);
-    int firstWeekday = (int)((st.wDayOfWeek - (st.wDay - 1) % 7) % 7);
-    if (firstWeekday < 0) firstWeekday += 7;
-    int cells = firstWeekday + DaysInMonth(st.wYear, st.wMonth);
-    int rows = (cells + 6) / 7;
-    L.calendarY = L.bodyY;
-    L.calendarH = Scale(24 + 20 + rows * 20, dpi);
-    L.totalH = L.calendarY + L.calendarH + Scale(12, dpi);
+    L.totalH = L.dockY + L.dockH + Scale(12, dpi);
     return L;
 }
 
@@ -837,7 +866,7 @@ static void ApplyNotchSizeInstant(Notch* n, bool expanded)
 {
     if (!n || !n->hwnd) return;
     int dpi = n->dpi;
-    int w = expanded ? Scale(340, dpi) : CollapsedWidth(dpi);
+    int w = expanded ? ExpandedWidth(n) : CollapsedWidth(dpi);
     int h;
     if (expanded) {
         Layout L = ComputeLayout(n, w);
@@ -862,7 +891,7 @@ static const int kAnimIntervalMs = 16;
 static void TargetSizeFor(Notch* n, bool expanded, int& outW, int& outH)
 {
     int dpi = n->dpi;
-    outW = expanded ? Scale(340, dpi) : CollapsedWidth(dpi);
+    outW = expanded ? ExpandedWidth(n) : CollapsedWidth(dpi);
     if (expanded) {
         Layout L = ComputeLayout(n, outW);
         outH = L.totalH;
@@ -1305,6 +1334,135 @@ static void SampleStats()
         g_memUsedGB = (double)(ms.ullTotalPhys - ms.ullAvailPhys) / (1024.0 * 1024.0 * 1024.0);
         g_memTotalGB = (double)ms.ullTotalPhys / (1024.0 * 1024.0 * 1024.0);
     }
+    SampleDiskNetVolume();
+}
+
+// ---------------------------------------------------------------------------
+// v6 local data: Disk, Network, Volume, sparkline histories.
+// All sampled on the existing 1-second timer and only while the
+// stats widget is on, exactly like CPU/RAM sampling above, so
+// idle cost does not grow when everything is off. No network
+// calls: network rates come from local interface byte counters.
+// ---------------------------------------------------------------------------
+static int g_diskPercent = 0;
+static double g_diskUsedGB = 0.0, g_diskTotalGB = 0.0;
+static bool g_netOk = false;
+static wchar_t g_netName[64] = { 0 };
+static unsigned long long g_netDownBps = 0, g_netUpBps = 0;
+static bool g_havePrevNet = false;
+static unsigned long long g_prevNetIn = 0, g_prevNetOut = 0;
+static bool g_volOk = false;
+static int g_volPercent = 0;
+static int g_cpuHist[30] = { 0 }, g_ramHist[30] = { 0 }, g_diskHist[30] = { 0 };
+static int g_histCount = 0;
+
+static void PushHist(int* hist, int v)
+{
+    if (g_histCount < 30) { hist[g_histCount] = v; }
+    else {
+        for (int i = 1; i < 30; i++) hist[i - 1] = hist[i];
+        hist[29] = v;
+    }
+}
+
+static void SampleDiskNetVolume()
+{
+    if (!g_widgetStats) return;
+    ULARGE_INTEGER freeB = { 0 }, totalB = { 0 }, freeC = { 0 };
+    if (GetDiskFreeSpaceExW(L"C:\\", &freeC, &totalB, &freeB) && totalB.QuadPart > 0) {
+        g_diskTotalGB = (double)totalB.QuadPart / (1024.0 * 1024.0 * 1024.0);
+        g_diskUsedGB = (double)(totalB.QuadPart - freeB.QuadPart) / (1024.0 * 1024.0 * 1024.0);
+        g_diskPercent = (int)(100.0 * (double)(totalB.QuadPart - freeB.QuadPart) / (double)totalB.QuadPart + 0.5);
+        if (g_diskPercent < 0) g_diskPercent = 0;
+        if (g_diskPercent > 100) g_diskPercent = 100;
+    }
+    // Network: sum byte counters over operational, non-loopback
+    // interfaces. Rates are deltas over the 1-second timer tick.
+    {
+        DWORD tableSize = 0;
+        GetIfTable(NULL, &tableSize, TRUE);
+        MIB_IFTABLE* table = (MIB_IFTABLE*)malloc(tableSize > 0 ? tableSize : 1);
+        g_netOk = false;
+        if (table && GetIfTable(table, &tableSize, TRUE) == NO_ERROR) {
+            unsigned long long inTotal = 0, outTotal = 0;
+            for (DWORD i = 0; i < table->dwNumEntries; i++) {
+                MIB_IFROW& row = table->table[i];
+                if (row.dwOperStatus != IF_OPER_STATUS_OPERATIONAL) continue;
+                if (row.dwType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
+                inTotal += row.dwInOctets;
+                outTotal += row.dwOutOctets;
+                if (!g_netOk && row.bDescrLength > 0) {
+                    char desc[256] = { 0 };
+                    DWORD dl = row.bDescrLength < 255 ? row.bDescrLength : 255;
+                    for (DWORD k = 0; k < dl; k++) desc[k] = (char)row.bDescr[k];
+                    MultiByteToWideChar(CP_ACP, 0, desc, -1, g_netName, 64);
+                    g_netOk = true;
+                }
+            }
+            if (g_havePrevNet) {
+                g_netDownBps = (inTotal >= g_prevNetIn) ? (inTotal - g_prevNetIn) : 0;
+                g_netUpBps = (outTotal >= g_prevNetOut) ? (outTotal - g_prevNetOut) : 0;
+            }
+            g_prevNetIn = inTotal; g_prevNetOut = outTotal; g_havePrevNet = true;
+        }
+        if (table) free(table);
+    }
+    // Volume: default playback device level via waveOut, which is
+    // plain Win32 and needs no COM. If it fails, the card shows
+    // "Volume unavailable" instead of a fake value.
+    {
+        DWORD vol = 0;
+        if (waveOutGetVolume((HWAVEOUT)(UINT_PTR)WAVE_MAPPER, &vol) == MMSYSERR_NOERROR) {
+            int left = (int)(vol & 0xFFFF), right = (int)((vol >> 16) & 0xFFFF);
+            g_volPercent = ((left + right) / 2) * 100 / 65535;
+            g_volOk = true;
+        } else {
+            g_volOk = false;
+        }
+    }
+    if (g_histCount < 30) g_histCount++;
+    PushHist(g_cpuHist, g_cpuPercent);
+    PushHist(g_ramHist, g_memPercent);
+    PushHist(g_diskHist, g_diskPercent);
+}
+
+// v6 world clocks: resolve a Windows timezone key, convert UTC
+// now into it, and return the offset from UTC in minutes. If the
+// key cannot be found, returns false and the city is omitted.
+static bool GetCityTime(const wchar_t* tzKey, SYSTEMTIME* out, int* offsetMin)
+{
+    SYSTEMTIME utc; GetSystemTime(&utc);
+    for (DWORD i = 0; i < 300; i++) {
+        DYNAMIC_TIME_ZONE_INFORMATION dtzi = { 0 };
+        if (EnumDynamicTimeZoneInformation(i, &dtzi) != ERROR_SUCCESS) break;
+        if (wcscmp(dtzi.TimeZoneKeyName, tzKey) != 0) continue;
+        SYSTEMTIME local;
+        if (!SystemTimeToTzSpecificLocalTimeEx(&dtzi, &utc, &local)) return false;
+        FILETIME fu, fl;
+        if (!SystemTimeToFileTime(&utc, &fu)) return false;
+        if (!SystemTimeToFileTime(&local, &fl)) return false;
+        ULARGE_INTEGER u, l;
+        u.LowPart = fu.dwLowDateTime; u.HighPart = fu.dwHighDateTime;
+        l.LowPart = fl.dwLowDateTime; l.HighPart = fl.dwHighDateTime;
+        *offsetMin = (int)(((long long)l.QuadPart - (long long)u.QuadPart) / 600000000LL);
+        *out = local;
+        return true;
+    }
+    return false;
+}
+
+static void FormatTime12(const SYSTEMTIME& st, wchar_t* out, size_t count)
+{
+    int h = st.wHour % 12;
+    if (h == 0) h = 12;
+    swprintf(out, count, L"%d:%02d %s", h, st.wMinute, st.wHour < 12 ? L"AM" : L"PM");
+}
+
+static void FormatOffset(int offsetMin, wchar_t* out, size_t count)
+{
+    int sign = offsetMin < 0 ? -1 : 1;
+    int a = offsetMin < 0 ? -offsetMin : offsetMin;
+    swprintf(out, count, L"UTC%c%02d:%02d", sign < 0 ? L'-' : L'+', a / 60, a % 60);
 }
 
 // ---------------------------------------------------------------------------
@@ -1528,22 +1686,31 @@ static bool MediaButtonHit(Notch* n, int px, int py, WORD& vkOut)
     return true;
 }
 
-// v4 tabs: tab hit test. Returns the tab id (0 = HOME, 1 =
-// MEDIA, 2 = SYSTEM, 3 = CALENDAR) or -1. Same paint-vs-click
-// split as the media buttons and the gear: hover may use what
-// is drawn, a click only counts while truly expanded.
-static int TabIndexAt(Notch* n, int px, int py, bool usePaint)
+// v6: dock hit test. Returns the tab id or -1. Same
+// paint-vs-click split as media buttons and gear.
+static int DockIndexAt(Notch* n, int px, int py, bool usePaint)
 {
     if (usePaint ? !n->paintExpanded : !n->expanded) return -1;
     RECT rc; GetClientRect(n->hwnd, &rc);
     Layout L = ComputeLayout(n, rc.right);
-    if (!L.showTabs) return -1;
-    if (py < L.tabY || py >= L.tabY + L.tabH) return -1;
-    for (int i = 0; i < L.tabCount; i++) {
-        RECT tr = L.tabRects[i];
-        if (px >= tr.left && px < tr.right) return L.tabIds[i];
+    for (int i = 0; i < L.dockCount; i++) {
+        RECT dr = L.dockRects[i];
+        int cx = (dr.left + dr.right) / 2, cy = (dr.top + dr.bottom) / 2, r = (dr.right - dr.left) / 2 + 2;
+        int dx = px - cx, dy = py - cy;
+        if (dx * dx + dy * dy <= r * r) return L.dockIds[i];
     }
     return -1;
+}
+
+// v6: close X hit test (header right, next to the gear).
+static bool CloseHitAt(Notch* n, int px, int py, bool usePaint)
+{
+    if (usePaint ? !n->paintExpanded : !n->expanded) return false;
+    RECT rc; GetClientRect(n->hwnd, &rc);
+    Layout L = ComputeLayout(n, rc.right);
+    int dx = px - L.closeCX, dy = py - L.closeCY;
+    int r = L.closeR + 4;
+    return dx * dx + dy * dy <= r * r;
 }
 
 // v4 reorg: settings-gear hit test. Same paint-vs-click split as
@@ -1784,310 +1951,480 @@ static void DrawBatteryGlyph(HDC hdc, int x, int y, int w, int h, int pct, bool 
     }
 }
 
+// ---------------------------------------------------------------------------
+// v6 card / ring / sparkline / dock-glyph painting helpers.
+// All colours come from the current theme. Card background is
+// the theme gradient top lightened slightly, so cards read as
+// raised panels on the darker panel gradient, in every theme.
+// ---------------------------------------------------------------------------
+static COLORREF CardColor()
+{
+    const Theme& th = CurrentTheme();
+    int r = GetRValue(th.gradTop) + 14; if (r > 255) r = 255;
+    int g = GetGValue(th.gradTop) + 14; if (g > 255) g = 255;
+    int b = GetBValue(th.gradTop) + 14; if (b > 255) b = 255;
+    return RGB(r, g, b);
+}
+
+static void DrawCard(HDC hdc, const RECT& rc, const wchar_t* label, HFONT fontTiny)
+{
+    HPEN nullPen = (HPEN)GetStockObject(NULL_PEN);
+    HPEN oldPen = (HPEN)SelectObject(hdc, nullPen);
+    HBRUSH brush = CreateSolidBrush(CardColor());
+    HBRUSH oldBrush = (HBRUSH)SelectObject(hdc, brush);
+    RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, 18, 18);
+    SelectObject(hdc, oldPen);
+    SelectObject(hdc, oldBrush);
+    DeleteObject(brush);
+    if (label) DrawLeftText(hdc, fontTiny, label, rc.left + 14, rc.top + 10, rc.right - rc.left - 28, 16, CurrentTheme().muted);
+}
+
+static void DrawRing(HDC hdc, int cx, int cy, int r, int pct, int dpi)
+{
+    const Theme& th = CurrentTheme();
+    HPEN trackPen = CreatePen(PS_SOLID, Scale(6, dpi), th.divider);
+    HPEN oldPen = (HPEN)SelectObject(hdc, trackPen);
+    HBRUSH nullBrush = (HBRUSH)GetStockObject(NULL_BRUSH);
+    HBRUSH oldBrush = (HBRUSH)SelectObject(hdc, nullBrush);
+    Ellipse(hdc, cx - r, cy - r, cx + r, cy + r);
+    DeleteObject(trackPen);
+    if (pct > 0) {
+        HPEN fillPen = CreatePen(PS_SOLID, Scale(6, dpi), th.accent);
+        SelectObject(hdc, fillPen);
+        const double kPi = 3.141592653589793;
+        double endA = -kPi / 2.0 + (double)pct * 2.0 * kPi / 100.0;
+        int x1 = (int)(cx + r * cos(-kPi / 2.0) + 0.5);
+        int y1 = (int)(cy + r * sin(-kPi / 2.0) + 0.5);
+        int x2 = (int)(cx + r * cos(endA) + 0.5);
+        int y2 = (int)(cy + r * sin(endA) + 0.5);
+        Arc(hdc, cx - r, cy - r, cx + r, cy + r, x1, y1, x2, y2);
+        DeleteObject(fillPen);
+    }
+    SelectObject(hdc, oldPen);
+    SelectObject(hdc, oldBrush);
+}
+
+static void DrawSparkline(HDC hdc, const RECT& rc, const int* hist, int count, COLORREF color)
+{
+    if (count < 2) return;
+    HPEN pen = CreatePen(PS_SOLID, 1, color);
+    HPEN oldPen = (HPEN)SelectObject(hdc, pen);
+    int w = rc.right - rc.left, h = rc.bottom - rc.top;
+    for (int i = 1; i < count; i++) {
+        int x0 = rc.left + (i - 1) * w / (count - 1);
+        int x1 = rc.left + i * w / (count - 1);
+        int y0 = rc.bottom - hist[i - 1] * h / 100;
+        int y1 = rc.bottom - hist[i] * h / 100;
+        MoveToEx(hdc, x0, y0, NULL);
+        LineTo(hdc, x1, y1);
+    }
+    SelectObject(hdc, oldPen);
+    DeleteObject(pen);
+}
+
+static void DrawBar(HDC hdc, const RECT& rc, int pct)
+{
+    HBRUSH trackBrush = CreateSolidBrush(CurrentTheme().divider);
+    FillRect(hdc, &rc, trackBrush);
+    DeleteObject(trackBrush);
+    if (pct > 0) {
+        RECT fill = rc;
+        fill.right = rc.left + (rc.right - rc.left) * pct / 100;
+        if (fill.right > fill.left) {
+            HBRUSH fillBrush = CreateSolidBrush(CurrentTheme().accent);
+            FillRect(hdc, &fill, fillBrush);
+            DeleteObject(fillBrush);
+        }
+    }
+}
+
+static void DrawDockGlyph(HDC hdc, int tabId, int cx, int cy, int r, COLORREF color)
+{
+    HPEN pen = CreatePen(PS_SOLID, 1, color);
+    HPEN oldPen = (HPEN)SelectObject(hdc, pen);
+    HBRUSH brush = CreateSolidBrush(color);
+    HBRUSH oldBrush = (HBRUSH)SelectObject(hdc, brush);
+    HPEN nullPen = (HPEN)GetStockObject(NULL_PEN);
+    if (tabId == kTabHome) {
+        POINT roof[3] = { { cx, cy - r }, { cx - r, cy }, { cx + r, cy } };
+        Polygon(hdc, roof, 3);
+        RECT house = { cx - r * 2 / 3, cy, cx + r * 2 / 3, cy + r };
+        FillRect(hdc, &house, brush);
+    } else if (tabId == kTabSystem) {
+        SelectObject(hdc, nullPen);
+        DrawGear(hdc, cx, cy, r * 2 / 3, color);
+        SelectObject(hdc, pen);
+    } else if (tabId == kTabMedia) {
+        POINT tri[3] = { { cx - r / 2, cy - r * 2 / 3 }, { cx - r / 2, cy + r * 2 / 3 }, { cx + r * 2 / 3, cy } };
+        Polygon(hdc, tri, 3);
+    } else if (tabId == kTabClock) {
+        HBRUSH nullBrush = (HBRUSH)GetStockObject(NULL_BRUSH);
+        HBRUSH prevB = (HBRUSH)SelectObject(hdc, nullBrush);
+        Ellipse(hdc, cx - r * 2 / 3, cy - r * 2 / 3, cx + r * 2 / 3, cy + r * 2 / 3);
+        SelectObject(hdc, prevB);
+        MoveToEx(hdc, cx, cy, NULL); LineTo(hdc, cx, cy - r / 2);
+        MoveToEx(hdc, cx, cy, NULL); LineTo(hdc, cx + r / 3, cy);
+    } else if (tabId == kTabCalendar) {
+        RECT cal = { cx - r * 2 / 3, cy - r / 2, cx + r * 2 / 3, cy + r * 2 / 3 };
+        HBRUSH nullBrush = (HBRUSH)GetStockObject(NULL_BRUSH);
+        HBRUSH prevB = (HBRUSH)SelectObject(hdc, nullBrush);
+        RoundRect(hdc, cal.left, cal.top, cal.right, cal.bottom, 4, 4);
+        SelectObject(hdc, prevB);
+        RECT bar = { cal.left, cal.top, cal.right, cal.top + r / 3 };
+        FillRect(hdc, &bar, brush);
+    }
+    SelectObject(hdc, oldPen);
+    SelectObject(hdc, oldBrush);
+    DeleteObject(pen);
+    DeleteObject(brush);
+}
+
+static void DrawMediaButtonsRow(HDC hdc, Notch* n, const Layout& L, bool home)
+{
+    HBRUSH glyphBrush = CreateSolidBrush(CurrentTheme().glyph);
+    HPEN nullPen = (HPEN)GetStockObject(NULL_PEN);
+    HPEN oldPen = (HPEN)SelectObject(hdc, nullPen);
+    HBRUSH oldBrush = (HBRUSH)GetCurrentObject(hdc, OBJ_BRUSH);
+    for (int i = 0; i < 3; i++) {
+        int cx, cy, r;
+        if (home) HomeMediaButtonCircle(L, i, cx, cy, r);
+        else MediaButtonCircle(L, i, cx, cy, r);
+        COLORREF bg = CurrentTheme().btnBg;
+        if (i == n->pressedBtn) bg = CurrentTheme().btnPressed;
+        else if (i == n->hoverBtn) bg = CurrentTheme().btnHover;
+        HBRUSH btnBrush = CreateSolidBrush(bg);
+        HBRUSH prevBrush = (HBRUSH)SelectObject(hdc, btnBrush);
+        Ellipse(hdc, cx - r, cy - r, cx + r, cy + r);
+        SelectObject(hdc, prevBrush);
+        DeleteObject(btnBrush);
+    }
+    SelectObject(hdc, glyphBrush);
+    for (int i = 0; i < 3; i++) {
+        int cx, cy, r;
+        if (home) HomeMediaButtonCircle(L, i, cx, cy, r);
+        else MediaButtonCircle(L, i, cx, cy, r);
+        DrawMediaGlyph(hdc, i, cx, cy, r, glyphBrush, SmtcPlayPauseGlyphMode());
+    }
+    SelectObject(hdc, oldPen);
+    SelectObject(hdc, oldBrush);
+    DeleteObject(glyphBrush);
+}
+
 static void PaintNotch(Notch* n, HDC hdc)
 {
     RECT rc; GetClientRect(n->hwnd, &rc);
     PaintPremiumSurface(hdc, rc);
-
     wchar_t clockText[32]; FormatClock(clockText, 32);
     int dpi = n->dpi;
-    // v3: paint by paintExpanded, not expanded, so a collapse
-    // animation keeps drawing expanded content until it finishes
-    // instead of popping to the collapsed clock on the first frame.
+    const Theme& th = CurrentTheme();
     if (!n->paintExpanded) {
-        DrawCenteredText(hdc, n->hFontClock, clockText, 0, 0, rc.right, rc.bottom, CurrentTheme().primary);
+        DrawCenteredText(hdc, n->hFontClock, clockText, 0, 0, rc.right, rc.bottom, th.primary);
         PaintPremiumBorder(hdc, rc, dpi, n->hoverNotch);
         return;
     }
-
     Layout L = ComputeLayout(n, rc.right);
     int effTab = EffectiveTab(n);
-    DrawCenteredText(hdc, n->hFontBig, clockText, 0, Scale(12, dpi), rc.right, Scale(48, dpi), CurrentTheme().primary);
-    wchar_t dateText[64]; FormatDate(dateText, 64);
-    DrawCenteredText(hdc, n->hFontSmall, dateText, 0, Scale(64, dpi), rc.right, Scale(22, dpi), CurrentTheme().secondary);
-    // v4 battery row: drawn glyph + text, centred as a pair, so the
-    // row reads as one unit instead of text alone.
-    wchar_t batteryText[64]; FormatBattery(batteryText, 64);
+    // v6 header bar: title left, subtitle under it, battery +
+    // gear + close X right. The old big clock/date/battery block
+    // is gone: that content now lives in cards below.
+    static const wchar_t* kTabTitles[5] = { L"Home", L"Media", L"System", L"Calendar", L"Clock" };
+    wchar_t subtitle[128] = { 0 };
+    if (effTab == kTabHome) { FormatDate(subtitle, 128); }
+    else if (effTab == kTabSystem) { wcscpy_s(subtitle, 128, L"Power \x00B7 Network \x00B7 Audio"); }
+    else if (effTab == kTabClock) { wcscpy_s(subtitle, 128, L"Local Time & Date"); }
+    else if (effTab == kTabCalendar) {
+        SYSTEMTIME st; GetLocalTime(&st);
+        static const wchar_t* kMonths[] = { L"January", L"February", L"March", L"April", L"May", L"June", L"July", L"August", L"September", L"October", L"November", L"December" };
+        swprintf(subtitle, 128, L"%s %d", kMonths[(st.wMonth - 1) % 12], st.wYear);
+    } else if (effTab == kTabMedia) {
+        if (g_smtcHasTrack && g_smtcArtist[0] != L'\0') wcsncpy_s(subtitle, 128, g_smtcArtist, _TRUNCATE);
+        else wcscpy_s(subtitle, 128, L"Media controls");
+    }
+    int margin = Scale(20, dpi);
+    DrawLeftText(hdc, n->hFontSmall, kTabTitles[effTab], margin, Scale(8, dpi), rc.right / 2, Scale(24, dpi), th.primary);
+    DrawLeftText(hdc, n->hFontTiny, subtitle, margin, Scale(30, dpi), rc.right / 2, Scale(20, dpi), th.secondary);
+    // Battery % + glyph, right-aligned before the gear.
     {
-        HFONT oldF = (HFONT)SelectObject(hdc, n->hFontSmall);
-        SIZE sz = { 0, 0 };
-        GetTextExtentPoint32W(hdc, batteryText, lstrlenW(batteryText), &sz);
-        SelectObject(hdc, oldF);
-        int glyphW = Scale(24, dpi), glyphH = Scale(13, dpi), gap = Scale(8, dpi);
-        int totalW = glyphW + gap + sz.cx;
-        int startX = (rc.right - totalW) / 2;
-        if (startX < 0) startX = 0;
-        int glyphY = Scale(88, dpi) + (Scale(22, dpi) - glyphH) / 2;
         int pct = 0; bool charging = false; bool known = BatteryInfo(pct, charging);
-        DrawBatteryGlyph(hdc, startX, glyphY, glyphW, glyphH, pct, charging, known);
-        DrawCenteredText(hdc, n->hFontSmall, batteryText,
-                         startX + glyphW + gap, Scale(88, dpi), sz.cx, Scale(22, dpi),
-                         CurrentTheme().secondary);
+        wchar_t batt[32];
+        if (known) swprintf(batt, 32, L"%d%%", pct); else wcscpy_s(batt, 32, L"--");
+        HFONT oldF = (HFONT)SelectObject(hdc, n->hFontTiny);
+        SIZE sz = { 0, 0 }; GetTextExtentPoint32W(hdc, batt, lstrlenW(batt), &sz);
+        SelectObject(hdc, oldF);
+        int glyphW = Scale(24, dpi), glyphH = Scale(13, dpi), gap = Scale(6, dpi);
+        int textX = L.gearCX - L.gearR - Scale(12, dpi) - gap - glyphW - gap - sz.cx;
+        if (textX < rc.right / 2) textX = rc.right / 2;
+        DrawLeftText(hdc, n->hFontTiny, batt, textX, L.headerH / 2 - Scale(10, dpi), sz.cx, Scale(20, dpi), th.secondary);
+        DrawBatteryGlyph(hdc, textX + sz.cx + gap, L.headerH / 2 - glyphH / 2, glyphW, glyphH, pct, charging, known);
     }
-    // v4 divider: a thin line between the clock/date/battery block
-    // and whatever sections follow (media and/or widgets).
-    if (g_mediaEnabled || g_widgetStats || g_widgetCalendar) {
-        int margin = Scale(20, dpi);
-        HBRUSH divBrush = CreateSolidBrush(CurrentTheme().divider);
-        RECT div = { margin, Scale(118, dpi), rc.right - margin, Scale(119, dpi) };
-        if (div.right > div.left) FillRect(hdc, &div, divBrush);
-        DeleteObject(divBrush);
-    }
-
-    // v4 tabs: tab bar below the divider. Active tab: near-white
-    // text with a near-white underline across its segment;
-    // inactive tabs: muted grey, brighter on hover.
-    if (L.showTabs) {
-        static const wchar_t* kTabNames[4] = { L"HOME", L"MEDIA", L"SYSTEM", L"CALENDAR" };
-        for (int i = 0; i < L.tabCount; i++) {
-            int id = L.tabIds[i];
-            RECT tr = L.tabRects[i];
-            COLORREF tc = (id == effTab) ? CurrentTheme().primary
-                : (id == n->hoverTab ? CurrentTheme().tabHover : CurrentTheme().muted);
-            DrawCenteredText(hdc, n->hFontTiny, kTabNames[id],
-                             tr.left, tr.top, tr.right - tr.left, Scale(20, dpi), tc);
-            if (id == effTab) {
-                HBRUSH ulBrush = CreateSolidBrush(CurrentTheme().accent);
-                int pad = Scale(12, dpi);
-                RECT ul = { tr.left + pad, tr.top + Scale(20, dpi), tr.right - pad, tr.top + Scale(22, dpi) };
-                if (ul.right > ul.left) FillRect(hdc, &ul, ulBrush);
-                DeleteObject(ulBrush);
-            }
-        }
+    // Gear + close X in the header.
+    {
+        COLORREF gearColor = th.gear;
+        if (n->pressedGear) gearColor = th.gearPressed;
+        else if (n->hoverGear) gearColor = th.gearHover;
+        DrawGear(hdc, L.gearCX, L.gearCY, L.gearR, gearColor);
+        HPEN xPen = CreatePen(PS_SOLID, 2, n->hoverClose ? th.primary : th.secondary);
+        HPEN oldPen = (HPEN)SelectObject(hdc, xPen);
+        int r = L.closeR;
+        MoveToEx(hdc, L.closeCX - r, L.closeCY - r, NULL); LineTo(hdc, L.closeCX + r, L.closeCY + r);
+        MoveToEx(hdc, L.closeCX + r, L.closeCY - r, NULL); LineTo(hdc, L.closeCX - r, L.closeCY + r);
+        SelectObject(hdc, oldPen);
+        DeleteObject(xPen);
     }
 
-    // v4 tabs: HOME is the compact summary — smaller media
-    // buttons (still functional), one stats line, the current
-    // week only. No section headers here: each row is self
-    // evident, and headers would cost the height HOME saves.
-    if (L.showTabs && effTab == kTabHome) {
-        if (g_mediaEnabled) {
-            // v5-SMTC: compact title line above the mini buttons,
-            // left-aligned in the body, ellipsis-truncated to the
-            // body width. Only when a track is known; otherwise
-            // this row does not exist and the layout is v4.
-            if (g_smtcHasTrack && L.homeMediaTitleY >= 0) {
-                int margin = Scale(16, dpi);
-                DrawLeftEllipsisText(hdc, n->hFontTiny, g_smtcTitle,
-                                     margin, L.homeMediaTitleY,
-                                     rc.right - 2 * margin, Scale(20, dpi),
-                                     CurrentTheme().primary);
+    SYSTEMTIME now; GetLocalTime(&now);
+    if (effTab == kTabHome) {
+        for (int i = 0; i < L.homeCardCount; i++) {
+            RECT c = L.homeCards[i];
+            int id = L.homeCardIds[i];
+            if (id == 0) {
+                DrawCard(hdc, c, L"SYSTEM", n->hFontTiny);
+                int vals[3] = { g_cpuPercent, g_memPercent, g_diskPercent };
+                static const wchar_t* names[3] = { L"CPU", L"RAM", L"DISK" };
+                int r = Scale(26, dpi);
+                int totalW = 3 * (2 * r) + 2 * Scale(16, dpi);
+                int x0 = c.left + (c.right - c.left - totalW) / 2;
+                int cy = c.top + Scale(62, dpi);
+                for (int k = 0; k < 3; k++) {
+                    int cx = x0 + k * (2 * r + Scale(16, dpi)) + r;
+                    DrawRing(hdc, cx, cy, r, vals[k], dpi);
+                    wchar_t pv[16]; swprintf(pv, 16, L"%d%%", vals[k]);
+                    DrawCenteredText(hdc, n->hFontTiny, pv, cx - r, cy - Scale(10, dpi), 2 * r, Scale(20, dpi), th.primary);
+                    DrawCenteredText(hdc, n->hFontTiny, names[k], cx - r, cy + r + Scale(4, dpi), 2 * r, Scale(16, dpi), th.muted);
+                }
+            } else if (id == 1) {
+                DrawCard(hdc, c, L"CALENDAR", n->hFontTiny);
+                FILETIME ft; SystemTimeToFileTime(&now, &ft);
+                ULARGE_INTEGER base; base.LowPart = ft.dwLowDateTime; base.HighPart = ft.dwHighDateTime;
+                int cellW = (c.right - c.left - Scale(28, dpi)) / 7;
+                int cellH = Scale(20, dpi);
+                int y = c.top + Scale(56, dpi);
+                for (int cc = 0; cc < 7; cc++) {
+                    ULARGE_INTEGER v; v.QuadPart = base.QuadPart + (ULONGLONG)((LONGLONG)(cc - now.wDayOfWeek) * 864000000000LL);
+                    FILETIME cft; cft.dwLowDateTime = v.LowPart; cft.dwHighDateTime = v.HighPart;
+                    SYSTEMTIME cst; FileTimeToSystemTime(&cft, &cst);
+                    int x = c.left + Scale(14, dpi) + cc * cellW;
+                    bool isToday = (cc == now.wDayOfWeek);
+                    if (isToday) {
+                        HPEN nullP = (HPEN)GetStockObject(NULL_PEN); HPEN oldP = (HPEN)SelectObject(hdc, nullP);
+                        HBRUSH pill = CreateSolidBrush(th.accent); HBRUSH oldB = (HBRUSH)SelectObject(hdc, pill);
+                        RoundRect(hdc, x + 2, y + 1, x + cellW - 2, y + cellH - 1, cellH, cellH);
+                        SelectObject(hdc, oldP); SelectObject(hdc, oldB); DeleteObject(pill);
+                    }
+                    wchar_t dayText[8]; swprintf(dayText, 8, L"%d", cst.wDay);
+                    DrawCenteredText(hdc, n->hFontTiny, dayText, x, y, cellW, cellH, isToday ? th.pillText : th.secondary);
+                }
+                wchar_t weekLabel[64]; FormatDate(weekLabel, 64);
+                DrawCenteredText(hdc, n->hFontTiny, weekLabel, c.left + 14, c.top + Scale(84, dpi), c.right - c.left - 28, Scale(20, dpi), th.secondary);
+            } else if (id == 2) {
+                DrawCard(hdc, c, L"CLOCK", n->hFontTiny);
+                wchar_t t12[32]; FormatTime12(now, t12, 32);
+                DrawCenteredText(hdc, n->hFontBig, t12, c.left, c.top + Scale(36, dpi), c.right - c.left, Scale(48, dpi), th.primary);
+                wchar_t dt[64]; FormatDate(dt, 64);
+                DrawCenteredText(hdc, n->hFontTiny, dt, c.left + 14, c.top + Scale(92, dpi), c.right - c.left - 28, Scale(20, dpi), th.secondary);
+            } else if (id == 3) {
+                DrawCard(hdc, c, L"MEDIA", n->hFontTiny);
+                if (g_smtcHasTrack) {
+                    DrawLeftEllipsisText(hdc, n->hFontTiny, g_smtcTitle, c.left + 14, L.homeMediaTitleY, c.right - c.left - 28, Scale(20, dpi), th.primary);
+                    if (g_smtcArtist[0] != L'\0') DrawLeftEllipsisText(hdc, n->hFontTiny, g_smtcArtist, c.left + 14, L.homeMediaTitleY + Scale(20, dpi), c.right - c.left - 28, Scale(20, dpi), th.secondary);
+                } else {
+                    DrawLeftText(hdc, n->hFontTiny, L"No track", c.left + 14, L.homeMediaTitleY, c.right - c.left - 28, Scale(20, dpi), th.secondary);
+                }
+                DrawMediaButtonsRow(hdc, n, L, true);
+            } else if (id == 4) {
+                DrawCard(hdc, c, L"BATTERY", n->hFontTiny);
+                wchar_t bt[64]; FormatBattery(bt, 64);
+                int pct = 0; bool ch = false; bool known = BatteryInfo(pct, ch);
+                wchar_t big[16]; if (known) swprintf(big, 16, L"%d%%", pct); else wcscpy_s(big, 16, L"--");
+                DrawCenteredText(hdc, n->hFontBig, big, c.left, c.top + Scale(36, dpi), c.right - c.left, Scale(48, dpi), th.primary);
+                DrawCenteredText(hdc, n->hFontTiny, bt, c.left + 14, c.top + Scale(92, dpi), c.right - c.left - 28, Scale(20, dpi), th.secondary);
+                if (known) { RECT bar = { c.left + 14, c.bottom - Scale(18, dpi), c.right - 14, c.bottom - Scale(12, dpi) }; DrawBar(hdc, bar, pct); }
+            } else if (id == 5) {
+                DrawCard(hdc, c, L"NETWORK", n->hFontTiny);
+                if (g_netOk) {
+                    DrawLeftEllipsisText(hdc, n->hFontTiny, g_netName, c.left + 14, c.top + Scale(36, dpi), c.right - c.left - 28, Scale(20, dpi), th.primary);
+                    wchar_t rates[96];
+                    swprintf(rates, 96, L"\x2193 %llu B/s  \x2191 %llu B/s", g_netDownBps, g_netUpBps);
+                    DrawLeftText(hdc, n->hFontTiny, rates, c.left + 14, c.top + Scale(62, dpi), c.right - c.left - 28, Scale(20, dpi), th.secondary);
+                } else {
+                    DrawLeftText(hdc, n->hFontTiny, L"Network unavailable", c.left + 14, c.top + Scale(36, dpi), c.right - c.left - 28, Scale(20, dpi), th.secondary);
+                }
             }
-            HBRUSH glyphBrush = CreateSolidBrush(CurrentTheme().glyph);
-            HPEN nullPen = (HPEN)GetStockObject(NULL_PEN);
-            HPEN oldPen = (HPEN)SelectObject(hdc, nullPen);
-            HBRUSH oldBrush = (HBRUSH)GetCurrentObject(hdc, OBJ_BRUSH);
-            for (int i = 0; i < 3; i++) {
-                int cx, cy, r;
-                HomeMediaButtonCircle(L, i, cx, cy, r);
-                COLORREF bg = CurrentTheme().btnBg;
-                if (i == n->pressedBtn) bg = CurrentTheme().btnPressed;
-                else if (i == n->hoverBtn) bg = CurrentTheme().btnHover;
-                HBRUSH btnBrush = CreateSolidBrush(bg);
-                HBRUSH prevBrush = (HBRUSH)SelectObject(hdc, btnBrush);
-                Ellipse(hdc, cx - r, cy - r, cx + r, cy + r);
-                SelectObject(hdc, prevBrush);
-                DeleteObject(btnBrush);
-            }
-            SelectObject(hdc, glyphBrush);
-            for (int i = 0; i < 3; i++) {
-                int cx, cy, r;
-                HomeMediaButtonCircle(L, i, cx, cy, r);
-                DrawMediaGlyph(hdc, i, cx, cy, r, glyphBrush, SmtcPlayPauseGlyphMode());
-            }
-            SelectObject(hdc, oldPen);
-            SelectObject(hdc, oldBrush);
-            DeleteObject(glyphBrush);
         }
-        if (g_widgetStats) {
-            wchar_t homeStats[128];
-            swprintf(homeStats, 128, L"CPU %d%%  \x00B7  RAM %d%%", g_cpuPercent, g_memPercent);
-            DrawCenteredText(hdc, n->hFontTiny, homeStats,
-                             Scale(16, dpi), L.homeStatsY, rc.right - Scale(32, dpi), Scale(20, dpi),
-                             CurrentTheme().secondary);
+    } else if (effTab == kTabSystem) {
+        // 0 Battery, 1 Network, 2 Performance, 3 Volume.
+        DrawCard(hdc, L.sysCards[0], L"BATTERY", n->hFontTiny);
+        {
+            RECT c = L.sysCards[0];
+            int pct = 0; bool ch = false; bool known = BatteryInfo(pct, ch);
+            wchar_t big[16]; if (known) swprintf(big, 16, L"%d%%", pct); else wcscpy_s(big, 16, L"--");
+            wchar_t bt[64]; FormatBattery(bt, 64);
+            DrawLeftText(hdc, n->hFontBig, big, c.left + 14, c.top + Scale(36, dpi), c.right - c.left - 28, Scale(48, dpi), th.primary);
+            DrawLeftText(hdc, n->hFontTiny, bt, c.left + 14, c.top + Scale(92, dpi), c.right - c.left - 28, Scale(20, dpi), th.secondary);
+            if (known) { RECT bar = { c.left + 14, c.bottom - Scale(20, dpi), c.right - 14, c.bottom - Scale(12, dpi) }; DrawBar(hdc, bar, pct); }
         }
-        if (g_widgetCalendar) {
-            SYSTEMTIME st; GetLocalTime(&st);
-            // Current week, Sunday start: step today by whole
-            // days in FILETIME (100 ns units), then convert back.
-            FILETIME ft; SystemTimeToFileTime(&st, &ft);
-            ULARGE_INTEGER base; base.LowPart = ft.dwLowDateTime; base.HighPart = ft.dwHighDateTime;
-            int margin = Scale(16, dpi);
-            int cellW = (rc.right - 2 * margin) / 7;
+        DrawCard(hdc, L.sysCards[1], L"NETWORK", n->hFontTiny);
+        {
+            RECT c = L.sysCards[1];
+            if (g_netOk) {
+                DrawLeftEllipsisText(hdc, n->hFontSmall, g_netName, c.left + 14, c.top + Scale(36, dpi), c.right - c.left - 28, Scale(24, dpi), th.primary);
+                wchar_t rates[96];
+                swprintf(rates, 96, L"\x2193 %llu B/s", g_netDownBps);
+                DrawLeftText(hdc, n->hFontTiny, rates, c.left + 14, c.top + Scale(68, dpi), c.right - c.left - 28, Scale(20, dpi), th.secondary);
+                swprintf(rates, 96, L"\x2191 %llu B/s", g_netUpBps);
+                DrawLeftText(hdc, n->hFontTiny, rates, c.left + 14, c.top + Scale(92, dpi), c.right - c.left - 28, Scale(20, dpi), th.secondary);
+            } else {
+                DrawLeftText(hdc, n->hFontTiny, L"Network unavailable", c.left + 14, c.top + Scale(36, dpi), c.right - c.left - 28, Scale(20, dpi), th.secondary);
+            }
+        }
+        DrawCard(hdc, L.sysCards[2], L"PERFORMANCE", n->hFontTiny);
+        {
+            RECT c = L.sysCards[2];
+            int vals[3] = { g_cpuPercent, g_memPercent, g_diskPercent };
+            const int* hists[3] = { g_cpuHist, g_ramHist, g_diskHist };
+            static const wchar_t* names[3] = { L"CPU", L"RAM", L"DISK" };
+            for (int k = 0; k < 3; k++) {
+                int y = c.top + Scale(36, dpi) + k * Scale(38, dpi);
+                wchar_t row[48]; swprintf(row, 48, L"%s  %d%%", names[k], vals[k]);
+                DrawLeftText(hdc, n->hFontTiny, row, c.left + 14, y, Scale(90, dpi), Scale(20, dpi), th.secondary);
+                RECT sp = { c.left + Scale(110, dpi), y, c.right - 14, y + Scale(18, dpi) };
+                DrawSparkline(hdc, sp, hists[k], g_histCount, th.accent);
+            }
+        }
+        DrawCard(hdc, L.sysCards[3], L"VOLUME", n->hFontTiny);
+        {
+            RECT c = L.sysCards[3];
+            if (g_volOk) {
+                wchar_t big[16]; swprintf(big, 16, L"%d%%", g_volPercent);
+                DrawLeftText(hdc, n->hFontBig, big, c.left + 14, c.top + Scale(36, dpi), c.right - c.left - 28, Scale(48, dpi), th.primary);
+                RECT track = { c.left + 14, c.top + Scale(100, dpi), c.right - 14, c.top + Scale(108, dpi) };
+                DrawBar(hdc, track, g_volPercent);
+                int knobX = track.left + (track.right - track.left) * g_volPercent / 100;
+                int knobY = (track.top + track.bottom) / 2;
+                HPEN nullPen = (HPEN)GetStockObject(NULL_PEN); HPEN oldPen = (HPEN)SelectObject(hdc, nullPen);
+                HBRUSH kb = CreateSolidBrush(th.primary); HBRUSH oldB = (HBRUSH)SelectObject(hdc, kb);
+                int kr = Scale(8, dpi);
+                Ellipse(hdc, knobX - kr, knobY - kr, knobX + kr, knobY + kr);
+                SelectObject(hdc, oldPen); SelectObject(hdc, oldB); DeleteObject(kb);
+            } else {
+                DrawLeftText(hdc, n->hFontTiny, L"Volume unavailable", c.left + 14, c.top + Scale(36, dpi), c.right - c.left - 28, Scale(20, dpi), th.secondary);
+            }
+        }
+    } else if (effTab == kTabClock) {
+        DrawCard(hdc, L.clockCard, L"CLOCK", n->hFontTiny);
+        {
+            RECT c = L.clockCard;
+            wchar_t t12[32]; FormatTime12(now, t12, 32);
+            DrawCenteredText(hdc, n->hFontBig, t12, c.left, c.top + Scale(40, dpi), c.right - c.left, Scale(48, dpi), th.primary);
+            wchar_t dt[64]; FormatDate(dt, 64);
+            DrawCenteredText(hdc, n->hFontTiny, dt, c.left + 14, c.top + Scale(100, dpi), c.right - c.left - 28, Scale(20, dpi), th.secondary);
+            DrawCenteredText(hdc, n->hFontTiny, L"Local", c.left + 14, c.top + Scale(124, dpi), c.right - c.left - 28, Scale(20, dpi), th.muted);
+        }
+        DrawCard(hdc, L.worldCard, L"WORLD CLOCKS", n->hFontTiny);
+        {
+            RECT c = L.worldCard;
+            struct City { const wchar_t* name; const wchar_t* key; };
+            static const City cities[3] = { { L"New York", L"Eastern Standard Time" }, { L"London", L"GMT Standard Time" }, { L"Tokyo", L"Tokyo Standard Time" } };
+            int y = c.top + Scale(36, dpi);
+            wchar_t t12[32]; FormatTime12(now, t12, 32);
+            DrawLeftText(hdc, n->hFontTiny, L"Local", c.left + 14, y, Scale(120, dpi), Scale(20, dpi), th.secondary);
+            DrawLeftText(hdc, n->hFontTiny, t12, c.left + Scale(140, dpi), y, c.right - c.left - Scale(154, dpi), Scale(20, dpi), th.primary);
+            y += Scale(28, dpi);
+            for (int k = 0; k < 3; k++) {
+                SYSTEMTIME ct; int off = 0;
+                if (!GetCityTime(cities[k].key, &ct, &off)) continue;
+                wchar_t ct12[32]; FormatTime12(ct, ct12, 32);
+                wchar_t offText[32]; FormatOffset(off, offText, 32);
+                DrawLeftText(hdc, n->hFontTiny, cities[k].name, c.left + 14, y, Scale(120, dpi), Scale(20, dpi), th.secondary);
+                DrawLeftText(hdc, n->hFontTiny, ct12, c.left + Scale(140, dpi), y, Scale(110, dpi), Scale(20, dpi), th.primary);
+                DrawLeftText(hdc, n->hFontTiny, offText, c.right - Scale(90, dpi), y, Scale(76, dpi), Scale(20, dpi), th.muted);
+                y += Scale(28, dpi);
+            }
+        }
+    } else if (effTab == kTabCalendar) {
+        DrawCard(hdc, L.monthCard, L"CALENDAR", n->hFontTiny);
+        {
+            RECT c = L.monthCard;
+            static const wchar_t* kMonths[] = { L"January", L"February", L"March", L"April", L"May", L"June", L"July", L"August", L"September", L"October", L"November", L"December" };
+            wchar_t monthText[64]; swprintf(monthText, 64, L"%s %d", kMonths[(now.wMonth - 1) % 12], now.wYear);
+            DrawCenteredText(hdc, n->hFontSmall, monthText, c.left, c.top + Scale(30, dpi), c.right - c.left, Scale(24, dpi), th.primary);
+            int cellW = (c.right - c.left - Scale(28, dpi)) / 7;
             int cellH = Scale(20, dpi);
-            for (int c = 0; c < 7; c++) {
-                ULARGE_INTEGER v;
-                v.QuadPart = base.QuadPart + (ULONGLONG)((LONGLONG)(c - st.wDayOfWeek) * 864000000000LL);
+            int weekY = c.top + Scale(58, dpi);
+            static const wchar_t* kWeek[] = { L"S", L"M", L"T", L"W", L"T", L"F", L"S" };
+            for (int cc = 0; cc < 7; cc++) DrawCenteredText(hdc, n->hFontTiny, kWeek[cc], c.left + Scale(14, dpi) + cc * cellW, weekY, cellW, cellH, th.muted);
+            int firstWeekday = (int)((now.wDayOfWeek - (now.wDay - 1) % 7) % 7);
+            if (firstWeekday < 0) firstWeekday += 7;
+            int days = DaysInMonth(now.wYear, now.wMonth);
+            for (int d = 1; d <= days; d++) {
+                int idx = firstWeekday + d - 1;
+                int col = idx % 7, row = idx / 7;
+                int x = c.left + Scale(14, dpi) + col * cellW;
+                int y = weekY + cellH + row * cellH;
+                bool isToday = (d == now.wDay);
+                if (isToday) {
+                    HPEN nullP = (HPEN)GetStockObject(NULL_PEN); HPEN oldP = (HPEN)SelectObject(hdc, nullP);
+                    HBRUSH pill = CreateSolidBrush(th.accent); HBRUSH oldB = (HBRUSH)SelectObject(hdc, pill);
+                    RoundRect(hdc, x + 2, y + 1, x + cellW - 2, y + cellH - 1, cellH, cellH);
+                    SelectObject(hdc, oldP); SelectObject(hdc, oldB); DeleteObject(pill);
+                }
+                wchar_t dayText[8]; swprintf(dayText, 8, L"%d", d);
+                DrawCenteredText(hdc, n->hFontTiny, dayText, x, y, cellW, cellH, isToday ? th.pillText : th.secondary);
+            }
+        }
+        DrawCard(hdc, L.agendaCard, L"AGENDA", n->hFontTiny);
+        {
+            RECT c = L.agendaCard;
+            wchar_t dt[64]; FormatDate(dt, 64);
+            DrawLeftText(hdc, n->hFontSmall, dt, c.left + 14, c.top + Scale(30, dpi), c.right - c.left - 28, Scale(24, dpi), th.primary);
+            DrawLeftText(hdc, n->hFontTiny, L"Today", c.left + 14, c.top + Scale(58, dpi), c.right - c.left - 28, Scale(20, dpi), th.muted);
+            static const wchar_t* kDays[] = { L"Sun", L"Mon", L"Tue", L"Wed", L"Thu", L"Fri", L"Sat" };
+            FILETIME ft; SystemTimeToFileTime(&now, &ft);
+            ULARGE_INTEGER base; base.LowPart = ft.dwLowDateTime; base.HighPart = ft.dwHighDateTime;
+            int y = c.top + Scale(84, dpi);
+            for (int cc = 0; cc < 7; cc++) {
+                ULARGE_INTEGER v; v.QuadPart = base.QuadPart + (ULONGLONG)((LONGLONG)(cc - now.wDayOfWeek) * 864000000000LL);
                 FILETIME cft; cft.dwLowDateTime = v.LowPart; cft.dwHighDateTime = v.HighPart;
                 SYSTEMTIME cst; FileTimeToSystemTime(&cft, &cst);
-                int x = margin + c * cellW;
-                int y = L.homeWeekY;
-                bool isToday = (c == st.wDayOfWeek);
-                if (isToday) {
-                    HPEN nullP = (HPEN)GetStockObject(NULL_PEN);
-                    HPEN oldP = (HPEN)SelectObject(hdc, nullP);
-                    HBRUSH pill = CreateSolidBrush(CurrentTheme().accent);
-                    HBRUSH oldB = (HBRUSH)SelectObject(hdc, pill);
-                    RoundRect(hdc, x + Scale(2, dpi), y + Scale(1, dpi),
-                              x + cellW - Scale(2, dpi), y + cellH - Scale(1, dpi),
-                              cellH, cellH);
-                    SelectObject(hdc, oldP);
-                    SelectObject(hdc, oldB);
-                    DeleteObject(pill);
-                }
-                wchar_t dayText[8]; swprintf(dayText, 8, L"%d", cst.wDay);
-                DrawCenteredText(hdc, n->hFontTiny, dayText, x, y, cellW, cellH,
-                                 isToday ? CurrentTheme().pillText : CurrentTheme().secondary);
+                wchar_t row[32]; swprintf(row, 32, L"%s  %d", kDays[cst.wDayOfWeek % 7], cst.wDay);
+                DrawLeftText(hdc, n->hFontTiny, row, c.left + 14, y, c.right - c.left - 28, Scale(20, dpi), cc == now.wDayOfWeek ? th.primary : th.secondary);
+                y += Scale(20, dpi);
             }
+            DrawLeftText(hdc, n->hFontTiny, L"No events", c.left + 14, y + Scale(4, dpi), c.right - c.left - 28, Scale(20, dpi), th.muted);
         }
-    }
-
-
-    if (effTab == kTabMedia) {
-        // v4 reorg: MEDIA section header, left-aligned in its column
-        // (the "media keys" explanation lives in the README/About).
-        DrawLeftText(hdc, n->hFontTiny, L"MEDIA",
-                     L.mediaX, L.mediaLabelY, L.mediaW, Scale(16, dpi), CurrentTheme().muted);
-        // v5-SMTC: title on one line, artist on the next, both
-        // left-aligned in the media section and ellipsis-truncated
-        // to the section width. Artist line only when an artist
-        // string exists; with no track, neither line is drawn and
-        // the buttons sit at the v4 position.
+    } else if (effTab == kTabMedia) {
+        DrawCard(hdc, L.mediaCard, L"MEDIA", n->hFontTiny);
         if (g_smtcHasTrack && L.mediaTitleY >= 0) {
-            DrawLeftEllipsisText(hdc, n->hFontSmall, g_smtcTitle,
-                                 L.mediaX, L.mediaTitleY, L.mediaW, Scale(20, dpi),
-                                 CurrentTheme().primary);
-            if (g_smtcArtist[0] != L'\0' && L.mediaArtistY >= 0) {
-                DrawLeftEllipsisText(hdc, n->hFontTiny, g_smtcArtist,
-                                     L.mediaX, L.mediaArtistY, L.mediaW, Scale(20, dpi),
-                                     CurrentTheme().secondary);
-            }
+            DrawLeftEllipsisText(hdc, n->hFontSmall, g_smtcTitle, L.mediaCard.left + 14, L.mediaTitleY, L.mediaCard.right - L.mediaCard.left - 28, Scale(22, dpi), th.primary);
+            if (g_smtcArtist[0] != L'\0' && L.mediaArtistY >= 0) DrawLeftEllipsisText(hdc, n->hFontTiny, g_smtcArtist, L.mediaCard.left + 14, L.mediaArtistY, L.mediaCard.right - L.mediaCard.left - 28, Scale(20, dpi), th.secondary);
+        } else {
+            DrawLeftText(hdc, n->hFontTiny, L"No track", L.mediaCard.left + 14, L.mediaCard.top + Scale(36, dpi), L.mediaCard.right - L.mediaCard.left - 28, Scale(20, dpi), th.secondary);
         }
-        // v4 buttons: circles, not rectangles. Diameter = media-row
-        // height, centred on the old button rects, so the row stays
-        // centred and balanced. The hit test (MediaButtonIndexAt)
-        // uses these same circles, so drawing and clicking agree.
-        // Hover/pressed states are the v3 idea, restrained: a
-        // lighter circle on hover, lighter still on press.
-        HBRUSH glyphBrush = CreateSolidBrush(CurrentTheme().glyph);
-        HPEN nullPen = (HPEN)GetStockObject(NULL_PEN);
-        HPEN oldPen = (HPEN)SelectObject(hdc, nullPen);
-        HBRUSH oldBrush = (HBRUSH)GetCurrentObject(hdc, OBJ_BRUSH);
-        for (int i = 0; i < 3; i++) {
-            int cx, cy, r;
-            MediaButtonCircle(L, i, cx, cy, r);
-            COLORREF bg = CurrentTheme().btnBg;
-            if (i == n->pressedBtn) bg = CurrentTheme().btnPressed;
-            else if (i == n->hoverBtn) bg = CurrentTheme().btnHover;
-            HBRUSH btnBrush = CreateSolidBrush(bg);
-            HBRUSH prevBrush = (HBRUSH)SelectObject(hdc, btnBrush);
-            Ellipse(hdc, cx - r, cy - r, cx + r, cy + r);
-            SelectObject(hdc, prevBrush);
-            DeleteObject(btnBrush);
-        }
-        SelectObject(hdc, glyphBrush);
-        for (int i = 0; i < 3; i++) {
-            int cx, cy, r;
-            MediaButtonCircle(L, i, cx, cy, r);
-            DrawMediaGlyph(hdc, i, cx, cy, r, glyphBrush, SmtcPlayPauseGlyphMode());
-        }
-        SelectObject(hdc, oldPen);
-        SelectObject(hdc, oldBrush);
-        DeleteObject(glyphBrush);
+        DrawMediaButtonsRow(hdc, n, L, false);
     }
-
-    if (effTab == kTabSystem) {
-        // v4 reorg: SYSTEM header, then two labelled rows, each
-        // with a thin progress bar underneath (track dark, fill
-        // near-white). Same CPU/RAM values as before, just split
-        // out of the old single dense line so they scan at a glance.
-        DrawLeftText(hdc, n->hFontTiny, L"SYSTEM",
-                     L.statsX, L.statsLabelY, L.statsW, Scale(16, dpi), CurrentTheme().muted);
-        wchar_t cpuText[32];
-        swprintf(cpuText, 32, L"CPU  %d%%", g_cpuPercent);
-        DrawLeftText(hdc, n->hFontTiny, cpuText,
-                     L.statsX, L.cpuLabelY, L.statsW, Scale(18, dpi), CurrentTheme().secondary);
-        wchar_t ramText[64];
-        swprintf(ramText, 64, L"RAM  %d%%  \x00B7  %.1f/%.1f GB", g_memPercent, g_memUsedGB, g_memTotalGB);
-        DrawLeftText(hdc, n->hFontTiny, ramText,
-                     L.statsX, L.ramLabelY, L.statsW, Scale(18, dpi), CurrentTheme().secondary);
-        int barH = Scale(6, dpi);
-        HBRUSH trackBrush = CreateSolidBrush(CurrentTheme().divider);
-        HBRUSH fillBrush = CreateSolidBrush(CurrentTheme().accent);
-        RECT cpuTrack = { L.statsX, L.cpuBarY, L.statsX + L.statsW, L.cpuBarY + barH };
-        FillRect(hdc, &cpuTrack, trackBrush);
-        RECT cpuFill = { L.statsX, L.cpuBarY, L.statsX + L.statsW * g_cpuPercent / 100, L.cpuBarY + barH };
-        if (cpuFill.right > cpuFill.left) FillRect(hdc, &cpuFill, fillBrush);
-        RECT ramTrack = { L.statsX, L.ramBarY, L.statsX + L.statsW, L.ramBarY + barH };
-        FillRect(hdc, &ramTrack, trackBrush);
-        RECT ramFill = { L.statsX, L.ramBarY, L.statsX + L.statsW * g_memPercent / 100, L.ramBarY + barH };
-        if (ramFill.right > ramFill.left) FillRect(hdc, &ramFill, fillBrush);
-        DeleteObject(trackBrush);
-        DeleteObject(fillBrush);
-    }
-
-    if (effTab == kTabCalendar) {
-        SYSTEMTIME st; GetLocalTime(&st);
-        static const wchar_t* kMonths[] = { L"January", L"February", L"March", L"April", L"May", L"June",
-            L"July", L"August", L"September", L"October", L"November", L"December" };
-        wchar_t monthText[64];
-        swprintf(monthText, 64, L"%s %d", kMonths[(st.wMonth - 1) % 12], st.wYear);
-        // v4 reorg: CALENDAR header shares the month row — label on
-        // the left, month centred — so it costs no extra height.
-        DrawLeftText(hdc, n->hFontTiny, L"CALENDAR",
-                     Scale(16, dpi), L.calendarY, Scale(100, dpi), Scale(24, dpi), CurrentTheme().muted);
-        DrawCenteredText(hdc, n->hFontSmall, monthText, 0, L.calendarY, rc.right, Scale(24, dpi), CurrentTheme().primary);
-        int margin = Scale(16, dpi);
-        int cellW = (rc.right - 2 * margin) / 7;
-        int cellH = Scale(20, dpi);
-        int weekY = L.calendarY + Scale(24, dpi);
-        static const wchar_t* kWeek[] = { L"S", L"M", L"T", L"W", L"T", L"F", L"S" };
-        for (int c = 0; c < 7; c++) {
-            DrawCenteredText(hdc, n->hFontTiny, kWeek[c], margin + c * cellW, weekY, cellW, cellH, CurrentTheme().muted);
-        }
-        int firstWeekday = (int)((st.wDayOfWeek - (st.wDay - 1) % 7) % 7);
-        if (firstWeekday < 0) firstWeekday += 7;
-        int days = DaysInMonth(st.wYear, st.wMonth);
-        for (int d = 1; d <= days; d++) {
-            int idx = firstWeekday + d - 1;
-            int col = idx % 7, row = idx / 7;
-            int x = margin + col * cellW;
-            int y = weekY + cellH + row * cellH;
-            // v4 today highlight: a white pill with dark text, not
-            // a plain grey box — it reads as selected at a glance.
-            bool isToday = (d == st.wDay);
-            if (isToday) {
-                HPEN nullP = (HPEN)GetStockObject(NULL_PEN);
-                HPEN oldP = (HPEN)SelectObject(hdc, nullP);
-                HBRUSH pill = CreateSolidBrush(CurrentTheme().accent);
-                HBRUSH oldB = (HBRUSH)SelectObject(hdc, pill);
-                RoundRect(hdc, x + Scale(2, dpi), y + Scale(1, dpi),
-                          x + cellW - Scale(2, dpi), y + cellH - Scale(1, dpi),
-                          cellH, cellH);
-                SelectObject(hdc, oldP);
-                SelectObject(hdc, oldB);
-                DeleteObject(pill);
-            }
-            wchar_t dayText[8]; swprintf(dayText, 8, L"%d", d);
-            DrawCenteredText(hdc, n->hFontTiny, dayText, x, y, cellW, cellH,
-                             isToday ? CurrentTheme().pillText : CurrentTheme().secondary);
-        }
-    }
-
-    // v4 reorg: the footer ("OnyxNotch v4 | Click to pin") is gone
-    // — pinning still works by clicking the header, and the pin
-    // explanation now lives in the About box and the README.
-    // Settings gear, top-right of the header: drawn before the
-    // border so the border stroke never covers it.
+    // v6 bottom icon dock: centred pill, active icon is a white
+    // circle with a dark glyph, inactive glyphs are muted and
+    // brighten on hover. Dock clicks switch tabs only.
     {
-        COLORREF gearColor = CurrentTheme().gear;
-        if (n->pressedGear) gearColor = CurrentTheme().gearPressed;
-        else if (n->hoverGear) gearColor = CurrentTheme().gearHover;
-        DrawGear(hdc, L.gearCX, L.gearCY, L.gearR, gearColor);
+        HPEN nullPen = (HPEN)GetStockObject(NULL_PEN); HPEN oldPen = (HPEN)SelectObject(hdc, nullPen);
+        HBRUSH pillBrush = CreateSolidBrush(CardColor()); HBRUSH oldBrush = (HBRUSH)SelectObject(hdc, pillBrush);
+        RoundRect(hdc, L.dockPill.left, L.dockPill.top, L.dockPill.right, L.dockPill.bottom, 28, 28);
+        SelectObject(hdc, oldPen); SelectObject(hdc, oldBrush); DeleteObject(pillBrush);
+        for (int i = 0; i < L.dockCount; i++) {
+            RECT dr = L.dockRects[i];
+            int cx = (dr.left + dr.right) / 2, cy = (dr.top + dr.bottom) / 2, r = (dr.right - dr.left) / 2;
+            int id = L.dockIds[i];
+            if (id == effTab) {
+                HBRUSH wb = CreateSolidBrush(th.primary); HBRUSH pb = (HBRUSH)SelectObject(hdc, wb);
+                Ellipse(hdc, cx - r, cy - r, cx + r, cy + r);
+                SelectObject(hdc, pb); DeleteObject(wb);
+                DrawDockGlyph(hdc, id, cx, cy, r, th.pillText);
+            } else {
+                COLORREF gc = (id == n->hoverDock) ? th.tabHover : th.muted;
+                DrawDockGlyph(hdc, id, cx, cy, r, gc);
+            }
+        }
     }
-    // v4 border (drawn last, over the content): subtle always, a
-    // touch brighter on hover. This replaces the v3 hover-only
-    // outline; the hover state is now part of the border itself.
     PaintPremiumBorder(hdc, rc, dpi, n->hoverNotch);
 }
 
@@ -2140,9 +2477,14 @@ static LRESULT CALLBACK NotchWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                 n->hoverGear = gear;
                 InvalidateRect(hwnd, NULL, FALSE);
             }
-            int tab = TabIndexAt(n, pt.x, pt.y, true);
-            if (tab != n->hoverTab) {
-                n->hoverTab = tab;
+            int dock = DockIndexAt(n, pt.x, pt.y, true);
+            if (dock != n->hoverDock) {
+                n->hoverDock = dock;
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
+            bool close = CloseHitAt(n, pt.x, pt.y, true);
+            if (close != n->hoverClose) {
+                n->hoverClose = close;
                 InvalidateRect(hwnd, NULL, FALSE);
             }
         }
@@ -2166,6 +2508,8 @@ static LRESULT CALLBACK NotchWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             n->hoverGear = false;
             n->pressedGear = false;
             n->hoverTab = -1;
+            n->hoverDock = -1;
+            n->hoverClose = false;
             if (n->expanded && !n->pinned) SetNotchExpanded(n, false);
         }
         return 0;
@@ -2188,15 +2532,19 @@ static LRESULT CALLBACK NotchWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             InvalidateRect(hwnd, NULL, FALSE);
             return 0;
         }
-        // v4 tabs: a tab click switches the body — never pins,
+        // v6: close X collapses the panel to the clock pill.
+        // It never quits the app; Quit stays in the tray menu.
+        if (CloseHitAt(n, pt.x, pt.y, false)) {
+            n->pinned = false;
+            SetNotchExpanded(n, false);
+            return 0;
+        }
+        // v6 dock: a dock click switches the tab - never pins,
         // never fires a media key, never opens the gear menu.
-        // Height animates via the existing path (or snaps, if
-        // Animations is off); ApplyTargetSize already handles
-        // the no-change case, so re-clicking a tab is harmless.
-        int tab = TabIndexAt(n, pt.x, pt.y, false);
-        if (tab >= 0) {
-            if (tab != n->activeTab) {
-                n->activeTab = tab;
+        int dockTab = DockIndexAt(n, pt.x, pt.y, false);
+        if (dockTab >= 0) {
+            if (dockTab != n->activeTab) {
+                n->activeTab = dockTab;
                 ApplyTargetSize(n, true);
             } else {
                 InvalidateRect(hwnd, NULL, FALSE);
@@ -2371,7 +2719,7 @@ static LRESULT CALLBACK ManagerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
         case ID_TRAY_MEDIA_NEXT: SendMediaKey(VK_MEDIA_NEXT_TRACK); break;
         case ID_TRAY_ABOUT:
             MessageBoxW(hwnd,
-                L"OnyxNotch v5 (SMTC titles + saved settings + themes)\nMac-style notch for Windows.\nNative Win32 C++, no runtime, low memory.\n\nv4: premium UI — gradient surface, lighter\ntypography, circular media buttons, battery glyph,\ncalendar pill — reorganized in place: compact\ntwo-column body (media beside system stats),\nsection headers, stats rows with bars.\n\nv5-SMTC: with Media controls on, the Media tab\nshows the current track title and artist from\nWindows SMTC (read-only), and Home shows a\ncompact title line. No track, no title — the\nmedia buttons still work via media keys.\n\nv5-settings: size and toggles are saved to\n%APPDATA%\\OnyxNotch\\settings.ini and restored\nat startup. Start with Windows (tray menu) writes\nthe Run registry value for this .exe.\n\nThemes: tray menu Themes submenu — Onyx, Midnight,\nGraphite — applies instantly to all notches and is\nsaved to settings.ini as theme=onyx|midnight|graphite.\n\nClick the notch header to pin it open;\nclick again to unpin. The gear button in the\nexpanded header opens this menu from the notch.\n\nTabs: Home is a compact summary of every\ntab; Media, System and Calendar show the\nfull versions. Click a tab to switch.",
+                L"OnyxNotch v6 (card + dock dashboard)\nMac-style notch for Windows.\nNative Win32 C++, no runtime, low memory.\n\nv4: premium UI — gradient surface, lighter\ntypography, circular media buttons, battery glyph,\ncalendar pill — reorganized in place: compact\ntwo-column body (media beside system stats),\nsection headers, stats rows with bars.\n\nv5-SMTC: with Media controls on, the Media tab\nshows the current track title and artist from\nWindows SMTC (read-only), and Home shows a\ncompact title line. No track, no title — the\nmedia buttons still work via media keys.\n\nv5-settings: size and toggles are saved to\n%APPDATA%\\OnyxNotch\\settings.ini and restored\nat startup. Start with Windows (tray menu) writes\nthe Run registry value for this .exe.\n\nThemes: tray menu Themes submenu — Onyx, Midnight,\nGraphite — applies instantly to all notches and is\nsaved to settings.ini as theme=onyx|midnight|graphite.\n\nClick the notch header to pin it open;\nclick again to unpin. The gear button in the\nexpanded header opens this menu from the notch.\n\nv6: wide card dashboard with a header bar,\ncard grid and a bottom icon dock. Home is a\ncompact summary; System, Clock, Calendar\nand Media show full card versions. Click a\ndock icon to switch. Close X collapses only.",
                 L"OnyxNotch", MB_OK | MB_ICONINFORMATION);
             break;
         }
