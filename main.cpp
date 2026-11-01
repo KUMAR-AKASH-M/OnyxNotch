@@ -1311,6 +1311,20 @@ static void FormatBattery(wchar_t* out, size_t count)
     swprintf(out, count, L"Battery: %d%%  %s", (int)sps.BatteryLifePercent, state);
 }
 
+// v7 build fix: the D2D header/paint code calls BatteryInfo, which the
+// v6-to-v7 port dropped. It shares FormatBattery's power-status logic:
+// false when no battery / unknown percent, otherwise pct + charging.
+static bool BatteryInfo(int& pct, bool& charging)
+{
+    SYSTEM_POWER_STATUS sps;
+    if (!GetSystemPowerStatus(&sps) || sps.BatteryLifePercent == 255) {
+        pct = 0; charging = false; return false;
+    }
+    pct = (int)sps.BatteryLifePercent;
+    charging = (sps.ACLineStatus == 1) && ((sps.BatteryFlag & 8) != 0);
+    return true;
+}
+
 // v7: GDI text helpers are gone. DirectWrite text lives in the
 // v7 rendering section (D2DText / D2DTextEllipsis / D2DMeasure).
 
@@ -2305,7 +2319,7 @@ static void PaintSurfaceD2D(Canvas* cv, Notch* n, const RECT& rc, float panelAlp
         D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES bp = D2D1::LinearGradientBrushProperties(
             D2D1::Point2F((float)rc.left, (float)rc.top),
             D2D1::Point2F((float)rc.left, (float)rc.bottom));
-        if (SUCCEEDED(cv->rt->CreateLinearGradientBrush(&bp, stops, &gb))) {
+        if (SUCCEEDED(cv->rt->CreateLinearGradientBrush(bp, stops, &gb))) {
             cv->rt->FillRoundedRectangle(D2D1::RoundedRect(RectF(rc), 14.0f, 14.0f), gb);
             gb->Release();
             painted = true;
