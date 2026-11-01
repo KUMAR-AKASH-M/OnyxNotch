@@ -34,6 +34,18 @@
 //     Clicking it opens the existing tray menu at the gear's
 //     screen position; it is hit-tested before the pin click, so
 //     it never pins/unpins. No new settings window is built.
+// v4 tabs (in place, after the reorganization — no v5):
+//  1. Tab bar in the expanded notch: HOME, MEDIA, SYSTEM,
+//     CALENDAR (only the enabled ones, after HOME). No tab bar
+//     when nothing is enabled: the expanded view is just the
+//     header, as before.
+//  2. HOME is a compact summary of every enabled feature:
+//     smaller media buttons, one stats line, the current week
+//     only. Each other tab shows that feature's full version.
+//  3. Clicking a tab switches the body (never pins, never fires
+//     a media key, never opens the gear menu); height animates
+//     via the existing animation path. The selected tab resets
+//     to HOME on the next expand after a collapse.
 // v3 changes over v2 (v2 behaviour is otherwise intact):
 //  1. Smooth expand/collapse animation (~220 ms, ease-out cubic),
 //     driven by a short-lived per-notch timer that stops when the
@@ -173,6 +185,10 @@ struct Notch {
     // v4 reorg: settings-gear hover/pressed state (gear only).
     bool hoverGear = false;
     bool pressedGear = false;
+    // v4 tabs: per-notch selected tab (0 = HOME, 1 = MEDIA,
+    // 2 = SYSTEM, 3 = CALENDAR) and hovered tab (-1 = none).
+    int activeTab = 0;
+    int hoverTab = -1;
     bool animActive = false;
     ULONGLONG animStartTick = 0;
     int animFromW = 0, animFromH = 0;
@@ -206,12 +222,15 @@ static int CollapsedWidth(int dpi)
 // ---------------------------------------------------------------------------
 struct Layout {
     int totalH = 0;
-    // v4 reorg: gear button (header, top-right) and two-column body.
-    // mediaX/mediaW and statsX/statsW are the column rects; when
-    // only one body section is on, its column spans the full body
-    // width. Calendar stays full-width below the body row.
     int gearCX = 0, gearCY = 0, gearR = 0;
+    // v4 tabs: tab bar below the header divider. showTabs is
+    // false when no feature is enabled (header-only view).
+    bool showTabs = false;
+    int tabY = 0, tabH = 0, tabCount = 0;
+    int tabIds[4] = { 0, 0, 0, 0 };
+    RECT tabRects[4] = { { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 } };
     int bodyY = 0;
+    // Detailed sections (full width on their own tab).
     int mediaX = 0, mediaW = 0;
     int mediaLabelY = 0;
     int mediaButtonY = 0;
@@ -225,6 +244,13 @@ struct Layout {
     int ramLabelY = 0, ramBarY = 0;
     int calendarY = 0;
     int calendarH = 0;
+    // HOME summaries (compact, stacked).
+    int homeMediaButtonY = 0, homeMediaButtonH = 0;
+    RECT homeBtnPrev = { 0, 0, 0, 0 };
+    RECT homeBtnPlay = { 0, 0, 0, 0 };
+    RECT homeBtnNext = { 0, 0, 0, 0 };
+    int homeStatsY = 0;
+    int homeWeekY = 0;
 };
 
 static int DaysInMonth(int year, int month)
@@ -237,76 +263,134 @@ static int DaysInMonth(int year, int month)
     return kDays[(month - 1) % 12];
 }
 
+static const int kTabHome = 0;
+static const int kTabMedia = 1;
+static const int kTabSystem = 2;
+static const int kTabCalendar = 3;
+
+// v4 tabs: the tab actually shown. A selected tab whose feature
+// was toggled off falls back to HOME, so layout, painting and
+// hit tests can never show a dead tab.
+static int EffectiveTab(Notch* n)
+{
+    if (!g_mediaEnabled && !g_widgetStats && !g_widgetCalendar) return kTabHome;
+    int t = n->activeTab;
+    if (t == kTabMedia && !g_mediaEnabled) return kTabHome;
+    if (t == kTabSystem && !g_widgetStats) return kTabHome;
+    if (t == kTabCalendar && !g_widgetCalendar) return kTabHome;
+    return t;
+}
+
 static Layout ComputeLayout(Notch* n, int clientW)
 {
     Layout L;
     int dpi = n->dpi;
-    // v4 reorg geometry. Header (big clock, date, battery) ends at
-    // the divider (y 118); the body starts at y 126. The gear sits
-    // in the header's top-right corner, clear of the centred clock.
+    // Header geometry is unchanged: gear in the header's
+    // top-right corner, divider at y 118, body at y 126 when
+    // there is no tab bar. With a tab bar, the body moves
+    // below it (see below).
     L.gearR = Scale(11, dpi);
     L.gearCX = clientW - Scale(16, dpi) - L.gearR;
     L.gearCY = Scale(24, dpi);
-    L.bodyY = Scale(126, dpi);
-    int margin = Scale(16, dpi), colGap = Scale(12, dpi), btnGap = Scale(8, dpi);
+    int margin = Scale(16, dpi);
     int bodyW = clientW - 2 * margin;
     if (bodyW < 40) bodyW = 40;
-    int colW = (bodyW - colGap) / 2;
-    if (colW < 40) colW = 40;
-    bool twoCol = g_mediaEnabled && g_widgetStats;
-    if (g_mediaEnabled) {
+    bool anyFeature = g_mediaEnabled || g_widgetStats || g_widgetCalendar;
+    if (!anyFeature) {
+        L.showTabs = false;
+        L.bodyY = Scale(126, dpi);
+        L.totalH = L.bodyY + Scale(12, dpi);
+        return L;
+    }
+    // Tab bar: below the header divider (y 118), above the body.
+    // Tabs are evenly spaced across the body width, in order:
+    // HOME first, then each enabled feature.
+    L.showTabs = true;
+    L.tabY = Scale(126, dpi);
+    L.tabH = Scale(24, dpi);
+    L.bodyY = L.tabY + L.tabH + Scale(8, dpi);
+    int ids[4] = { kTabHome, kTabMedia, kTabSystem, kTabCalendar };
+    bool tabOn[4] = { true, g_mediaEnabled, g_widgetStats, g_widgetCalendar };
+    int count = 0;
+    for (int i = 0; i < 4; i++) if (tabOn[i]) count++;
+    L.tabCount = count;
+    int segW = bodyW / count;
+    int ti = 0;
+    for (int i = 0; i < 4; i++) if (tabOn[i]) {
+        L.tabIds[ti] = ids[i];
+        L.tabRects[ti] = { margin + ti * segW, L.tabY, margin + (ti + 1) * segW, L.tabY + L.tabH };
+        ti++;
+    }
+    int effTab = EffectiveTab(n);
+    int btnGap = Scale(8, dpi);
+    if (effTab == kTabHome) {
+        // HOME: compact summaries, stacked, each section only
+        // as tall as it needs (media buttons 20 px, stats line
+        // 20 px, week row 20 px, 8 px gaps between sections).
+        int y = L.bodyY;
+        int lastBottom = y;
+        if (g_mediaEnabled) {
+            L.homeMediaButtonY = y;
+            L.homeMediaButtonH = Scale(20, dpi);
+            int bw = (bodyW - 2 * btnGap) / 3;
+            if (bw < 20) bw = 20;
+            L.homeBtnPrev = { margin, y, margin + bw, y + L.homeMediaButtonH };
+            L.homeBtnPlay = { margin + bw + btnGap, y, margin + 2 * bw + btnGap, y + L.homeMediaButtonH };
+            L.homeBtnNext = { margin + 2 * bw + 2 * btnGap, y, margin + 3 * bw + 2 * btnGap, y + L.homeMediaButtonH };
+            lastBottom = y + L.homeMediaButtonH;
+            y = lastBottom + Scale(8, dpi);
+        }
+        if (g_widgetStats) {
+            L.homeStatsY = y;
+            lastBottom = y + Scale(20, dpi);
+            y = lastBottom + Scale(8, dpi);
+        }
+        if (g_widgetCalendar) {
+            L.homeWeekY = y;
+            lastBottom = y + Scale(20, dpi);
+        }
+        L.totalH = lastBottom + Scale(12, dpi);
+        return L;
+    }
+    if (effTab == kTabMedia) {
+        // Full media section, full body width (as before the
+        // reorganization's two-column row, but behind its tab).
         L.mediaX = margin;
-        L.mediaW = twoCol ? colW : bodyW;
-    }
-    if (g_widgetStats) {
-        L.statsX = twoCol ? margin + colW + colGap : margin;
-        L.statsW = twoCol ? colW : bodyW;
-    }
-    // Body row height: media is header (16) + gap (6) + buttons
-    // (28) = 50; stats is header (16) + gap (4) + CPU label (18)
-    // + bar (6) + gap (4) + RAM label (18) + bar (6) = 72. The row
-    // is the taller of the two, so media + stats together take
-    // 72 px of body instead of the old stacked 56 + 24 = 80 px.
-    int bodyBottom = L.bodyY;
-    if (g_mediaEnabled) {
+        L.mediaW = bodyW;
         L.mediaLabelY = L.bodyY;
         L.mediaButtonY = L.bodyY + Scale(22, dpi);
         L.mediaButtonH = Scale(28, dpi);
-        int bw = (L.mediaW - 2 * btnGap) / 3;
+        int bw = (bodyW - 2 * btnGap) / 3;
         if (bw < 20) bw = 20;
-        L.btnPrev = { L.mediaX, L.mediaButtonY, L.mediaX + bw, L.mediaButtonY + L.mediaButtonH };
-        L.btnPlay = { L.mediaX + bw + btnGap, L.mediaButtonY, L.mediaX + 2 * bw + btnGap, L.mediaButtonY + L.mediaButtonH };
-        L.btnNext = { L.mediaX + 2 * bw + 2 * btnGap, L.mediaButtonY, L.mediaX + 3 * bw + 2 * btnGap, L.mediaButtonY + L.mediaButtonH };
-        int mediaBottom = L.mediaButtonY + L.mediaButtonH;
-        if (mediaBottom > bodyBottom) bodyBottom = mediaBottom;
+        L.btnPrev = { margin, L.mediaButtonY, margin + bw, L.mediaButtonY + L.mediaButtonH };
+        L.btnPlay = { margin + bw + btnGap, L.mediaButtonY, margin + 2 * bw + btnGap, L.mediaButtonY + L.mediaButtonH };
+        L.btnNext = { margin + 2 * bw + 2 * btnGap, L.mediaButtonY, margin + 3 * bw + 2 * btnGap, L.mediaButtonY + L.mediaButtonH };
+        L.totalH = L.mediaButtonY + L.mediaButtonH + Scale(12, dpi);
+        return L;
     }
-    if (g_widgetStats) {
+    if (effTab == kTabSystem) {
+        // Full stats section, full body width: header, CPU row
+        // + bar, RAM row + bar (same geometry as the reorg).
+        L.statsX = margin;
+        L.statsW = bodyW;
         L.statsLabelY = L.bodyY;
         L.cpuLabelY = L.bodyY + Scale(20, dpi);
         L.cpuBarY = L.cpuLabelY + Scale(18, dpi);
         L.ramLabelY = L.cpuBarY + Scale(10, dpi);
         L.ramBarY = L.ramLabelY + Scale(18, dpi);
-        int statsBottom = L.ramBarY + Scale(6, dpi);
-        if (statsBottom > bodyBottom) bodyBottom = statsBottom;
+        L.totalH = L.ramBarY + Scale(6, dpi) + Scale(12, dpi);
+        return L;
     }
-    int y = bodyBottom;
-    if (g_widgetCalendar) {
-        if (g_mediaEnabled || g_widgetStats) y += Scale(10, dpi);
-        SYSTEMTIME st; GetLocalTime(&st);
-        int firstWeekday = (int)((st.wDayOfWeek - (st.wDay - 1) % 7) % 7);
-        if (firstWeekday < 0) firstWeekday += 7;
-        int cells = firstWeekday + DaysInMonth(st.wYear, st.wMonth);
-        int rows = (cells + 6) / 7;
-        L.calendarY = y;
-        // Calendar header shares the month row (CALENDAR label on
-        // the left, month centred), so no extra height is added.
-        L.calendarH = Scale(24 + 20 + rows * 20, dpi);
-        y += L.calendarH;
-    }
-    // Bottom padding only (12 px): the old footer row (20 px text
-    // + 10 px padding) is gone, which is where the remaining
-    // height saving comes from in every expanded configuration.
-    L.totalH = y + Scale(12, dpi);
+    // Full calendar section, full body width: month header +
+    // weekday row + all weeks (same geometry as the reorg).
+    SYSTEMTIME st; GetLocalTime(&st);
+    int firstWeekday = (int)((st.wDayOfWeek - (st.wDay - 1) % 7) % 7);
+    if (firstWeekday < 0) firstWeekday += 7;
+    int cells = firstWeekday + DaysInMonth(st.wYear, st.wMonth);
+    int rows = (cells + 6) / 7;
+    L.calendarY = L.bodyY;
+    L.calendarH = Scale(24 + 20 + rows * 20, dpi);
+    L.totalH = L.calendarY + L.calendarH + Scale(12, dpi);
     return L;
 }
 
@@ -444,6 +528,9 @@ static void SetNotchExpanded(Notch* n, bool expanded)
     if (n->expanded == expanded && !n->animActive) return;
     if (n->expanded == expanded && n->animActive) return;
     n->expanded = expanded;
+    // v4 tabs: expanding always starts on HOME (a collapse
+    // resets the tab on the next expand, never mid-collapse).
+    if (expanded) n->activeTab = kTabHome;
     ApplyTargetSize(n, expanded);
 }
 
@@ -805,12 +892,26 @@ static void RequestRebuild(HINSTANCE hInst)
 // the media-row height. PaintNotch and MediaButtonIndexAt both use
 // it, so a visible circle is exactly what is clickable, and the
 // invisible corners of the old rectangles are no longer clickable.
+static void MediaCircleFromRect(const RECT& btn, int buttonY, int buttonH, int& cx, int& cy, int& r)
+{
+    cx = (btn.left + btn.right) / 2;
+    cy = buttonY + buttonH / 2;
+    r = buttonH / 2;
+}
+
 static void MediaButtonCircle(const Layout& L, int idx, int& cx, int& cy, int& r)
 {
     RECT btn = (idx == 0) ? L.btnPrev : (idx == 1) ? L.btnPlay : L.btnNext;
-    cx = (btn.left + btn.right) / 2;
-    cy = L.mediaButtonY + L.mediaButtonH / 2;
-    r = L.mediaButtonH / 2;
+    MediaCircleFromRect(btn, L.mediaButtonY, L.mediaButtonH, cx, cy, r);
+}
+
+// v4 tabs: the smaller HOME media buttons use the same circle
+// test, scaled down, so a visible mini circle is exactly what
+// is clickable on the HOME tab.
+static void HomeMediaButtonCircle(const Layout& L, int idx, int& cx, int& cy, int& r)
+{
+    RECT btn = (idx == 0) ? L.homeBtnPrev : (idx == 1) ? L.homeBtnPlay : L.homeBtnNext;
+    MediaCircleFromRect(btn, L.homeMediaButtonY, L.homeMediaButtonH, cx, cy, r);
 }
 
 static int MediaButtonIndexAt(Notch* n, int px, int py, bool usePaint)
@@ -819,6 +920,18 @@ static int MediaButtonIndexAt(Notch* n, int px, int py, bool usePaint)
     if (usePaint ? !n->paintExpanded : !n->expanded) return -1;
     RECT rc; GetClientRect(n->hwnd, &rc);
     Layout L = ComputeLayout(n, rc.right);
+    int effTab = EffectiveTab(n);
+    if (effTab == kTabHome) {
+        if (py < L.homeMediaButtonY || py >= L.homeMediaButtonY + L.homeMediaButtonH) return -1;
+        for (int i = 0; i < 3; i++) {
+            int cx, cy, r;
+            HomeMediaButtonCircle(L, i, cx, cy, r);
+            int dx = px - cx, dy = py - cy;
+            if (dx * dx + dy * dy <= r * r) return i;
+        }
+        return -1;
+    }
+    if (effTab != kTabMedia) return -1;
     if (py < L.mediaButtonY || py >= L.mediaButtonY + L.mediaButtonH) return -1;
     for (int i = 0; i < 3; i++) {
         int cx, cy, r;
@@ -836,6 +949,24 @@ static bool MediaButtonHit(Notch* n, int px, int py, WORD& vkOut)
     if (idx < 0) return false;
     vkOut = kVk[idx];
     return true;
+}
+
+// v4 tabs: tab hit test. Returns the tab id (0 = HOME, 1 =
+// MEDIA, 2 = SYSTEM, 3 = CALENDAR) or -1. Same paint-vs-click
+// split as the media buttons and the gear: hover may use what
+// is drawn, a click only counts while truly expanded.
+static int TabIndexAt(Notch* n, int px, int py, bool usePaint)
+{
+    if (usePaint ? !n->paintExpanded : !n->expanded) return -1;
+    RECT rc; GetClientRect(n->hwnd, &rc);
+    Layout L = ComputeLayout(n, rc.right);
+    if (!L.showTabs) return -1;
+    if (py < L.tabY || py >= L.tabY + L.tabH) return -1;
+    for (int i = 0; i < L.tabCount; i++) {
+        RECT tr = L.tabRects[i];
+        if (px >= tr.left && px < tr.right) return L.tabIds[i];
+    }
+    return -1;
 }
 
 // v4 reorg: settings-gear hit test. Same paint-vs-click split as
@@ -894,6 +1025,56 @@ static void DrawGear(HDC hdc, int cx, int cy, int r, COLORREF color)
     SelectObject(hdc, oldPen);
     SelectObject(hdc, oldBrush);
     DeleteObject(brush);
+}
+
+// v4 tabs: one media glyph (Prev / Play-Pause / Next), shared
+// by the full-size buttons on the MEDIA tab and the smaller
+// buttons on the HOME tab. The glyph brush must already be
+// selected into the DC by the caller.
+static void DrawMediaGlyph(HDC hdc, int idx, int cx, int cy, int r, HBRUSH glyphBrush)
+{
+    int h = (2 * r) * 11 / 20; // glyph height, as in v3
+    int half = h / 2;
+    if (idx == 0 || idx == 2) {
+        // Prev: bar + two triangles pointing left.
+        // Next: two triangles pointing right + bar (mirrored).
+        int dir = (idx == 0) ? -1 : 1;
+        int barW = h / 6; if (barW < 2) barW = 2;
+        int triW = h / 2;
+        int gap = 1;
+        int totalW = barW + gap + 2 * triW + gap;
+        int x0 = cx - totalW / 2;
+        RECT bar = { 0, 0, 0, 0 };
+        if (dir < 0) {
+            bar = { x0, cy - half, x0 + barW, cy + half };
+            POINT t1[3] = { { x0 + barW + gap + triW, cy - half }, { x0 + barW + gap + triW, cy + half }, { x0 + barW + gap, cy } };
+            POINT t2[3] = { { x0 + barW + gap + 2 * triW + gap, cy - half }, { x0 + barW + gap + 2 * triW + gap, cy + half }, { x0 + barW + gap + triW + gap, cy } };
+            FillRect(hdc, &bar, glyphBrush);
+            Polygon(hdc, t1, 3);
+            Polygon(hdc, t2, 3);
+        } else {
+            POINT t1[3] = { { x0, cy - half }, { x0, cy + half }, { x0 + triW, cy } };
+            POINT t2[3] = { { x0 + triW + gap, cy - half }, { x0 + triW + gap, cy + half }, { x0 + 2 * triW + gap, cy } };
+            bar = { x0 + 2 * triW + 2 * gap, cy - half, x0 + 2 * triW + 2 * gap + barW, cy + half };
+            Polygon(hdc, t1, 3);
+            Polygon(hdc, t2, 3);
+            FillRect(hdc, &bar, glyphBrush);
+        }
+    } else {
+        // Play/Pause: a play triangle on the left, pause bars
+        // on the right, so one button reads as the toggle.
+        int triW = h / 2;
+        int barW = h / 6; if (barW < 2) barW = 2;
+        int gap = h / 8; if (gap < 2) gap = 2;
+        int totalW = triW + gap + 2 * barW + gap;
+        int x0 = cx - totalW / 2;
+        POINT tri[3] = { { x0, cy - half }, { x0, cy + half }, { x0 + triW, cy } };
+        Polygon(hdc, tri, 3);
+        RECT b1 = { x0 + triW + gap, cy - half, x0 + triW + gap + barW, cy + half };
+        RECT b2 = { x0 + triW + gap + barW + gap, cy - half, x0 + triW + gap + 2 * barW + gap, cy + half };
+        FillRect(hdc, &b1, glyphBrush);
+        FillRect(hdc, &b2, glyphBrush);
+    }
 }
 
 // v4 premium surface helpers. No new allocations, no new timers:
@@ -1018,6 +1199,7 @@ static void PaintNotch(Notch* n, HDC hdc)
     }
 
     Layout L = ComputeLayout(n, rc.right);
+    int effTab = EffectiveTab(n);
     DrawCenteredText(hdc, n->hFontBig, clockText, 0, Scale(12, dpi), rc.right, Scale(48, dpi), RGB(248, 248, 250));
     wchar_t dateText[64]; FormatDate(dateText, 64);
     DrawCenteredText(hdc, n->hFontSmall, dateText, 0, Scale(64, dpi), rc.right, Scale(22, dpi), RGB(165, 165, 170));
@@ -1050,7 +1232,105 @@ static void PaintNotch(Notch* n, HDC hdc)
         DeleteObject(divBrush);
     }
 
-    if (g_mediaEnabled) {
+    // v4 tabs: tab bar below the divider. Active tab: near-white
+    // text with a near-white underline across its segment;
+    // inactive tabs: muted grey, brighter on hover.
+    if (L.showTabs) {
+        static const wchar_t* kTabNames[4] = { L"HOME", L"MEDIA", L"SYSTEM", L"CALENDAR" };
+        for (int i = 0; i < L.tabCount; i++) {
+            int id = L.tabIds[i];
+            RECT tr = L.tabRects[i];
+            COLORREF tc = (id == effTab) ? RGB(248, 248, 250)
+                : (id == n->hoverTab ? RGB(210, 210, 214) : RGB(140, 140, 140));
+            DrawCenteredText(hdc, n->hFontTiny, kTabNames[id],
+                             tr.left, tr.top, tr.right - tr.left, Scale(20, dpi), tc);
+            if (id == effTab) {
+                HBRUSH ulBrush = CreateSolidBrush(RGB(248, 248, 250));
+                int pad = Scale(12, dpi);
+                RECT ul = { tr.left + pad, tr.top + Scale(20, dpi), tr.right - pad, tr.top + Scale(22, dpi) };
+                if (ul.right > ul.left) FillRect(hdc, &ul, ulBrush);
+                DeleteObject(ulBrush);
+            }
+        }
+    }
+
+    // v4 tabs: HOME is the compact summary — smaller media
+    // buttons (still functional), one stats line, the current
+    // week only. No section headers here: each row is self
+    // evident, and headers would cost the height HOME saves.
+    if (L.showTabs && effTab == kTabHome) {
+        if (g_mediaEnabled) {
+            HBRUSH glyphBrush = CreateSolidBrush(RGB(255, 255, 255));
+            HPEN nullPen = (HPEN)GetStockObject(NULL_PEN);
+            HPEN oldPen = (HPEN)SelectObject(hdc, nullPen);
+            HBRUSH oldBrush = (HBRUSH)GetCurrentObject(hdc, OBJ_BRUSH);
+            for (int i = 0; i < 3; i++) {
+                int cx, cy, r;
+                HomeMediaButtonCircle(L, i, cx, cy, r);
+                COLORREF bg = RGB(44, 44, 48);
+                if (i == n->pressedBtn) bg = RGB(94, 94, 98);
+                else if (i == n->hoverBtn) bg = RGB(66, 66, 70);
+                HBRUSH btnBrush = CreateSolidBrush(bg);
+                HBRUSH prevBrush = (HBRUSH)SelectObject(hdc, btnBrush);
+                Ellipse(hdc, cx - r, cy - r, cx + r, cy + r);
+                SelectObject(hdc, prevBrush);
+                DeleteObject(btnBrush);
+            }
+            SelectObject(hdc, glyphBrush);
+            for (int i = 0; i < 3; i++) {
+                int cx, cy, r;
+                HomeMediaButtonCircle(L, i, cx, cy, r);
+                DrawMediaGlyph(hdc, i, cx, cy, r, glyphBrush);
+            }
+            SelectObject(hdc, oldPen);
+            SelectObject(hdc, oldBrush);
+            DeleteObject(glyphBrush);
+        }
+        if (g_widgetStats) {
+            wchar_t homeStats[128];
+            swprintf(homeStats, 128, L"CPU %d%%  \x00B7  RAM %d%%", g_cpuPercent, g_memPercent);
+            DrawCenteredText(hdc, n->hFontTiny, homeStats,
+                             Scale(16, dpi), L.homeStatsY, rc.right - Scale(32, dpi), Scale(20, dpi),
+                             RGB(165, 165, 170));
+        }
+        if (g_widgetCalendar) {
+            SYSTEMTIME st; GetLocalTime(&st);
+            // Current week, Sunday start: step today by whole
+            // days in FILETIME (100 ns units), then convert back.
+            FILETIME ft; SystemTimeToFileTime(&st, &ft);
+            ULARGE_INTEGER base; base.LowPart = ft.dwLowDateTime; base.HighPart = ft.dwHighDateTime;
+            int margin = Scale(16, dpi);
+            int cellW = (rc.right - 2 * margin) / 7;
+            int cellH = Scale(20, dpi);
+            for (int c = 0; c < 7; c++) {
+                ULARGE_INTEGER v;
+                v.QuadPart = base.QuadPart + (ULONGLONG)((LONGLONG)(c - st.wDayOfWeek) * 864000000000LL);
+                FILETIME cft; cft.dwLowDateTime = v.LowPart; cft.dwHighDateTime = v.HighPart;
+                SYSTEMTIME cst; FileTimeToSystemTime(&cft, &cst);
+                int x = margin + c * cellW;
+                int y = L.homeWeekY;
+                bool isToday = (c == st.wDayOfWeek);
+                if (isToday) {
+                    HPEN nullP = (HPEN)GetStockObject(NULL_PEN);
+                    HPEN oldP = (HPEN)SelectObject(hdc, nullP);
+                    HBRUSH pill = CreateSolidBrush(RGB(248, 248, 250));
+                    HBRUSH oldB = (HBRUSH)SelectObject(hdc, pill);
+                    RoundRect(hdc, x + Scale(2, dpi), y + Scale(1, dpi),
+                              x + cellW - Scale(2, dpi), y + cellH - Scale(1, dpi),
+                              cellH, cellH);
+                    SelectObject(hdc, oldP);
+                    SelectObject(hdc, oldB);
+                    DeleteObject(pill);
+                }
+                wchar_t dayText[8]; swprintf(dayText, 8, L"%d", cst.wDay);
+                DrawCenteredText(hdc, n->hFontTiny, dayText, x, y, cellW, cellH,
+                                 isToday ? RGB(18, 18, 20) : RGB(165, 165, 170));
+            }
+        }
+    }
+
+
+    if (effTab == kTabMedia) {
         // v4 reorg: MEDIA section header, left-aligned in its column
         // (the "media keys" explanation lives in the README/About).
         DrawLeftText(hdc, n->hFontTiny, L"MEDIA",
@@ -1081,55 +1361,14 @@ static void PaintNotch(Notch* n, HDC hdc)
         for (int i = 0; i < 3; i++) {
             int cx, cy, r;
             MediaButtonCircle(L, i, cx, cy, r);
-            int h = (2 * r) * 11 / 20; // glyph height, as in v3
-            int half = h / 2;
-            if (i == 0 || i == 2) {
-                // Prev: bar + two triangles pointing left.
-                // Next: two triangles pointing right + bar (mirrored).
-                int dir = (i == 0) ? -1 : 1;
-                int barW = h / 6; if (barW < 2) barW = 2;
-                int triW = h / 2;
-                int gap = 1;
-                int totalW = barW + gap + 2 * triW + gap;
-                int x0 = cx - totalW / 2;
-                RECT bar = { 0, 0, 0, 0 };
-                if (dir < 0) {
-                    bar = { x0, cy - half, x0 + barW, cy + half };
-                    POINT t1[3] = { { x0 + barW + gap + triW, cy - half }, { x0 + barW + gap + triW, cy + half }, { x0 + barW + gap, cy } };
-                    POINT t2[3] = { { x0 + barW + gap + 2 * triW + gap, cy - half }, { x0 + barW + gap + 2 * triW + gap, cy + half }, { x0 + barW + gap + triW + gap, cy } };
-                    FillRect(hdc, &bar, glyphBrush);
-                    Polygon(hdc, t1, 3);
-                    Polygon(hdc, t2, 3);
-                } else {
-                    POINT t1[3] = { { x0, cy - half }, { x0, cy + half }, { x0 + triW, cy } };
-                    POINT t2[3] = { { x0 + triW + gap, cy - half }, { x0 + triW + gap, cy + half }, { x0 + 2 * triW + gap, cy } };
-                    bar = { x0 + 2 * triW + 2 * gap, cy - half, x0 + 2 * triW + 2 * gap + barW, cy + half };
-                    Polygon(hdc, t1, 3);
-                    Polygon(hdc, t2, 3);
-                    FillRect(hdc, &bar, glyphBrush);
-                }
-            } else {
-                // Play/Pause: a play triangle on the left, pause bars
-                // on the right, so one button reads as the toggle.
-                int triW = h / 2;
-                int barW = h / 6; if (barW < 2) barW = 2;
-                int gap = h / 8; if (gap < 2) gap = 2;
-                int totalW = triW + gap + 2 * barW + gap;
-                int x0 = cx - totalW / 2;
-                POINT tri[3] = { { x0, cy - half }, { x0, cy + half }, { x0 + triW, cy } };
-                Polygon(hdc, tri, 3);
-                RECT b1 = { x0 + triW + gap, cy - half, x0 + triW + gap + barW, cy + half };
-                RECT b2 = { x0 + triW + gap + barW + gap, cy - half, x0 + triW + gap + 2 * barW + gap, cy + half };
-                FillRect(hdc, &b1, glyphBrush);
-                FillRect(hdc, &b2, glyphBrush);
-            }
+            DrawMediaGlyph(hdc, i, cx, cy, r, glyphBrush);
         }
         SelectObject(hdc, oldPen);
         SelectObject(hdc, oldBrush);
         DeleteObject(glyphBrush);
     }
 
-    if (g_widgetStats) {
+    if (effTab == kTabSystem) {
         // v4 reorg: SYSTEM header, then two labelled rows, each
         // with a thin progress bar underneath (track dark, fill
         // near-white). Same CPU/RAM values as before, just split
@@ -1159,7 +1398,7 @@ static void PaintNotch(Notch* n, HDC hdc)
         DeleteObject(fillBrush);
     }
 
-    if (g_widgetCalendar) {
+    if (effTab == kTabCalendar) {
         SYSTEMTIME st; GetLocalTime(&st);
         static const wchar_t* kMonths[] = { L"January", L"February", L"March", L"April", L"May", L"June",
             L"July", L"August", L"September", L"October", L"November", L"December" };
@@ -1273,6 +1512,11 @@ static LRESULT CALLBACK NotchWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                 n->hoverGear = gear;
                 InvalidateRect(hwnd, NULL, FALSE);
             }
+            int tab = TabIndexAt(n, pt.x, pt.y, true);
+            if (tab != n->hoverTab) {
+                n->hoverTab = tab;
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
         }
         if (n && !n->expanded) SetNotchExpanded(n, true);
         if (n && !n->trackingLeave) {
@@ -1293,6 +1537,7 @@ static LRESULT CALLBACK NotchWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             n->pressedBtn = -1;
             n->hoverGear = false;
             n->pressedGear = false;
+            n->hoverTab = -1;
             if (n->expanded && !n->pinned) SetNotchExpanded(n, false);
         }
         return 0;
@@ -1313,6 +1558,21 @@ static LRESULT CALLBACK NotchWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             ShowTrayMenuAt(menuPt, TPM_RIGHTALIGN);
             n->pressedGear = false;
             InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
+        }
+        // v4 tabs: a tab click switches the body — never pins,
+        // never fires a media key, never opens the gear menu.
+        // Height animates via the existing path (or snaps, if
+        // Animations is off); ApplyTargetSize already handles
+        // the no-change case, so re-clicking a tab is harmless.
+        int tab = TabIndexAt(n, pt.x, pt.y, false);
+        if (tab >= 0) {
+            if (tab != n->activeTab) {
+                n->activeTab = tab;
+                ApplyTargetSize(n, true);
+            } else {
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
             return 0;
         }
         WORD vk = 0;
@@ -1447,7 +1707,7 @@ static LRESULT CALLBACK ManagerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
         case ID_TRAY_MEDIA_NEXT: SendMediaKey(VK_MEDIA_NEXT_TRACK); break;
         case ID_TRAY_ABOUT:
             MessageBoxW(hwnd,
-                L"OnyxNotch v4\nMac-style notch for Windows.\nNative Win32 C++, no runtime, low memory.\n\nv4: premium UI — gradient surface, lighter\ntypography, circular media buttons, battery glyph,\ncalendar pill — reorganized in place: compact\ntwo-column body (media beside system stats),\nsection headers, stats rows with bars.\n\nClick the notch header to pin it open;\nclick again to unpin. The gear button in the\nexpanded header opens this menu from the notch.",
+                L"OnyxNotch v4\nMac-style notch for Windows.\nNative Win32 C++, no runtime, low memory.\n\nv4: premium UI — gradient surface, lighter\ntypography, circular media buttons, battery glyph,\ncalendar pill — reorganized in place: compact\ntwo-column body (media beside system stats),\nsection headers, stats rows with bars.\n\nClick the notch header to pin it open;\nclick again to unpin. The gear button in the\nexpanded header opens this menu from the notch.\n\nTabs: Home is a compact summary of every\ntab; Media, System and Calendar show the\nfull versions. Click a tab to switch.",
                 L"OnyxNotch", MB_OK | MB_ICONINFORMATION);
             break;
         }

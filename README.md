@@ -294,6 +294,74 @@ animation path is unchanged: animated sizes interpolate to
 the new total height, and expanded content still paints until
 a collapse finishes, so nothing pops mid-collapse.
 
+## What's new in v4 — Tabs (in place, after the reorganization)
+
+No new version number, no new features, no changed defaults,
+no settings file. The v4 premium look and the reorganized
+layout are unchanged in spirit; the expanded body is now
+organized into tabs instead of showing every section at once.
+
+### 1. Tab bar and visibility rules
+The tab bar sits in the expanded notch below the header
+(clock, date, battery) and its divider, above the body
+content. Tabs, in order: **HOME**, then **MEDIA** (only if
+media controls are enabled), **SYSTEM** (only if the
+system-stats widget is enabled), **CALENDAR** (only if the
+calendar widget is enabled). Tabs are uppercase, small, and
+evenly spaced across the notch width. The active tab is
+near-white text with a near-white underline across its
+segment; inactive tabs are muted grey, brighter on hover.
+If no media/widget is enabled, there is no tab bar at all:
+the expanded view is just the header, exactly as before.
+The settings gear stays in the expanded header, top-right,
+and works as before; the collapsed notch is unchanged
+(clock only).
+
+### 2. HOME — a smaller version of every tab
+HOME stacks a compact summary of each enabled feature,
+vertically, and is deliberately short:
+- **Media summary:** the three media buttons at a smaller
+  size (20 px circles instead of 28 px), still fully
+  functional — same media keys, same circular hit test
+  scaled down, same hover/pressed states.
+- **System summary:** one line, `CPU x% · RAM y%` — no
+  bars, no GB figures (those live on the SYSTEM tab).
+- **Calendar summary:** the current week only — 7 day
+  cells, Sunday start, today as the white pill — no month
+  grid, no month header, no weekday header row.
+With all three features on, HOME is 246 px tall at the
+standard size (96 DPI), versus 364 px for the old view
+that showed every detailed section at once.
+
+### 3. Detailed tabs — the full versions, unchanged
+Clicking a tab shows that feature's full version, with the
+same data and behaviour as before the tabs, only moved
+behind its tab:
+- **MEDIA:** the MEDIA header plus the full-size circular
+  media buttons (28 px), as in the reorganization.
+- **SYSTEM:** the SYSTEM header, then the CPU row with its
+  bar and the RAM row (with GB used/total) with its bar.
+- **CALENDAR:** the CALENDAR header sharing the month row,
+  the weekday row, and the full month grid with the today
+  pill. No track title/artist is added (see the SMTC limit
+  in the v2 section); no acrylic is added.
+
+### 4. Switching, height, and reset rules
+Clicking a tab switches the body content to that tab. The
+hit-test order is: gear first, then tabs, then media
+buttons, then pin — so a tab click never pins or unpins,
+never fires a media key, and never opens the gear menu.
+Switching changes the notch height to the new tab's height
+through the existing animation path: it animates (~220 ms,
+ease-out) when Animations is on and snaps instantly when
+off. The selected tab is per-notch state (each monitor's
+notch remembers its own tab). When the notch collapses
+(unpinned, mouse leaves), the tab resets to HOME on the
+next expand — so every fresh expand starts on HOME. If a
+tab's feature is toggled off while that tab is selected
+(from the tray menu or the gear menu), the notch falls
+back to HOME rather than showing a dead tab.
+
 ## Build (Windows) — unchanged from v2
 
 ## Build (Windows)
@@ -419,6 +487,45 @@ Everything under "v4 additions" above still applies, plus:
   layout, not a measurement, and the both-on saving (236 px
   to 210 px) is arithmetic too until a Windows run confirms it.
 
+## Honest limits — v4 tabs (not verified on Windows)
+
+Everything under "v4 additions" above still applies, plus:
+- **Not compiled on Windows.** The tabs use only the same
+  Win32/GDI APIs as before (`Ellipse`, `Polygon`,
+  `FillRect`, `RoundRect`, `SystemTimeToFileTime` /
+  `FileTimeToSystemTime` for the HOME week), plus the
+  existing animation path, but `cl`/`rc` were never run on
+  it here, so a compile error is still possible until the
+  first Windows build.
+- **Tab legibility and balance untested on screen.** Tab
+  labels at the tiny font size, the active underline, and
+  the even spacing across 2–4 tabs have not been seen on a
+  real display; with 4 tabs each segment is about 77 px
+  wide at the standard size, which may feel cramped, and
+  the HOME week numbers without a weekday header may need
+  a label after all.
+- **Mini media button hit areas untested.** The HOME
+  buttons are 20 px circles (10 px radius); the circular
+  hit test is scaled from the same layout as the drawing,
+  but whether 20 px targets feel too small to click
+  reliably has not been tried on a real screen.
+- **Height animation on tab switch untested.** Tab
+  switches reuse the expand/collapse animation, but the
+  animation from one expanded height to another (rather
+  than collapsed-to-expanded) has not been observed;
+  flicker, or content from the old tab showing during the
+  switch, is possible — the Animations tray tick remains
+  the instant fallback.
+- **DPI behaviour untested**, as in v3/v4: tab segments,
+  mini buttons, and week cells all scale with DPI via
+  `Scale()`, but per-monitor DPI tab layout has not been
+  run.
+- **Heights are arithmetic, not measurements** (standard
+  size, 96 DPI): HOME with all features 246 px, MEDIA
+  220 px, SYSTEM 242 px, CALENDAR 314 px for a 5-row
+  month (294 px for 4 rows, 334 px for 6 rows), header
+  only 138 px — until a Windows run confirms them.
+
 ## Honest limits — v4 additions (not verified on Windows)
 
 - **Not compiled on Windows.** This Linux VM has no Windows
@@ -496,6 +603,12 @@ Everything under "v4 additions" above still applies, plus:
   and a GDI settings gear in the expanded header that opens
   the existing tray menu (hit-tested before the pin click).
   No new settings window, no settings file.
+  Tabs (in place): HOME summary plus MEDIA / SYSTEM /
+  CALENDAR detailed tabs, shown only for enabled features;
+  tab clicks switch the body (hit-tested after the gear,
+  before media buttons and pin), height animates via the
+  existing path, and the tab resets to HOME on the next
+  expand after a collapse.
 - `build.bat` — MSVC build script (resource compile + compile/link).
 - `onyxnotch.rc` — resource script binding the icon (ID 100).
 - `onyxnotch.ico` — custom black-pill icon, 16/32/48 px, 32-bit.
