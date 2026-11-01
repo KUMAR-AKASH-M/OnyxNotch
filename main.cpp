@@ -184,9 +184,14 @@
 // v2 changes over v1 (v1 behaviour is otherwise intact):
 //  1. Multi-monitor: one notch per monitor, top-centre of each monitor's
 //     work area, rebuilt on display change, per-monitor DPI aware.
-//  2. Hide on fullscreen, OPT-IN (tray, default OFF): a notch hides on a
-//     monitor while a fullscreen/borderless window covers that monitor,
-//     and returns when fullscreen ends. Checked once per second.
+//  2. Hide on fullscreen, OPT-IN (tray, default OFF): a notch shrinks
+//     to a thin strip on a monitor while a fullscreen/borderless
+//     window covers that monitor, and returns to its previous state
+//     when fullscreen ends. It is NEVER totally hidden any more
+//     (v7 thin-strip change): total hiding could stick on the
+//     desktop after a false-positive fullscreen detection, and a
+//     stuck-hidden notch cannot be seen to recover. Checked once
+//     per second.
 //  3. Custom tray/app icon: a black-pill icon (onyxnotch.ico, via
 //     onyxnotch.rc) instead of the default Windows application icon.
 //  4. Media controls, OPT-IN (tray, default OFF): play/pause, previous,
@@ -639,7 +644,15 @@ struct Notch {
     bool expanded = false;
     bool pinned = false;
     bool trackingLeave = false;
-    bool hiddenByFullscreen = false;
+    // v7 thin strip on fullscreen: replaces total hiding (SW_HIDE),
+    // which could stick on the desktop after a false-positive
+    // fullscreen detection. inFullscreenStrip means this notch is
+    // currently a 6 px accent strip; savedExpanded/savedPinned are
+    // the state it had when the strip started, restored when
+    // fullscreen ends (or when the toggle is switched off).
+    bool inFullscreenStrip = false;
+    bool savedExpanded = false;
+    bool savedPinned = false;
     // v3 animation / hover state. paintExpanded is what PaintNotch
     // draws: it becomes true as soon as an expand starts, and only
     // becomes false when a collapse animation finishes, so content
@@ -1028,6 +1041,18 @@ static void ApplyRegion(HWND hwnd, int w, int h, bool expanded)
 static void PresentNotch(Notch* n);
 static void ApplyBlur(Notch* n);
 
+// v7 thin strip on fullscreen: same collapsed width, centred at
+// the top of the work area, 6 px tall at 96 DPI. The floor guards
+// against a 0-height window at any DPI (a 0-height layered
+// window would present nothing and be unhoverable); 6 px at
+// 96 DPI is the designed height, the floor only bites below it.
+static int StripHeight(int dpi)
+{
+    int h = Scale(6, dpi);
+    if (h < 3) h = 3;
+    return h;
+}
+
 static void ApplyNotchSizeInstant(Notch* n, bool expanded)
 {
     if (!n || !n->hwnd) return;
@@ -1037,6 +1062,13 @@ static void ApplyNotchSizeInstant(Notch* n, bool expanded)
     if (expanded) {
         Layout L = ComputeLayout(n, w);
         h = L.totalH;
+    } else if (n->inFullscreenStrip) {
+        // v7 strip: collapsing while fullscreen is active goes
+        // to the strip, NOT to the normal 34 px collapsed pill.
+        // This single rule is what makes hover-expand over a
+        // fullscreen app collapse back to the strip, and makes
+        // ApplySizeToAll safe while a notch is in strip mode.
+        h = StripHeight(dpi);
     } else {
         h = Scale(34, dpi);
     }
@@ -1072,6 +1104,12 @@ static void TargetSizeFor(Notch* n, bool expanded, int& outW, int& outH)
     if (expanded) {
         Layout L = ComputeLayout(n, outW);
         outH = L.totalH;
+    } else if (n->inFullscreenStrip) {
+        // v7 strip: the animation target for "collapsed" is the
+        // strip height while fullscreen is active, so a spring
+        // collapse from an expanded panel over a fullscreen app
+        // lands on the strip instead of the normal pill.
+        outH = StripHeight(dpi);
     } else {
         outH = Scale(34, dpi);
     }
@@ -1629,18 +1667,99 @@ static void FormatOffset(int offsetMin, wchar_t* out, size_t count)
 }
 
 // ---------------------------------------------------------------------------
-// Fullscreen detection (heuristic, checked once per second).
-// A window counts as fullscreen on a monitor when it is visible, not
-// minimised, not one of our own windows, not the desktop, and its rect
-// covers the whole monitor rect. Captioned/maximised windows that leave
-// the taskbar visible do not cover the full rect, so they do not hide
-// the notch. Some borderless games keep a caption; those may be missed
-// (see README limits).
+// Fullscreen detection (heuristic, checked once per second) and
+// the v7 thin strip that replaces total hiding.
+// WHY TOTAL HIDING WAS REPLACED: the old code SW_HIDE'd the notch
+// on a fullscreen detection and only SW_SHOW'd it when NO window
+// covered the monitor any more. Any false positive that kept
+// matching — a cloaked window, an owned/tool window, or a shell
+// window that covers the monitor without being a real app —
+// therefore latched the notch hidden on the DESKTOP, where the
+// user could never see it to recover it. The strip removes the
+// failure mode instead of merely shrinking it: a false positive
+// now shows a visible 6 px accent bar, never a disappearance,
+// and hovering that bar still opens the full panel.
+// A window counts as fullscreen on a monitor when it is visible,
+// not minimised, not cloaked, not owned, not a tool window, not
+// one of our own windows, not the desktop/shell, and its rect
+// covers the whole monitor rect. The window does NOT have to be
+// foreground: a fullscreen game/app should still count even if
+// a small overlay is briefly foreground, because the app behind
+// the overlay is still fullscreen. Captioned/maximised windows
+// that leave the taskbar visible do not cover the full rect, so
+// they do not trigger the strip. Some borderless games keep a
+// caption; those may be missed (see README limits).
+// Remaining false positives (unowned, non-tool, uncloaked overlay
+// / wallpaper windows that cover the full rect) still trigger
+// the strip — but a strip, not a disappearance, so they are a
+// cosmetic annoyance, not a stuck-hidden notch.
 // ---------------------------------------------------------------------------
 struct FullscreenCheck {
     RECT monitorRect;
     bool found = false;
 };
+
+// DWMWA_CLOAKED = 14. Resolved at runtime (same pattern as the
+// blur accent call): no dwmapi.lib link dependency, no header
+// dependency, and a resolution failure simply means "cannot
+// prove cloaked", falling back to the other exclusions.
+static bool IsWindowCloaked(HWND hwnd)
+{
+    typedef HRESULT (WINAPI* DwmGetWindowAttributeFn)(HWND, DWORD, PVOID, DWORD);
+    static DwmGetWindowAttributeFn fn = NULL;
+    static bool resolved = false;
+    if (!resolved) {
+        resolved = true;
+        HMODULE dwm = GetModuleHandleW(L"dwmapi.dll");
+        if (dwm) fn = (DwmGetWindowAttributeFn)GetProcAddress(dwm, "DwmGetWindowAttribute");
+    }
+    if (!fn) return false;
+    DWORD cloaked = 0;
+    if (FAILED(fn(hwnd, 14, &cloaked, sizeof(cloaked)))) return false;
+    return cloaked != 0;
+}
+
+// Narrow Start/search-shell test for Windows.UI.Core.CoreWindow
+// windows. CoreWindow is NOT blanket-excluded: real UWP apps
+// (including fullscreen games) also use it, and excluding them
+// would break the strip for exactly the apps it exists for.
+// Only the shell hosts are excluded, identified by their
+// process image name, not by class alone. The process check
+// runs only for CoreWindow windows (a handful per second),
+// never for every enumerated window.
+// ASCII case-insensitive compare (all four host exe names are
+// ASCII, so no CRT wide-char compare function is needed here).
+static bool ExeNameEqualsIgnoreCase(const wchar_t* a, const wchar_t* b)
+{
+    while (*a && *b) {
+        wchar_t ca = *a, cb = *b;
+        if (ca >= L'A' && ca <= L'Z') ca = (wchar_t)(ca + 32);
+        if (cb >= L'A' && cb <= L'Z') cb = (wchar_t)(cb + 32);
+        if (ca != cb) return false;
+        a++; b++;
+    }
+    return *a == *b;
+}
+
+static bool IsStartSearchShellWindow(HWND hwnd)
+{
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid == 0) return false;
+    HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!proc) return false;
+    wchar_t path[MAX_PATH] = { 0 };
+    DWORD len = MAX_PATH;
+    BOOL ok = QueryFullProcessImageNameW(proc, 0, path, &len);
+    CloseHandle(proc);
+    if (!ok) return false;
+    const wchar_t* base = wcsrchr(path, L'\\');
+    base = base ? base + 1 : path;
+    return ExeNameEqualsIgnoreCase(base, L"ShellExperienceHost.exe") ||
+           ExeNameEqualsIgnoreCase(base, L"StartMenuExperienceHost.exe") ||
+           ExeNameEqualsIgnoreCase(base, L"SearchHost.exe") ||
+           ExeNameEqualsIgnoreCase(base, L"SearchUI.exe");
+}
 
 static BOOL CALLBACK EnumFullscreenWindow(HWND hwnd, LPARAM lParam)
 {
@@ -1651,7 +1770,36 @@ static BOOL CALLBACK EnumFullscreenWindow(HWND hwnd, LPARAM lParam)
     if (hwnd == GetShellWindow()) return TRUE;
     wchar_t cls[64] = { 0 };
     GetClassNameW(hwnd, cls, 64);
-    if (wcscmp(cls, L"Progman") == 0 || wcscmp(cls, L"WorkerW") == 0) return TRUE;
+    // Desktop / shell windows that can cover the monitor
+    // without being an app. Shell_TrayWnd /
+    // Shell_SecondaryTrayWnd are the taskbars (primary and
+    // secondary monitors); Progman/WorkerW are the desktop.
+    if (wcscmp(cls, L"Progman") == 0 || wcscmp(cls, L"WorkerW") == 0 ||
+        wcscmp(cls, L"Shell_TrayWnd") == 0 || wcscmp(cls, L"Shell_SecondaryTrayWnd") == 0) return TRUE;
+    // Owned windows (dialogs, popups, dropdowns owned by an app)
+    // are not the fullscreen app itself: a real fullscreen app
+    // is a top-level, unowned window. Counting an owned window
+    // was a prime false-positive source (an owned overlay that
+    // happens to cover the monitor latched the old hide).
+    if (GetWindow(hwnd, GW_OWNER) != NULL) return TRUE;
+    // Tool windows (floating palettes, tooltips, IME windows)
+    // are UI chrome, not apps, even when they cover the rect.
+    LONG_PTR exStyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    if (exStyle & WS_EX_TOOLWINDOW) return TRUE;
+    // Cloaked windows (DWM-cloaked: UWP/Store windows on another
+    // virtual desktop, or hidden behind the shell) still report
+    // IsWindowVisible, so visibility alone cannot exclude them.
+    // A cloaked window covering the rect was the other prime
+    // false-positive source for the old stuck-hide bug.
+    if (IsWindowCloaked(hwnd)) return TRUE;
+    // Start/search shell only, by process image (see
+    // IsStartSearchShellWindow): never a blanket CoreWindow
+    // exclusion, so real UWP fullscreen apps still count.
+    // ApplicationFrameWindow (the UWP frame host) is deliberately
+    // NOT excluded: a fullscreen UWP app's frame covering the
+    // monitor is a real fullscreen app.
+    if (wcscmp(cls, L"Windows.UI.Core.CoreWindow") == 0 &&
+        IsStartSearchShellWindow(hwnd)) return TRUE;
     RECT rc;
     if (!GetWindowRect(hwnd, &rc)) return TRUE;
     if (rc.left <= check->monitorRect.left && rc.top <= check->monitorRect.top &&
@@ -1669,18 +1817,59 @@ static bool IsFullscreenOnMonitor(const RECT& monitorRect)
     return check.found;
 }
 
+// Enter strip mode on one monitor only (per-monitor state, so
+// a strip on one monitor never affects another monitor's
+// notch). The pre-strip expanded/pinned state is saved and
+// restored by ExitFullscreenStrip; the tab is preserved, not
+// reset to HOME (unlike a fresh expand), because this is a
+// restore, not a new expansion. Entering from an already
+// collapsed notch still resizes to the strip: ApplyTargetSize
+// alone would early-return only if the size already matched,
+// and the strip height differs from the 34 px pill, so the
+// resize always runs. The window is never SW_HIDE'd.
+static void EnterFullscreenStrip(Notch* n)
+{
+    if (!n || !n->hwnd || n->inFullscreenStrip) return;
+    n->savedExpanded = n->expanded;
+    n->savedPinned = n->pinned;
+    n->inFullscreenStrip = true;
+    n->pinned = false;
+    if (n->expanded) SetNotchExpanded(n, false);
+    else ApplyTargetSize(n, false);
+}
+
+// Leave strip mode, restoring exactly the pre-strip state:
+// collapsed stays collapsed, expanded+pinned stays
+// expanded+pinned (tab preserved). This is also the path when
+// the user switches hide-on-fullscreen OFF while in strip
+// mode: UpdateFullscreenAndVisibility sees fullscreen as
+// false and calls this at once, so the notch restores without
+// waiting for any app to leave fullscreen. Any in-flight
+// animation is stopped first, so a strip animation cannot
+// carry the notch to the wrong size after the restore.
+static void ExitFullscreenStrip(Notch* n)
+{
+    if (!n || !n->hwnd || !n->inFullscreenStrip) return;
+    bool wasExpanded = n->savedExpanded;
+    bool wasPinned = n->savedPinned;
+    StopAnimation(n);
+    n->inFullscreenStrip = false;
+    n->savedExpanded = false;
+    n->savedPinned = false;
+    n->pinned = wasPinned;
+    n->expanded = wasExpanded;
+    ApplyTargetSize(n, wasExpanded);
+}
+
 static void UpdateFullscreenAndVisibility()
 {
     for (size_t i = 0; i < g_notches.size(); i++) {
         Notch* n = g_notches[i];
         bool fs = g_hideOnFullscreen && IsFullscreenOnMonitor(n->monitorRect);
-        if (fs && !n->hiddenByFullscreen) {
-            ShowWindow(n->hwnd, SW_HIDE);
-            n->hiddenByFullscreen = true;
-        } else if (!fs && n->hiddenByFullscreen) {
-            n->hiddenByFullscreen = false;
-            ShowWindow(n->hwnd, SW_SHOWNOACTIVATE);
-            ApplyTargetSize(n, n->expanded);
+        if (fs && !n->inFullscreenStrip) {
+            EnterFullscreenStrip(n);
+        } else if (!fs && n->inFullscreenStrip) {
+            ExitFullscreenStrip(n);
         }
     }
 }
@@ -1689,7 +1878,13 @@ static void InvalidateAllNotches()
 {
     for (size_t i = 0; i < g_notches.size(); i++) {
         Notch* nn = g_notches[i];
-        if (!nn->hwnd || nn->hiddenByFullscreen) continue;
+        if (!nn->hwnd) continue;
+        // v7 strip: a strip notch is VISIBLE (a 6 px accent bar),
+        // so it is no longer skipped here — the old code skipped
+        // SW_HIDE'd notches, which do not exist any more. A
+        // collapsed strip notch still skips the minute-unchanged
+        // repaint below (it shows no clock), and an expanded
+        // panel over a fullscreen app repaints normally.
         // v6-fix, provably safe dirty-region cut: a collapsed notch
         // shows only the clock (HH:MM), so a 1-second tick that does
         // not change the minute paints nothing new. Expanded notches
@@ -1709,7 +1904,16 @@ static void InvalidateAllNotches()
 static void ApplySizeToAll()
 {
     for (size_t i = 0; i < g_notches.size(); i++) {
-        if (g_notches[i]->hwnd && !g_notches[i]->hiddenByFullscreen) {
+        if (g_notches[i]->hwnd) {
+            // v7 strip: ApplyTargetSize is strip-aware (a
+            // collapsed target sizes to the strip height while
+            // fullscreen is active), so size/feature toggles
+            // while in strip mode update the strip width and
+            // keep the strip height, and an expanded panel over
+            // a fullscreen app resizes normally. The old code
+            // skipped hidden notches here; skipping a visible
+            // strip notch would freeze its width on a size
+            // change, so it is no longer skipped.
             ApplyTargetSize(g_notches[i], g_notches[i]->expanded);
         }
     }
@@ -2469,6 +2673,24 @@ static void PaintNotchD2D(Notch* n, Canvas* cv)
 {
     RECT rc; GetClientRect(n->hwnd, &rc);
     float panelAlpha = n->blurActive ? 0.88f : 1.0f;
+    // v7 thin strip on fullscreen: when in strip mode and not
+    // expanded, paint ONLY the strip — a single thin accent bar
+    // (theme accent, full width of the strip, anti-aliased via
+    // Direct2D, radius = half the strip height so it reads as a
+    // pill). No clock, no cards, no dock, no border, no gradient:
+    // the strip must read as a deliberate accent bar, not as a
+    // leftover black bar or a broken panel. It is opaque even
+    // when blur is on (blur through a 6 px bar would be noise).
+    // When the strip is expanded (hover/click over a fullscreen
+    // app), paintExpanded is true and this branch is skipped, so
+    // the full panel paints exactly as normal.
+    if (n->inFullscreenStrip && !n->paintExpanded) {
+        const Theme& stripTh = CurrentTheme();
+        float radius = (float)rc.bottom / 2.0f;
+        if (radius < 1.0f) radius = 1.0f;
+        cv->FillRounded(rc, stripTh.accent, radius, 1.0f);
+        return;
+    }
     PaintSurfaceD2D(cv, n, rc, panelAlpha);
     wchar_t clockText[32]; FormatClock(clockText, 32);
     int dpi = n->dpi;
@@ -3226,10 +3448,15 @@ static LRESULT CALLBACK ManagerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
                 // snap each notch to its final v2 size at once.
                 for (size_t i = 0; i < g_notches.size(); i++) {
                     Notch* an = g_notches[i];
-                    // Hidden-by-fullscreen notches stay hidden; their
-                    // size is snapped on restore instead (which would
-                    // otherwise un-hide them here via SHOWWINDOW).
-                    if (an && an->hwnd && !an->hiddenByFullscreen) {
+                    // v7 strip: strip notches are visible, so
+                    // they are snapped too (a collapsed strip
+                    // snaps to strip height, an expanded panel
+                    // snaps to its normal size). The old code
+                    // skipped SW_HIDE'd notches to avoid
+                    // un-hiding them via SHOWWINDOW; that
+                    // failure mode no longer exists, because
+                    // nothing is ever SW_HIDE'd any more.
+                    if (an && an->hwnd) {
                         StopAnimation(an);
                         an->paintExpanded = an->expanded;
                         ApplyNotchSizeInstant(an, an->expanded);
@@ -3239,9 +3466,10 @@ static LRESULT CALLBACK ManagerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             }
             break;
         // v5-themes: switch, persist via the existing settings
-        // mechanism, and repaint every notch at once. Hidden-by-
-        // fullscreen notches are skipped by InvalidateAllNotches
-        // (they are not visible) and repaint on restore.
+        // mechanism, and repaint every notch at once. v7 strip:
+        // a strip notch repaints as a strip (accent colour
+        // follows the new theme), and an expanded panel over a
+        // fullscreen app repaints normally.
         case ID_TRAY_THEME_ONYX: g_theme = 0; SaveSettings(); InvalidateAllNotches(); break;
         case ID_TRAY_THEME_MIDNIGHT: g_theme = 1; SaveSettings(); InvalidateAllNotches(); break;
         case ID_TRAY_THEME_GRAPHITE: g_theme = 2; SaveSettings(); InvalidateAllNotches(); break;

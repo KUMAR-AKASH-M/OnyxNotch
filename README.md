@@ -99,9 +99,153 @@ runtime-resolved `SetWindowCompositionAttribute` accent API
 - Blur is in the tray menu (and therefore the gear menu, which
   opens the same menu), like every other toggle.
 
-### 4. What was preserved, exactly
+### 4. Thin strip on fullscreen — replaces total hiding
+**The bug it fixes:** hide-on-fullscreen used to `SW_HIDE` the
+notch when a fullscreen window was detected, and only show it
+again when *no* window covered the monitor any more. A false
+positive that kept matching — a DWM-cloaked window, an owned
+or tool window, or a shell window covering the monitor without
+being a real app — therefore left the notch hidden permanently
+on the desktop, where the user could never see it to recover
+it. Total hiding is gone. The notch is never `SW_HIDE`'d for
+fullscreen any more.
+
+**What happens now:** when hide-on-fullscreen is ON and a
+fullscreen window is detected on a monitor, that monitor's
+notch shrinks to a **thin strip**: same collapsed width,
+centred at the top of the work area, 6 px tall at 96 DPI
+(DPI-scaled, with a 3 px floor so the height is never 0).
+It is painted as a single thin accent bar (theme accent, full
+width of the strip, anti-aliased via Direct2D) — no clock, no
+cards, no dock. It stays topmost and never steals focus, so
+it is visible on top of the fullscreen app instead of
+disappearing under it. It is a deliberate accent bar, not a
+leftover black bar.
+
+**Interaction and restore:**
+- Hovering the strip expands the full panel over the
+  fullscreen app, exactly like a normal hover expand.
+  Clicking it toggles pin, exactly like a normal collapsed
+  click (so a clicked-open panel stays until clicked again
+  or closed with X). Moving away from an unpinned panel, or
+  clicking its close X, collapses it back to the **strip**
+  (not to the normal 34 px pill) while fullscreen persists.
+- When fullscreen ends, the notch returns to the state it
+  had *before* the strip started — collapsed stays collapsed,
+  expanded+pinned stays expanded+pinned, and its tab is
+  preserved (unlike a fresh expand, which resets to HOME).
+  It is never forced expanded by the restore.
+- Turning hide-on-fullscreen OFF while in strip mode
+  restores the notch to normal at once (through the normal
+  animated size path if animations are on); it does not wait
+  for any app to leave fullscreen.
+- Per-monitor independence is preserved: a strip on one
+  monitor does not affect notches on other monitors. Size /
+  theme / feature toggles while in strip mode update the
+  strip width (and the strip's accent colour on a theme
+  change) without breaking the strip or the restore path.
+  On a display change the notches are rebuilt as before, and
+  the strip re-enters within the next 1-second check if
+  fullscreen is still active.
+- The settings key is unchanged (`hide_on_fullscreen` in
+  settings.ini) and the tray item text is unchanged ("Hide
+  on fullscreen"), so existing settings files keep working.
+  The name now means "thin strip on fullscreen, never total
+  hide" — only the behaviour changed, not the setting.
+
+**Hardened detection (what counts as fullscreen now):**
+a window counts only if it is visible, not minimised, not
+DWM-cloaked, not owned by another window, not a tool window,
+not one of our own windows, not the shell window, and its
+rect covers the whole monitor rect. Exclusions, exactly:
+- `Progman`, `WorkerW` (desktop), `Shell_TrayWnd`,
+  `Shell_SecondaryTrayWnd` (taskbars), and the shell window
+  itself — shell UI that can cover the monitor without
+  being an app.
+- Owned windows (`GW_OWNER != NULL`): dialogs, popups and
+  dropdowns owned by an app are not the fullscreen app
+  itself, and an owned overlay covering the monitor was a
+  prime false-positive source for the old stuck hide.
+- `WS_EX_TOOLWINDOW` windows: floating palettes, tooltips,
+  IME windows — UI chrome, not apps.
+- DWM-cloaked windows (`DwmGetWindowAttribute`,
+  `DWMWA_CLOAKED`, resolved at runtime like the blur accent
+  call, so no new link dependency): cloaked UWP/Store
+  windows on another virtual desktop still report
+  `IsWindowVisible`, so visibility alone could not exclude
+  them — the other prime false-positive source.
+- `Windows.UI.Core.CoreWindow` **only** when its process is
+  `ShellExperienceHost.exe`,
+  `StartMenuExperienceHost.exe`, `SearchHost.exe`, or
+  `SearchUI.exe` (Start/search shell). CoreWindow is NOT
+  blanket-excluded: real UWP apps, including fullscreen
+  games, also use it, and excluding them would break the
+  strip for exactly the apps it exists for.
+  `ApplicationFrameWindow` (the UWP frame host) is
+  deliberately NOT excluded: a fullscreen UWP app's frame
+  covering the monitor is a real fullscreen app.
+- The window does NOT have to be foreground: a fullscreen
+  game/app still counts even if a small overlay is briefly
+  foreground. The check still runs once per second on the
+  existing timer, and still uses the full monitor rect (not
+  the work area), so captioned/maximised windows that leave
+  the taskbar visible still do not trigger it.
+- Safety net, by design: a remaining false positive (an
+  unowned, non-tool, uncloaked overlay or wallpaper window
+  covering the full rect) now shows a visible strip, not a
+  disappearance — a cosmetic annoyance, not a stuck notch.
+  There is deliberately NO timer that force-restores the
+  notch over a real fullscreen app: that would defeat the
+  feature for games and fullscreen video.
+
+**How to test it on Windows, step by step:**
+1. Pull, build with `build.bat` in a Developer Command
+   Prompt, quit any running OnyxNotch first (LNK1104).
+2. Turn **Hide on fullscreen** ON in the tray menu
+   (default is OFF). On the desktop, the notch must stay
+   a normal pill — this is the regression test for the old
+   bug: if the desktop alone ever shows a strip, a
+   false-positive source is still matching; report which
+   app/shell state was open.
+3. Open a fullscreen game or a borderless fullscreen app
+   (or press F11 in a browser). The notch must shrink to
+   a thin accent strip at the top, not disappear.
+4. Hover the strip: the full panel must open over the
+   fullscreen app. Move away (unpinned): it must return
+   to the strip, not to the normal pill and not to hidden.
+5. Leave fullscreen (exit the game / un-maximise): the
+   notch must return to its pre-strip state (collapsed, or
+   expanded+pinned if it was pinned before).
+6. While in strip mode, turn Hide on fullscreen OFF in
+   the tray menu: the notch must restore to normal at
+   once, without leaving fullscreen.
+7. Repeat 3–5 on a second monitor if you have one: the
+   strip must appear only on the fullscreen monitor.
+8. Report: does the strip show over a real fullscreen
+   game, does hover/click over it work, and does the
+   desktop ever show a strip when nothing is fullscreen?
+
+**Honest limits for the strip (untested on Windows):**
+- Whether the strip actually shows over a real fullscreen
+  game/app (topmost + layered + NOACTIVATE together over a
+  fullscreen exclusive window) is untested, as is whether
+  the cloaked/owned/tool exclusions fix the desktop
+  false positive on the reporter's machine — that machine
+  is the test.
+- Start/search shell identification by process image name
+  assumes those host exe names; if Windows renames them,
+  that one exclusion silently stops matching (the strip
+  still shows, it just may trigger for Start as well).
+- A fullscreen app that draws over the top-centre of the
+  screen may cover the 6 px strip visually even though the
+  strip window is topmost; that is an app-draw-order
+  question, not a hide bug, and should be reported with
+  the app name if seen.
+
+### 5. What was preserved, exactly
 Multi-monitor (one notch per monitor, per-monitor DPI, rebuild
-on display change); hide-on-fullscreen OFF opt-in; custom tray
+on display change); hide-on-fullscreen OFF opt-in (now a thin
+strip, never total hide — see section 4); custom tray
 icon; media controls OFF opt-in with SMTC titles (header-only
 C++/WinRT, media-keys-only control, exact v4 fallback on any
 SMTC failure); widgets OFF opt-in (stats, calendar); saved
@@ -123,7 +267,7 @@ only, feature toggle may change the unified height via the
 animated path); tray/gear menus; no taskbar; no focus steal;
 1-second timer; Animations ON by default.
 
-### 5. Build on Windows (MSVC only)
+### 6. Build on Windows (MSVC only)
 From a Visual Studio Developer Command Prompt, in this folder,
 run `build.bat`:
 
@@ -146,7 +290,7 @@ running OnyxNotch first (tray Quit, or
 `taskkill /F /IM OnyxNotch.exe`) or the link will fail with
 LNK1104 because it cannot overwrite the running .exe.
 
-### 6. Honest list of what was NOT verified on Windows
+### 7. Honest list of what was NOT verified on Windows
 - NOT compiled on Windows. This Linux VM has no Windows
   toolchain, so `cl`/`rc` were never run on v7. Static checks
   passed (braces/parens/brackets balance; no GDI paint calls
@@ -606,6 +750,12 @@ on the existing clock timer, so hiding can lag up to a second.
 Turning the toggle off restores all notches immediately.
 With the toggle off (the default), v2 behaves exactly like v1: the
 notch stays on top in fullscreen apps.
+Note (v7 change, superseding the "hides" wording above):
+total hiding was replaced by a thin strip, because hiding
+could stick on the desktop after a false-positive detection
+— see the v7 section 4, "Thin strip on fullscreen", for the
+strip behaviour, the hardened detection rules, and the test
+steps. The settings key and tray text are unchanged.
 
 ### 3. Custom tray / app icon — ON by default
 The default Windows application icon is replaced by a black-pill
