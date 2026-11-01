@@ -832,6 +832,16 @@ just before `HomeCardFeatureOn`, with a comment at the old
 site. No behaviour changed — same defaults, same settings
 keys.
 
+Build fix 3 (2026-11-02, after the sound push): the first
+sound build failed with C2660 on three Core Audio calls.
+Cause: the mixer code assumed Get-style calls take an event
+context, but only the Set-style calls do. `IAudioSessionControl2::IsSystemSoundsSession`
+takes no arguments and returns BOOL directly (not an HRESULT
+with a BOOL out parameter), and `ISimpleAudioVolume::GetMasterVolume`
+/ `GetMute` each take exactly one argument. Fix: call them
+with their real signatures; the Set* calls keep their
+`(value, NULL)` form. No behaviour changed.
+
 ### 8. Honest limits — v8 (not verified on Windows)
 
 v8 was written and reviewed in the Linux VM, which has no

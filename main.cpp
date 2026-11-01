@@ -3815,8 +3815,10 @@ static std::wstring MixerExeOfSession(IAudioSessionControl* ctl)
     if (!ctl) return L"";
     IAudioSessionControl2* ctl2 = NULL;
     if (FAILED(ctl->QueryInterface(__uuidof(IAudioSessionControl2), (void**)&ctl2)) || !ctl2) return L"";
-    BOOL sys = FALSE;
-    ctl2->IsSystemSoundsSession(&sys);
+    // v8-sound fix: IsSystemSoundsSession takes no arguments and
+    // returns BOOL directly (audiopolicy.h), it is not an HRESULT
+    // with an out parameter.
+    BOOL sys = ctl2->IsSystemSoundsSession();
     DWORD pid = 0;
     if (FAILED(ctl2->GetProcessId(&pid))) pid = 0;
     ctl2->Release();
@@ -3854,8 +3856,11 @@ static void RefreshMixer()
                 ISimpleAudioVolume* sv = NULL;
                 if (SUCCEEDED(ctl->QueryInterface(__uuidof(ISimpleAudioVolume), (void**)&sv)) && sv) {
                     float v = 0; BOOL m = FALSE;
-                    sv->GetMasterVolume(&v, NULL);
-                    sv->GetMute(&m, NULL);
+                    // v8-sound fix: ISimpleAudioVolume GetMasterVolume
+                    // and GetMute each take ONE argument (AudioClient.h);
+                    // the event-context GUID belongs only to the Set* calls.
+                    sv->GetMasterVolume(&v);
+                    sv->GetMute(&m);
                     MixSession ms; ms.exe = exe; ms.percent = (int)(v * 100.0f + 0.5f); ms.muted = (m != FALSE);
                     g_mixSessions.push_back(ms);
                     sv->Release();
