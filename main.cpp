@@ -1,3 +1,17 @@
+// OnyxNotch v6-unified-size - one expanded size for every tab
+// (in place, after the v6 flicker/icons/calendar fix).
+//  1. Unified height: ComputeLayout returns the MAXIMUM total
+//     height over every visible dock tab, so switching tabs never
+//     changes the panel width or height, and the header and dock
+//     sit at exactly the same Y on every tab.
+//  2. Shorter tabs are vertically centred in the unified body
+//     area (empty space split evenly above and below), for every
+//     tab including Calendar, whose card is already a fixed
+//     6-week height. Painting and hit tests share this layout.
+//  3. A tab switch only repaints; it does not animate the size.
+//     Expand/collapse still animate as before, and a feature
+//     toggle still resizes through the animated size path, since
+//     the set of visible tabs (and therefore the maximum) changed.
 // OnyxNotch v6-fix - flicker, icons, calendar (in place, after v6).
 //  1. Double-buffered painting: WM_PAINT renders into a memory DC
 //     and BitBlts once; no erase-on-invalidate anywhere, so the
@@ -770,7 +784,7 @@ static int DockIds(int* out)
     return c;
 }
 
-static Layout ComputeLayout(Notch* n, int clientW)
+static Layout ComputeLayoutForTab(Notch* n, int clientW, int tab)
 {
     Layout L;
     int dpi = n->dpi;
@@ -787,7 +801,7 @@ static Layout ComputeLayout(Notch* n, int clientW)
     L.gearCX = L.closeCX - Scale(40, dpi);
     L.gearCY = L.headerH / 2;
     L.bodyY = L.headerH + Scale(8, dpi);
-    int effTab = EffectiveTab(n);
+    int effTab = tab;
     int bodyH = 0;
     int btnGap = Scale(8, dpi);
     if (effTab == kTabHome) {
@@ -908,6 +922,70 @@ static Layout ComputeLayout(Notch* n, int clientW)
         L.dockRects[i] = { cx - r, cy - r, cx + r, cy + r };
     }
     L.totalH = L.dockY + L.dockH + Scale(12, dpi);
+    return L;
+}
+
+// v6-unified-size: every visible tab shares ONE expanded height.
+// ComputeLayoutForTab above builds one tab at its natural height;
+// this wrapper takes the maximum total height over every tab in
+// the dock (only tabs that are actually visible for the current
+// toggles) and vertically centres this tab's body inside that
+// unified body area, so the header and the dock sit at exactly
+// the same Y on every tab and switching tabs never moves them.
+// Centring is used for EVERY tab, including Calendar: its card
+// is already a fixed 6-week height, so centring it just splits
+// the remaining space evenly instead of leaving it all below.
+// Because painting and every hit test both call this wrapper,
+// a click always lands where the content is drawn, on every tab.
+// Header geometry (gear, close X) is never shifted.
+static void ShiftRectY(RECT& r, int dy)
+{
+    r.top += dy; r.bottom += dy;
+}
+
+static Layout ComputeLayout(Notch* n, int clientW)
+{
+    Layout L = ComputeLayoutForTab(n, clientW, EffectiveTab(n));
+    int ids[5];
+    int dc = DockIds(ids);
+    int maxTotal = L.totalH;
+    for (int i = 0; i < dc; i++) {
+        Layout t = ComputeLayoutForTab(n, clientW, ids[i]);
+        if (t.totalH > maxTotal) maxTotal = t.totalH;
+    }
+    int delta = maxTotal - L.totalH;
+    if (delta <= 0) return L;
+    int shift = delta / 2;
+    for (int i = 0; i < L.homeCardCount; i++) ShiftRectY(L.homeCards[i], shift);
+    if (L.homeMediaTitleY >= 0) L.homeMediaTitleY += shift;
+    L.homeMediaButtonY += shift;
+    ShiftRectY(L.homeBtnPrev, shift);
+    ShiftRectY(L.homeBtnPlay, shift);
+    ShiftRectY(L.homeBtnNext, shift);
+    L.homeStatsY += shift;
+    L.homeWeekY += shift;
+    ShiftRectY(L.mediaCard, shift);
+    if (L.mediaTitleY >= 0) L.mediaTitleY += shift;
+    if (L.mediaArtistY >= 0) L.mediaArtistY += shift;
+    L.mediaButtonY += shift;
+    ShiftRectY(L.btnPrev, shift);
+    ShiftRectY(L.btnPlay, shift);
+    ShiftRectY(L.btnNext, shift);
+    for (int i = 0; i < 4; i++) ShiftRectY(L.sysCards[i], shift);
+    ShiftRectY(L.clockCard, shift);
+    ShiftRectY(L.worldCard, shift);
+    ShiftRectY(L.monthCard, shift);
+    ShiftRectY(L.agendaCard, shift);
+    L.calendarY += shift;
+    L.calWeekY += shift;
+    L.calGridY += shift;
+    ShiftRectY(L.calPrevRect, shift);
+    ShiftRectY(L.calNextRect, shift);
+    ShiftRectY(L.calTodayRect, shift);
+    L.dockY += delta;
+    ShiftRectY(L.dockPill, delta);
+    for (int i = 0; i < L.dockCount; i++) ShiftRectY(L.dockRects[i], delta);
+    L.totalH = maxTotal;
     return L;
 }
 
@@ -2776,7 +2854,11 @@ static LRESULT CALLBACK NotchWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                 // at the current month (documented choice).
                 if (n->activeTab == kTabCalendar) { n->calYear = 0; n->calMonth = 0; n->calDay = 0; }
                 n->activeTab = dockTab;
-                ApplyTargetSize(n, true);
+                // v6-unified-size: the panel size is identical on
+                // every tab, so a switch only repaints content
+                // (into the double buffer). It must NOT run the
+                // size-animation path, or the panel would jump.
+                InvalidateRect(hwnd, NULL, FALSE);
             } else {
                 InvalidateRect(hwnd, NULL, FALSE);
             }

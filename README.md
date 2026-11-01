@@ -287,6 +287,109 @@ the WinRT part). It links `windowsapp.lib`, `advapi32.lib`,
 - **Heights are arithmetic, not measurements**, and under-10 MB
   idle remains a target, not a measurement.
 
+## What's new in v6 — Unified tab size (in place, after the v6-fix)
+
+This is a fix inside v6, not a v7. It answers the report "every
+tab have it's own size that looks odd".
+
+### 1. One expanded size for every tab
+
+Previously each tab computed its own total height (Home, System,
+Clock, Calendar, and Media all differed), so switching tabs
+jumped the panel size and moved the dock. Now the expanded panel
+has exactly one size:
+
+- `ComputeLayout` builds each visible dock tab's layout at its
+  natural height (Home, System, Media, Clock, Calendar — only
+  the tabs that are actually visible for the current toggles:
+  System only if stats are on, Media only if media controls are
+  on, Calendar only if the calendar widget is on; Home and Clock
+  are always present) and takes the **maximum** total height
+  over all of them.
+- The panel width never changed between tabs and still does not
+  (about 840 px at 96 DPI, clamped to the monitor work width).
+- The header (title, subtitle, battery, gear, close X) and the
+  bottom icon dock therefore sit at exactly the same Y on every
+  tab, because they are placed from the unified height, not from
+  a per-tab height. The tallest tab has no extra space; every
+  other tab is centred inside the same body area (see below).
+
+### 2. How shorter tabs are placed — centred, all of them
+
+A shorter tab's body content is vertically centred within the
+fixed body area between the header and the dock: the leftover
+space is split evenly above and below the content, so a short
+tab never looks like a small island at the top with a huge empty
+gap above the dock. This centring is used for **every** tab,
+including Calendar — its card is already a fixed 6-week height,
+so centring it just splits the remaining space evenly instead of
+leaving it all below. No tab is deliberately top-aligned.
+
+Centring is not a paint-only trick: painting and every hit test
+(media buttons, calendar arrows/days/Today, dock, gear, close X)
+all call the same `ComputeLayout`, so a click lands where the
+content is drawn, on every tab. Header geometry is never
+shifted, so the gear and close X keep their exact positions.
+
+### 3. What changes the height now
+
+- **Tab switch:** only repaints content (into the double
+  buffer). It deliberately does **not** run the size-animation
+  path, since the size does not change. A switch therefore
+  cannot jump, resize, or move the dock.
+- **Expand / collapse:** still animate (about 220 ms, ease-out)
+  when Animations is on, and snap instantly when it is off —
+  between the collapsed clock pill and the unified expanded
+  size.
+- **Feature toggle on/off:** may change the unified height,
+  because the set of visible tabs changed and therefore the
+  maximum changed. That change goes through the existing
+  animated size path, and it is the only time the expanded
+  height may change besides expand/collapse.
+- Data changes never change the height: the calendar card is
+  already fixed at 6 weeks, the MEDIA layout already reserves
+  title + artist rows, and sparklines, history, and network
+  speeds already live inside fixed-height cards.
+
+### 4. What did not change
+
+Card contents, the Home grid, the System/Clock/Calendar/Media
+cards, the calendar's fixed 6-week height and reserved MEDIA
+rows, themes, the tray/gear menus, saved settings, auto-start,
+the SMTC fallback, double-buffered painting, and `build.bat`
+(goto labels, zero parenthesis characters, C++17, `/EHsc`,
+coroutine silence macro) are all unchanged. Only `main.cpp`
+and this README changed in this fix.
+
+### 5. Build
+
+Unchanged from v6: from a Visual Studio Developer Command Prompt,
+in this folder, run `build.bat` (MSVC only; MinGW cannot build
+the WinRT part). It links `windowsapp.lib`, `advapi32.lib`,
+`iphlpapi.lib`, and `winmm.lib`.
+
+### Honest limits — unified tab size (not verified on Windows)
+
+- **Not compiled on Windows.** This Linux VM has no Windows
+  toolchain, so `cl`/`rc` were never run on the changed code.
+  Static checks passed (braces, parentheses, and brackets all
+  balance once comment/string contents are excluded; the raw
+  bracket count differs by one in both the old and the new code
+  because of a `[` inside a comment or string literal), but a
+  compile error is still possible until the first Windows build.
+- **Whether all tabs really are the same size on a real display
+  is untested**, as is whether the centred content looks
+  balanced on the shortest tabs (Media and Clock, which get the
+  most centring when System is the tallest tab). Hit-test
+  alignment on centred shorter tabs, per-monitor DPI behaviour,
+  and animation interplay (expand/collapse to the unified size)
+  have likewise not been observed. If anything still jumps, the
+  Animations tray tick remains the instant fallback for the
+  expand/collapse path (it does not affect tab switches, which
+  no longer animate at all).
+- **Heights are arithmetic, not measurements**, and under-10 MB
+  idle remains a target, not a measurement.
+
 ## What it does (v1, unchanged)
 
 - Black notch, top-centre of the screen, always on top.
