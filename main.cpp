@@ -352,6 +352,7 @@ static const int kShelfCap = 50;
 static bool GetShelfPath(wchar_t* out, size_t count);
 static void SaveShelf();
 static void LoadShelf();
+static void CopyClipItemBack(int storageIdx); // v8-fix: used by NotchWndProc, defined later
 
 // ---------------------------------------------------------------------------
 // v5-themes: theme table. Onyx reproduces the v4 colours exactly
@@ -2508,6 +2509,9 @@ public:
         return S_OK;
     }
 };
+// v8-fix: OnyxDropFiles is not declared under WIN32_LEAN_AND_MEAN,
+// so use this identical-layout struct instead of relying on shellapi.
+struct OnyxDropFiles { UINT pFiles; POINT pt; BOOL fNC; BOOL fWide; };
 class SimpleDataObject : public IDataObject {
     LONG m_ref = 1;
     std::vector<FORMATETC> m_fmts;
@@ -2528,15 +2532,15 @@ class SimpleDataObject : public IDataObject {
         size_t total = 0;
         for (size_t i = 0; i < files.size(); i++) total += (files[i].size() + 1);
         total += 1; // final double-null
-        size_t bytes = sizeof(DROPFILES) + total * sizeof(wchar_t);
+        size_t bytes = sizeof(OnyxDropFiles) + total * sizeof(wchar_t);
         HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, bytes);
         if (!h) return NULL;
         BYTE* base = (BYTE*)GlobalLock(h);
         if (!base) { GlobalFree(h); return NULL; }
-        DROPFILES* df = (DROPFILES*)base;
-        df->pFiles = sizeof(DROPFILES);
+        OnyxDropFiles* df = (OnyxDropFiles*)base;
+        df->pFiles = sizeof(OnyxDropFiles);
         df->pt.x = 0; df->pt.y = 0; df->fNC = FALSE; df->fWide = TRUE;
-        wchar_t* dst = (wchar_t*)(base + sizeof(DROPFILES));
+        wchar_t* dst = (wchar_t*)(base + sizeof(OnyxDropFiles));
         for (size_t i = 0; i < files.size(); i++) {
             wcscpy_s(dst, total, files[i].c_str());
             dst += files[i].size() + 1;
@@ -4184,14 +4188,14 @@ static void CopyClipItemBack(int storageIdx)
         size_t total = 0;
         for (size_t i = 0; i < item.files.size(); i++) total += item.files[i].size() + 1;
         total += 1;
-        size_t bytes = sizeof(DROPFILES) + total * sizeof(wchar_t);
+        size_t bytes = sizeof(OnyxDropFiles) + total * sizeof(wchar_t);
         HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, bytes);
         if (h) {
             BYTE* base = (BYTE*)GlobalLock(h);
             if (base) {
-                DROPFILES* df = (DROPFILES*)base;
-                df->pFiles = sizeof(DROPFILES); df->pt.x = 0; df->pt.y = 0; df->fNC = FALSE; df->fWide = TRUE;
-                wchar_t* dst = (wchar_t*)(base + sizeof(DROPFILES));
+                OnyxDropFiles* df = (OnyxDropFiles*)base;
+                df->pFiles = sizeof(OnyxDropFiles); df->pt.x = 0; df->pt.y = 0; df->fNC = FALSE; df->fWide = TRUE;
+                wchar_t* dst = (wchar_t*)(base + sizeof(OnyxDropFiles));
                 for (size_t i = 0; i < item.files.size(); i++) { wcscpy_s(dst, total, item.files[i].c_str()); dst += item.files[i].size() + 1; }
                 *dst = L'\0';
                 GlobalUnlock(h);

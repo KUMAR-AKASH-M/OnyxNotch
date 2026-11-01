@@ -479,6 +479,16 @@ dwrite.lib ole32.lib`. Output is `OnyxNotch.exe` in the same
 folder. Quit any running OnyxNotch first, or the link fails
 with LNK1104 (the running exe cannot be overwritten).
 
+Build fix 1 (2026-11-01, after the first Windows build): the
+first v8 build failed with C2065 `DROPFILES` undeclared and
+C3861 `CopyClipItemBack` not found. Cause: `DROPFILES` is not
+declared under `WIN32_LEAN_AND_MEAN`, and `CopyClipItemBack`
+was defined after the window procedure that calls it. Fix:
+v8 now uses its own identical-layout `OnyxDropFiles` struct
+(`pFiles`, `pt`, `fNC`, `fWide`) for the `CF_HDROP` buffers,
+and `CopyClipItemBack` is forward-declared near the shelf
+forward declarations. No behaviour changed.
+
 ### 6. Honest limits — v8 (not verified on Windows)
 
 v8 was written and reviewed in the Linux VM, which has no
