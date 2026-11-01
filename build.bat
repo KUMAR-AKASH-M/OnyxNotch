@@ -11,8 +11,8 @@ setlocal
 rc /nologo onyxnotch.rc
 if errorlevel 1 (
   echo.
-  echo Resource compile failed. Make sure rc.exe is on PATH
-  echo (it ships with the Windows SDK / Visual Studio).
+  echo Resource compile failed. Make sure rc.exe is on PATH.
+  echo It ships with the Windows SDK / Visual Studio.
   exit /b 1
 )
 cl /nologo /O2 /MT /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS main.cpp onyxnotch.res user32.lib gdi32.lib shell32.lib /link /SUBSYSTEM:WINDOWS /OUT:OnyxNotch.exe
