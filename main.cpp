@@ -180,6 +180,10 @@
 // v5-SMTC: C++/WinRT headers for the local SMTC session manager.
 // These need the Windows SDK with C++/WinRT and /std:c++17 (see
 // build.bat). No other WinRT API is used; there is no network use.
+// VS 2022/2026 cppwinrt headers still pull in the deprecated
+// experimental coroutine header, which fails with C2338 unless
+// this silence macro is defined before the first winrt include.
+#define _SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS
 #include <winrt/base.h>
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Media.Control.h>
