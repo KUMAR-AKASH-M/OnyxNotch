@@ -579,24 +579,41 @@ pre-existing behaviour as with 7 icons.
 
 #### 6.1 TIMER tab (always visible, like Clock)
 
-Stopwatch, Countdown, and Focus, switched by three mode
-buttons. Countdown and Focus share the same mechanics; only
-the label differs. Presets are 5 / 10 / 25 / 45 minutes, and
-step buttons are -5 / -1 / +1 / +5 minutes. Presets and steps
-apply to Countdown/Focus only, and only while paused; in
-Stopwatch mode they do nothing. Start/Pause toggles, Reset
-stops and clears. There is NO typed duration entry, because
-there is no typing in the notch — presets and steps are the
-whole input model, and that is deliberate.
+Stopwatch, Countdown, and Focus, switched by a segmented
+mode control (equal segments, selected mode filled accent,
+others outlined). Countdown and Focus share the same
+mechanics; only the label differs. Presets are 5 / 10 / 25 /
+45 minutes, and step buttons are -5 / -1 / +1 / +5 minutes.
+Presets and steps apply to Countdown/Focus only, and only
+while paused; in Stopwatch mode they do nothing. There is
+NO typed duration entry, because there is no typing in the
+notch — presets and steps are the whole input model, and
+that is deliberate.
+
+Layout (v8-ui2 redesign, 238px body at 96 DPI): the time
+is the hero, centred and large, with a status pill under it
+reading mode + state at a glance — "Countdown · Running",
+"· Paused", or, when finished, a filled-accent "· Done —
+Reset to run again". Under the pill, Countdown/Focus show a
+thin progress bar (elapsed over the set duration);
+Stopwatch has no total, so it shows only the empty track
+and the layout never shifts between modes. Below the bar:
+the segmented mode row, a preset-chip row, a compact step
+row in muted text (visually secondary to the presets, so
+the three rows do not blur together), then the actions:
+Start/Pause is the large filled-accent pill button, Reset
+is the outlined button beside it — and when Done, Reset
+gets an accent outline, because it is the action that
+matters then.
 
 Live activity: while a Countdown or Focus timer is running,
 the collapsed notch shows the remaining time instead of the
 clock; when it finishes, the collapsed notch shows "Done"
-and the TIMER tab shows "Done — Reset to run again" until
-you Reset or change mode. Stopwatch never replaces the
-collapsed clock; see it on the TIMER tab. There is NO sound
-on finish in this change (no beep toggle was added). Timers
-are in-memory only and stop on quit — they are not persisted.
+and the TIMER tab shows the Done pill until you Reset or
+change mode. Stopwatch never replaces the collapsed clock;
+see it on the TIMER tab. There is NO sound on finish in
+this change (no beep toggle was added). Timers are
+in-memory only and stop on quit — they are not persisted.
 
 #### 6.2 NOTES tab (always visible, like Clock)
 
@@ -612,8 +629,16 @@ text=<next line>
 
 Blank lines end a section; pinned notes sort first in the
 tab. The tab has four top buttons: New blank, From
-clipboard, Reload all, Clear all. Each row has Pin, Open,
-and Delete (X), and the list scrolls with the mouse wheel.
+clipboard, Reload all, Clear all — equal widths, so all
+four labels fit without truncation at 96 DPI. Rows are
+two lines tall (v8-ui2 redesign, 286px body at 96 DPI, 5
+visible rows of 40px): the note's first line as the title,
+with a muted second-line preview underneath when the note
+has one, Pin / Open / Delete (X) centred on the right, and
+a divider between rows. Pinned rows are obvious at a
+glance: a faint accent tint plus an accent dot beside the
+Pin label, which reads "Pinned". The list scrolls with the
+mouse wheel, with a scroll hint when there is more to see.
 
 The typing constraint, stated plainly: the notch cannot
 accept typing, by design (no-activate), so notes are NOT
@@ -639,8 +664,17 @@ image name (exe) is recorded, one second per tick, for
 today. Window titles are NEVER read — titles can contain
 private content (document titles, chats, URLs), and exe
 names are the only data this feature touches. OnyxNotch
-itself is never counted. The tab shows the top apps by time
-today and a total, with a Reset today button. Totals persist
+itself is never counted. The tab (v8-ui2 redesign, 286px
+body at 96 DPI, 5 visible rows of 40px) repeats the total
+inside the card as "Total today: Xh YYm", so the card
+stands alone. Each row shows the exe name, the duration,
+and its share of today's total, with a thin usage bar
+scaled to the top app (top app = 100%); the top app's name
+is drawn in accent, so the biggest time sink is obvious.
+Rows use the same divider treatment as NOTES rows, the
+list scrolls with the mouse wheel (hint beside Reset
+today when there is more to see), and Reset today stays
+as the secondary outlined button. Totals persist
 in `%APPDATA%\OnyxNotch\screentime.ini` (`day=YYYY-MM-DD`
 first, then `<exe>` + tab + seconds per line, corrupt lines
 ignored, at most 64 apps), and reset at local midnight. The
@@ -675,6 +709,23 @@ every tab shrinks by 140px / 350px respectively. TIMER
 SCREEN (302 -> 242px, 6 visible rows) were also compacted
 in the same pass; Clipboard/Shelf keep their 8-row lists
 (332px / 302px) and were deliberately left alone.
+
+v8-ui2 (Timer/Notes/Screen redesign, look and usability —
+not another height cut): TIMER body 238px, NOTES and
+SCREEN bodies 286px each, all still under the 380px Media
+unified max, so the unified max is unchanged. TIMER gets
+a hero display, a mode+state status pill, a Countdown /
+Focus progress bar, a segmented mode control, preset chips
+vs. a muted step row, and a large filled-accent Start /
+Pause pill with an outlined Reset (accent-outlined when
+Done). NOTES and SCREEN get 5 visible two-line / bar rows
+of 40px (down from 6 rows of 30px) with dividers, pinned
+rows tinted in NOTES, an in-card total and top-app accent
+in SCREEN, and shortened empty states — the full Notepad
+and privacy explanations live here in README, not crammed
+into the cards. The old TIMER footer line was removed
+from the card in this pass; the paused-only preset/step
+rule is stated above, not on the card.
 
 SOUND card (left half of the sound/mic row): the system
 wave-out volume % (big), the default output device's
@@ -936,6 +987,15 @@ claimed as verified until Kumar builds and runs it:
   6 rows) layouts, scroll clamping after Refresh, and
   the new unified max (380px Media body) on a real
   display at 96 DPI and at other DPIs are all unverified.
+- v8-ui2 (Timer/Notes/Screen redesign) is likewise
+  uncompiled and untested on Windows: the Timer status
+  pill and progress bar (including Done and Stopwatch
+  states), the primary Start/Pause pill and Done Reset
+  accent, Notes two-line rows with previews and pinned
+  tinting, Screen in-card total, percentage and usage
+  bars, the 5-row windows and wheel clamping in both
+  list tabs, and the new heights at 96 DPI and other
+  DPIs are all unverified.
 
 # OnyxNotch v6 — Card + dock dashboard look, existing data only
 

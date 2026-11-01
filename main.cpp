@@ -1193,11 +1193,14 @@ struct Layout {
     RECT timerStepRects[4] = { { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 } };
     RECT timerStartRect = { 0, 0, 0, 0 };
     RECT timerResetRect = { 0, 0, 0, 0 };
+    int timerStatusY = 0; // v8-ui2: status pill row top, Timer tab
+    RECT timerBarRect = { 0, 0, 0, 0 }; // v8-ui2: progress bar, Timer tab
     RECT notesCard = { 0, 0, 0, 0 };
     int notesListY = 0, notesRowH = 0;
     RECT notesTopRects[4] = { { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 } };
     RECT screenCard = { 0, 0, 0, 0 };
     int screenListY = 0, screenRowH = 0;
+    int screenTotalY = 0; // v8-ui2: in-card total line top, Screen tab
     RECT screenResetRect = { 0, 0, 0, 0 };
     RECT mediaSoundCard = { 0, 0, 0, 0 };
     RECT volTrackRect = { 0, 0, 0, 0 };
@@ -1558,64 +1561,83 @@ static Layout ComputeLayoutForTab(Notch* n, int clientW, int tab)
                              margin + Scale(110, dpi), L.shelfCard.bottom - Scale(8, dpi) };
         bodyH = cardH;
     } else if (effTab == kTabTimer) {
-        // v8-continued TIMER: display, mode row, preset row,
-        // step row, action row. All mouse clicks, no typing.
-        // v8-ui-fix: row pitch 42 -> 30 (26px buttons, 4px gap),
-        // footer shortened: body 256 -> 226 at 96 DPI.
-        int cardH = Scale(28, dpi) + Scale(52, dpi) + Scale(30, dpi) * 3 + Scale(26, dpi) + Scale(30, dpi);
+        // v8-ui2 TIMER redesign: hero time display, status pill,
+        // progress bar, segmented mode control, preset chips,
+        // compact step row, large primary Start/Pause pill +
+        // outlined Reset. All mouse clicks, no typing.
+        // Heights at 96 DPI: 28 header + 42 display + 20 pill
+        // + 6 bar + 28 mode + 22 preset + 22 step + 30 action
+        // + 10 padding = 238 body. The old footer line is gone
+        // from the card (the paused-only preset/step rule is
+        // still in README); there was no room for it and the
+        // status pill now carries mode + state at a glance.
+        int cardH = Scale(238, dpi);
         L.timerCard = { margin, L.bodyY, margin + bodyW, L.bodyY + cardH };
         int innerX = margin + Scale(14, dpi);
         int innerW = bodyW - Scale(28, dpi);
-        int modeY = L.bodyY + Scale(28, dpi) + Scale(52, dpi);
-        int presetY = modeY + Scale(30, dpi);
-        int stepY = presetY + Scale(30, dpi);
-        int actY = stepY + Scale(30, dpi);
+        L.timerStatusY = L.bodyY + Scale(72, dpi);
+        L.timerBarRect = { innerX, L.bodyY + Scale(96, dpi),
+                           innerX + innerW, L.bodyY + Scale(102, dpi) };
+        int modeY = L.bodyY + Scale(108, dpi);
+        int presetY = L.bodyY + Scale(142, dpi);
+        int stepY = L.bodyY + Scale(170, dpi);
+        int actY = L.bodyY + Scale(198, dpi);
+        int segGap = Scale(4, dpi);
         for (int i = 0; i < 3; i++) {
-            int w = (innerW - 2 * gap) / 3;
-            int x = innerX + i * (w + gap);
-            L.timerModeRects[i] = { x, modeY, x + w, modeY + Scale(26, dpi) };
+            int w = (innerW - 2 * segGap) / 3;
+            int x = innerX + i * (w + segGap);
+            L.timerModeRects[i] = { x, modeY, x + w, modeY + Scale(28, dpi) };
         }
         for (int i = 0; i < 4; i++) {
             int w = (innerW - 3 * gap) / 4;
             int x = innerX + i * (w + gap);
-            L.timerPresetRects[i] = { x, presetY, x + w, presetY + Scale(26, dpi) };
+            L.timerPresetRects[i] = { x, presetY, x + w, presetY + Scale(22, dpi) };
         }
         for (int i = 0; i < 4; i++) {
             int w = (innerW - 3 * gap) / 4;
             int x = innerX + i * (w + gap);
-            L.timerStepRects[i] = { x, stepY, x + w, stepY + Scale(26, dpi) };
+            L.timerStepRects[i] = { x, stepY, x + w, stepY + Scale(22, dpi) };
         }
-        L.timerStartRect = { innerX, actY, innerX + Scale(160, dpi), actY + Scale(26, dpi) };
-        L.timerResetRect = { innerX + Scale(168, dpi), actY, innerX + Scale(278, dpi), actY + Scale(26, dpi) };
+        L.timerStartRect = { innerX, actY, innerX + Scale(200, dpi), actY + Scale(30, dpi) };
+        L.timerResetRect = { innerX + Scale(208, dpi), actY, innerX + Scale(318, dpi), actY + Scale(30, dpi) };
         bodyH = cardH;
     } else if (effTab == kTabNotes) {
-        // v8-continued NOTES: 4 top buttons, 6 list rows.
-        // No typing: notes are created blank or from the
-        // clipboard, and edited in Notepad (see README).
-        // v8-ui-fix: 8 -> 6 visible rows (314 -> 254 at 96 DPI);
-        // the rest scrolls via noteScroll, as before.
-        int cardH = Scale(28, dpi) + Scale(34, dpi) + 6 * Scale(30, dpi) + Scale(12, dpi);
+        // v8-ui2 NOTES redesign: equal-width top buttons (the
+        // old fixed widths summed past the inner width at
+        // 96 DPI), two-line rows with separators, pinned rows
+        // tinted. 5 visible rows x 40px, so the card is
+        // 28 + 34 + 5*40 + 24 = 286 at 96 DPI — 6 taller rows
+        // would have been 326, over the 300 budget. The rest
+        // scrolls via noteScroll, as before. No typing: notes
+        // are created blank or from the clipboard, and edited
+        // in Notepad (see README).
+        int cardH = Scale(286, dpi);
         L.notesCard = { margin, L.bodyY, margin + bodyW, L.bodyY + cardH };
         int topY = L.bodyY + Scale(28, dpi);
-        int topW[4] = { Scale(140, dpi), Scale(170, dpi), Scale(120, dpi), Scale(110, dpi) };
-        int tx = margin + Scale(14, dpi);
+        int innerX = margin + Scale(14, dpi);
+        int innerW = bodyW - Scale(28, dpi);
+        int btnGap2 = Scale(8, dpi);
+        int topW = (innerW - 3 * btnGap2) / 4;
         for (int i = 0; i < 4; i++) {
-            L.notesTopRects[i] = { tx, topY, tx + topW[i], topY + Scale(26, dpi) };
-            tx += topW[i] + Scale(8, dpi);
+            int tx = innerX + i * (topW + btnGap2);
+            L.notesTopRects[i] = { tx, topY, tx + topW, topY + Scale(28, dpi) };
         }
         L.notesListY = topY + Scale(34, dpi);
-        L.notesRowH = Scale(30, dpi);
+        L.notesRowH = Scale(40, dpi);
         bodyH = cardH;
     } else if (effTab == kTabScreen) {
-        // v8-continued SCREEN: 6 list rows, Reset today row.
-        // v8-ui-fix: 8 -> 6 visible rows (302 -> 242 at 96 DPI);
-        // the rest scrolls via screenScroll, as before.
-        int cardH = Scale(28, dpi) + 6 * Scale(30, dpi) + Scale(34, dpi);
+        // v8-ui2 SCREEN redesign: in-card total line, rows with
+        // duration + percentage + proportional usage bar, top
+        // app emphasised. 5 visible rows x 40px, so the card
+        // is 28 + 24 + 5*40 + 34 = 286 at 96 DPI. The rest
+        // scrolls via screenScroll, as before.
+        int cardH = Scale(286, dpi);
         L.screenCard = { margin, L.bodyY, margin + bodyW, L.bodyY + cardH };
-        L.screenListY = L.bodyY + Scale(28, dpi);
-        L.screenRowH = Scale(30, dpi);
-        L.screenResetRect = { margin + Scale(14, dpi), L.screenCard.bottom - Scale(30, dpi),
-                              margin + Scale(130, dpi), L.screenCard.bottom - Scale(8, dpi) };
+        L.screenTotalY = L.bodyY + Scale(28, dpi);
+        L.screenListY = L.bodyY + Scale(52, dpi);
+        L.screenRowH = Scale(40, dpi);
+        L.screenResetRect = { margin + Scale(14, dpi), L.screenCard.bottom - Scale(32, dpi),
+                              margin + Scale(144, dpi), L.screenCard.bottom - Scale(6, dpi) };
         bodyH = cardH;
     }
     // Bottom icon dock: centred pill, one icon per dock tab.
@@ -1729,10 +1751,13 @@ static Layout ComputeLayout(Notch* n, int clientW)
     for (int i = 0; i < 4; i++) ShiftRectY(L.timerStepRects[i], shift);
     ShiftRectY(L.timerStartRect, shift);
     ShiftRectY(L.timerResetRect, shift);
+    L.timerStatusY += shift;
+    ShiftRectY(L.timerBarRect, shift);
     ShiftRectY(L.notesCard, shift);
     for (int i = 0; i < 4; i++) ShiftRectY(L.notesTopRects[i], shift);
     L.notesListY += shift;
     ShiftRectY(L.screenCard, shift);
+    L.screenTotalY += shift;
     L.screenListY += shift;
     ShiftRectY(L.screenResetRect, shift);
     ShiftRectY(L.volMinusRect, shift);
@@ -3045,7 +3070,7 @@ static bool NotesHitAt(Notch* n, int px, int py, bool usePaint, int& itemOut, in
     // returned itemOut is a STORAGE index, not a row index.
     std::vector<int> disp;
     for (int pass = 0; pass < 2; pass++) for (size_t i = 0; i < g_notes.size(); i++) if ((pass == 0) == g_notes[i].pinned) disp.push_back((int)i);
-    for (int row = 0; row < 6; row++) {
+    for (int row = 0; row < 5; row++) {
         int di = n->noteScroll + row;
         if (di < 0 || di >= (int)disp.size()) break;
         int storageIdx = disp[di];
@@ -3480,6 +3505,19 @@ static std::wstring NoteFirstLine(const NoteItem& nt)
     std::wstring line = (nl == std::wstring::npos) ? nt.text : nt.text.substr(0, nl);
     if (!line.empty() && line.back() == L'\r') line.pop_back();
     if (line.empty()) line = L"(empty note)";
+    return line;
+}
+// v8-ui2: second line of a note, for the two-line row preview.
+// Empty when the note has only one line; no new stored data,
+// derived from the existing text at paint time only.
+static std::wstring NoteSecondLine(const NoteItem& nt)
+{
+    size_t nl = nt.text.find(L'\n');
+    if (nl == std::wstring::npos) return L"";
+    std::wstring line = nt.text.substr(nl + 1);
+    size_t nl2 = line.find(L'\n');
+    if (nl2 != std::wstring::npos) line = line.substr(0, nl2);
+    if (!line.empty() && line.back() == L'\r') line.pop_back();
     return line;
 }
 static bool NoteAddFromClipboard()
@@ -5085,12 +5123,36 @@ static void PaintNotchD2D(Notch* n, Canvas* cv)
         {
             RECT c = L.timerCard;
             wchar_t tt[32]; TimerFormatMs(TimerDisplayMs(), tt, 32);
-            D2DText(cv, kFontBig, tt, (float)c.left, (float)(c.top + Scale(36, dpi)), (float)(c.right - c.left), (float)Scale(48, dpi), th.primary, true);
+            D2DText(cv, kFontBig, tt, (float)c.left, (float)(c.top + Scale(28, dpi)), (float)(c.right - c.left), (float)Scale(42, dpi), th.primary, true);
+            // Status pill, centred: mode + state at a glance.
+            // Done is unmistakable — filled accent; Running is
+            // an accent outline; Paused is a muted outline.
             wchar_t st[96];
-            if (g_timerDone) swprintf(st, 96, L"%s  Done — Reset to run again", TimerModeName());
-            else if (g_timerRunning) swprintf(st, 96, L"%s  Running", TimerModeName());
-            else swprintf(st, 96, L"%s  Paused", TimerModeName());
-            D2DText(cv, kFontTiny, st, (float)(c.left + 14), (float)(c.top + Scale(84, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.secondary, false);
+            if (g_timerDone) swprintf(st, 96, L"%s  ·  Done — Reset to run again", TimerModeName());
+            else if (g_timerRunning) swprintf(st, 96, L"%s  ·  Running", TimerModeName());
+            else swprintf(st, 96, L"%s  ·  Paused", TimerModeName());
+            float stW = D2DMeasure(cv, kFontTiny, st) + Scale(24, dpi);
+            int pillL = c.left + ((c.right - c.left) - (int)stW) / 2;
+            if (pillL < c.left + Scale(14, dpi)) pillL = c.left + Scale(14, dpi);
+            RECT pill = { pillL, L.timerStatusY, pillL + (int)stW, L.timerStatusY + Scale(20, dpi) };
+            if (g_timerDone) cv->FillRounded(pill, th.accent, 10.0f);
+            else if (g_timerRunning) cv->StrokeRounded(pill, th.accent, 1.0f, 10.0f);
+            else cv->StrokeRounded(pill, th.muted, 1.0f, 10.0f);
+            D2DText(cv, kFontTiny, st, (float)pill.left, (float)pill.top, (float)(pill.right - pill.left), (float)(pill.bottom - pill.top), g_timerDone ? th.pillText : (g_timerRunning ? th.accent : th.muted), true);
+            // Progress bar, Countdown/Focus only: elapsed over
+            // the set duration (g_timerTargetMs already exists;
+            // Stopwatch has no total, so it shows only the
+            // empty track — the reserved space never shifts).
+            if ((g_timerMode == 1 || g_timerMode == 2) && g_timerTargetMs > 0) {
+                ULONGLONG el = TimerElapsedMs();
+                int pct = (int)(el * 100 / g_timerTargetMs);
+                if (pct > 100) pct = 100;
+                DrawBarD2D(cv, L.timerBarRect, pct);
+            } else {
+                DrawBarD2D(cv, L.timerBarRect, 0);
+            }
+            // Segmented mode control: equal segments, selected
+            // filled accent, unselected outlined.
             static const wchar_t* kModes[3] = { L"Stopwatch", L"Countdown", L"Focus" };
             for (int i = 0; i < 3; i++) {
                 RECT r = L.timerModeRects[i];
@@ -5098,6 +5160,9 @@ static void PaintNotchD2D(Notch* n, Canvas* cv)
                 else cv->StrokeRounded(r, th.muted, 1.0f, (float)(r.bottom - r.top) / 2.0f);
                 D2DText(cv, kFontTiny, kModes[i], (float)r.left, (float)r.top, (float)(r.right - r.left), (float)(r.bottom - r.top), (i == g_timerMode) ? th.pillText : th.secondary, true);
             }
+            // Preset chips: smaller, muted outline, secondary
+            // text. Step row: same size but muted text, so the
+            // two rows do not blur into the mode row.
             static const wchar_t* kPresets[4] = { L"5 min", L"10 min", L"25 min", L"45 min" };
             for (int i = 0; i < 4; i++) {
                 RECT r = L.timerPresetRects[i];
@@ -5108,13 +5173,17 @@ static void PaintNotchD2D(Notch* n, Canvas* cv)
             for (int i = 0; i < 4; i++) {
                 RECT r = L.timerStepRects[i];
                 cv->StrokeRounded(r, th.muted, 1.0f, (float)(r.bottom - r.top) / 2.0f);
-                D2DText(cv, kFontTiny, kSteps[i], (float)r.left, (float)r.top, (float)(r.right - r.left), (float)(r.bottom - r.top), th.secondary, true);
+                D2DText(cv, kFontTiny, kSteps[i], (float)r.left, (float)r.top, (float)(r.right - r.left), (float)(r.bottom - r.top), th.muted, true);
             }
-            cv->StrokeRounded(L.timerStartRect, th.muted, 1.0f, 4.0f);
-            D2DText(cv, kFontTiny, g_timerRunning ? L"Pause" : L"Start", (float)L.timerStartRect.left, (float)L.timerStartRect.top, (float)(L.timerStartRect.right - L.timerStartRect.left), (float)(L.timerStartRect.bottom - L.timerStartRect.top), th.secondary, true);
-            cv->StrokeRounded(L.timerResetRect, th.muted, 1.0f, 4.0f);
-            D2DText(cv, kFontTiny, L"Reset", (float)L.timerResetRect.left, (float)L.timerResetRect.top, (float)(L.timerResetRect.right - L.timerResetRect.left), (float)(L.timerResetRect.bottom - L.timerResetRect.top), th.secondary, true);
-            D2DText(cv, kFontTiny, L"Presets/steps: Countdown/Focus only, while paused. Not saved.", (float)(c.left + 14), (float)(L.timerResetRect.bottom + Scale(6, dpi)), (float)(c.right - c.left - 28), (float)Scale(16, dpi), th.muted, false);
+            // Primary action: large filled accent pill. Reset
+            // is secondary outlined — except when Done, when
+            // it gets an accent outline + accent text, because
+            // Reset is the action that matters then.
+            cv->FillRounded(L.timerStartRect, th.accent, (float)(L.timerStartRect.bottom - L.timerStartRect.top) / 2.0f);
+            D2DText(cv, kFontTiny, g_timerRunning ? L"Pause" : L"Start", (float)L.timerStartRect.left, (float)L.timerStartRect.top, (float)(L.timerStartRect.right - L.timerStartRect.left), (float)(L.timerStartRect.bottom - L.timerStartRect.top), th.pillText, true);
+            if (g_timerDone) cv->StrokeRounded(L.timerResetRect, th.accent, 2.0f, (float)(L.timerResetRect.bottom - L.timerResetRect.top) / 2.0f);
+            else cv->StrokeRounded(L.timerResetRect, th.muted, 1.0f, (float)(L.timerResetRect.bottom - L.timerResetRect.top) / 2.0f);
+            D2DText(cv, kFontTiny, L"Reset", (float)L.timerResetRect.left, (float)L.timerResetRect.top, (float)(L.timerResetRect.right - L.timerResetRect.left), (float)(L.timerResetRect.bottom - L.timerResetRect.top), g_timerDone ? th.accent : th.secondary, true);
         }
     } else if (effTab == kTabNotes) {
         DrawCardD2D(cv, L.notesCard, L"NOTES");
@@ -5131,22 +5200,34 @@ static void PaintNotchD2D(Notch* n, Canvas* cv)
             for (int pass = 0; pass < 2; pass++) for (size_t i = 0; i < g_notes.size(); i++) if ((pass == 0) == g_notes[i].pinned) disp.push_back((int)i);
             if (disp.empty()) {
                 D2DText(cv, kFontTiny, L"No notes yet", (float)(c.left + 14), (float)L.notesListY, (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.secondary, false);
-                D2DText(cv, kFontTiny, L"The notch cannot accept typing (it must not steal focus), so notes are created blank or from the clipboard and edited in Notepad: Open, edit, save, then Reload all. Notes are saved in notes.ini.", (float)(c.left + 14), (float)(L.notesListY + Scale(22, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.muted, false);
+                D2DText(cv, kFontTiny, L"Created blank or from the clipboard, edited in Notepad. See README.", (float)(c.left + 14), (float)(L.notesListY + Scale(22, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.muted, false);
             } else {
-                for (int row = 0; row < 6; row++) {
+                // Two-line rows: title on top, muted second-line
+                // preview below (when the note has one), actions
+                // centred on the right, divider between rows.
+                // Pinned rows get a faint accent tint + accent
+                // dot, so the pinned state reads at a glance.
+                for (int row = 0; row < 5; row++) {
                     int di = n->noteScroll + row;
                     if (di < 0 || di >= (int)disp.size()) break;
                     NoteItem& it = g_notes[disp[di]];
                     int y0 = L.notesListY + row * L.notesRowH;
+                    if (it.pinned) cv->FillRounded(RECT{ c.left + Scale(8, dpi), y0 + Scale(2, dpi), c.right - Scale(8, dpi), y0 + L.notesRowH - Scale(2, dpi) }, th.accent, 4.0f, 0.12f);
                     D2DTextEllipsis(cv, kFontTiny, NoteFirstLine(it).c_str(), (float)(c.left + 14), (float)y0, (float)(c.right - c.left - 150), (float)Scale(20, dpi), th.primary);
+                    std::wstring prev = NoteSecondLine(it);
+                    if (!prev.empty()) D2DTextEllipsis(cv, kFontTiny, prev.c_str(), (float)(c.left + 14), (float)(y0 + Scale(20, dpi)), (float)(c.right - c.left - 150), (float)Scale(16, dpi), th.muted);
                     int delL = c.right - 14 - 24;
                     int openL = delL - 6 - 48;
                     int pinL = openL - 6 - 44;
-                    D2DText(cv, kFontTiny, it.pinned ? L"Pinned" : L"Pin", (float)pinL, (float)y0, 44.0f, (float)Scale(20, dpi), it.pinned ? th.accent : th.muted, true);
-                    D2DText(cv, kFontTiny, L"Open", (float)openL, (float)y0, 48.0f, (float)Scale(20, dpi), th.accent, true);
-                    D2DText(cv, kFontTiny, L"X", (float)delL, (float)y0, 24.0f, (float)Scale(20, dpi), th.muted, true);
+                    int actY = y0 + (L.notesRowH - Scale(20, dpi)) / 2;
+                    if (it.pinned) cv->FillEllipse((float)(pinL - Scale(8, dpi)), (float)(actY + Scale(10, dpi)), (float)Scale(3, dpi), (float)Scale(3, dpi), th.accent);
+                    D2DText(cv, kFontTiny, it.pinned ? L"Pinned" : L"Pin", (float)pinL, (float)actY, 44.0f, (float)Scale(20, dpi), it.pinned ? th.accent : th.muted, true);
+                    D2DText(cv, kFontTiny, L"Open", (float)openL, (float)actY, 48.0f, (float)Scale(20, dpi), th.accent, true);
+                    D2DText(cv, kFontTiny, L"X", (float)delL, (float)actY, 24.0f, (float)Scale(20, dpi), th.muted, true);
+                    if (row < 4 && di + 1 < (int)disp.size())
+                        cv->FillRect(RECT{ c.left + Scale(14, dpi), y0 + L.notesRowH - 1, c.right - Scale(14, dpi), y0 + L.notesRowH }, th.divider);
                 }
-                if (n->noteScroll > 0 || n->noteScroll + 6 < (int)disp.size())
+                if (n->noteScroll > 0 || n->noteScroll + 5 < (int)disp.size())
                     D2DText(cv, kFontTiny, L"Scroll with mouse wheel", (float)(c.left + 14), (float)(L.notesCard.bottom - Scale(20, dpi)), (float)(c.right - c.left - 28), (float)Scale(16, dpi), th.muted, false);
             }
         }
@@ -5156,23 +5237,43 @@ static void PaintNotchD2D(Notch* n, Canvas* cv)
             RECT c = L.screenCard;
             std::vector<ScreenApp> sorted = g_screenApps;
             for (size_t i = 0; i < sorted.size(); i++) for (size_t k = i + 1; k < sorted.size(); k++) if (sorted[k].seconds > sorted[i].seconds) { ScreenApp tmp = sorted[i]; sorted[i] = sorted[k]; sorted[k] = tmp; }
+            // In-card total, so the card stands alone without
+            // reading the tab subtitle. Derived from the same
+            // seconds the tab already totals; nothing new stored.
+            ULONGLONG tot2 = ScreenTotalSeconds();
+            wchar_t totLine[64];
+            swprintf(totLine, 64, L"Total today: %lluh %02llum", tot2 / 3600, (tot2 % 3600) / 60);
+            D2DText(cv, kFontSmall, totLine, (float)(c.left + 14), (float)L.screenTotalY, (float)(c.right - c.left - 28), (float)Scale(22, dpi), th.primary, false);
             if (sorted.empty()) {
                 D2DText(cv, kFontTiny, L"No apps tracked yet today", (float)(c.left + 14), (float)L.screenListY, (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.secondary, false);
-                D2DText(cv, kFontTiny, L"Exe names only — window titles are never read, so no private text is recorded. Totals are saved in screentime.ini and reset at local midnight.", (float)(c.left + 14), (float)(L.screenListY + Scale(22, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.muted, false);
+                D2DText(cv, kFontTiny, L"Exe names only — never window titles. Saved in screentime.ini, resets at midnight.", (float)(c.left + 14), (float)(L.screenListY + Scale(22, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.muted, false);
             } else {
-                for (int row = 0; row < 6; row++) {
+                // Rows: exe + duration + share of today, with a
+                // thin bar scaled to the top app (top = 100%).
+                // The top app (sorted index 0) gets accent text
+                // so the biggest time sink is obvious; rows get
+                // the same divider treatment as NOTES rows.
+                ULONGLONG top = sorted[0].seconds;
+                for (int row = 0; row < 5; row++) {
                     int di = n->screenScroll + row;
                     if (di < 0 || di >= (int)sorted.size()) break;
                     ScreenApp& app = sorted[di];
                     int y0 = L.screenListY + row * L.screenRowH;
-                    wchar_t dur[32];
-                    swprintf(dur, 32, L"%lluh %02llum", app.seconds / 3600, (app.seconds % 3600) / 60);
-                    D2DTextEllipsis(cv, kFontTiny, app.exe.c_str(), (float)(c.left + 14), (float)y0, (float)(c.right - c.left - 150), (float)Scale(20, dpi), th.primary);
-                    D2DText(cv, kFontTiny, dur, (float)(c.right - 14 - 110), (float)y0, 110.0f, (float)Scale(20, dpi), th.secondary, true);
+                    wchar_t dur[48];
+                    int pct = (top > 0) ? (int)(app.seconds * 100 / top) : 0;
+                    swprintf(dur, 48, L"%lluh %02llum  ·  %d%%", app.seconds / 3600, (app.seconds % 3600) / 60, pct);
+                    D2DTextEllipsis(cv, kFontTiny, app.exe.c_str(), (float)(c.left + 14), (float)y0, (float)(c.right - c.left - 150), (float)Scale(20, dpi), di == 0 ? th.accent : th.primary);
+                    D2DText(cv, kFontTiny, dur, (float)(c.right - 14 - 150), (float)y0, 150.0f, (float)Scale(20, dpi), th.secondary, true);
+                    RECT bar = { c.left + Scale(14, dpi), y0 + Scale(26, dpi), c.right - Scale(14, dpi), y0 + Scale(32, dpi) };
+                    DrawBarD2D(cv, bar, pct);
+                    if (row < 4 && di + 1 < (int)sorted.size())
+                        cv->FillRect(RECT{ c.left + Scale(14, dpi), y0 + L.screenRowH - 1, c.right - Scale(14, dpi), y0 + L.screenRowH }, th.divider);
                 }
             }
             cv->StrokeRounded(L.screenResetRect, th.muted, 1.0f, 4.0f);
             D2DText(cv, kFontTiny, L"Reset today", (float)L.screenResetRect.left, (float)L.screenResetRect.top, (float)(L.screenResetRect.right - L.screenResetRect.left), (float)(L.screenResetRect.bottom - L.screenResetRect.top), th.secondary, true);
+            if (n->screenScroll > 0 || n->screenScroll + 5 < (int)sorted.size())
+                D2DText(cv, kFontTiny, L"Scroll with mouse wheel", (float)(L.screenResetRect.right + Scale(12, dpi)), (float)L.screenResetRect.top, (float)(c.right - L.screenResetRect.right - Scale(26, dpi)), (float)Scale(20, dpi), th.muted, false);
         }
     } else if (effTab == kTabMedia) {
         DrawCardD2D(cv, L.mediaCard, L"MEDIA");
@@ -5929,13 +6030,13 @@ static LRESULT CALLBACK NotchWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                 if (n->shelfScroll > maxOff) n->shelfScroll = maxOff;
                 InvalidateRect(hwnd, NULL, FALSE);
             } else if (EffectiveTab(n) == kTabNotes) {
-                int maxOff = (int)g_notes.size() - 6; if (maxOff < 0) maxOff = 0;
+                int maxOff = (int)g_notes.size() - 5; if (maxOff < 0) maxOff = 0;
                 n->noteScroll -= step;
                 if (n->noteScroll < 0) n->noteScroll = 0;
                 if (n->noteScroll > maxOff) n->noteScroll = maxOff;
                 InvalidateRect(hwnd, NULL, FALSE);
             } else if (EffectiveTab(n) == kTabScreen) {
-                int maxOff = (int)g_screenApps.size() - 6; if (maxOff < 0) maxOff = 0;
+                int maxOff = (int)g_screenApps.size() - 5; if (maxOff < 0) maxOff = 0;
                 n->screenScroll -= step;
                 if (n->screenScroll < 0) n->screenScroll = 0;
                 if (n->screenScroll > maxOff) n->screenScroll = maxOff;
