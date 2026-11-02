@@ -2495,18 +2495,31 @@ static void FormatOffset(int offsetMin, wchar_t* out, size_t count)
 // and hovering that bar still opens the full panel.
 // A window counts as fullscreen on a monitor when it is visible,
 // not minimised, not cloaked, not owned, not a tool window, not
-// one of our own windows, not the desktop/shell, and its rect
-// covers the whole monitor rect. The window does NOT have to be
-// foreground: a fullscreen game/app should still count even if
-// a small overlay is briefly foreground, because the app behind
-// the overlay is still fullscreen. Captioned/maximised windows
-// that leave the taskbar visible do not cover the full rect, so
-// they do not trigger the strip. Some borderless games keep a
-// caption; those may be missed (see README limits).
-// Remaining false positives (unowned, non-tool, uncloaked overlay
-// / wallpaper windows that cover the full rect) still trigger
-// the strip — but a strip, not a disappearance, so they are a
-// cosmetic annoyance, not a stuck-hidden notch.
+// one of our own windows, not the desktop/shell, not zoomed,
+// not captioned, and its rect covers the whole monitor rect.
+// The window does NOT have to be foreground: a fullscreen
+// game/app should still count even if a small overlay is
+// briefly foreground, because the app behind the overlay is
+// still fullscreen. A true fullscreen app is normally a
+// WS_POPUP window without a caption and is not zoomed in the
+// window-manager sense, so the zoomed/captioned exclusions
+// below are what separate it from a maximised desktop app.
+// v8-strip-fix: a maximised desktop window covers the full
+// monitor rect whenever the taskbar is auto-hidden, so the
+// rect test alone misread everyday maximised apps (browser,
+// editor) as fullscreen and left the notch as a strip on the
+// desktop. That was the reported bug, present since v7.
+// Trade-off, accepted deliberately: a borderless game that
+// keeps a caption AND is reported as zoomed is now missed and
+// the notch stays a normal pill over it. That is the worse
+// failure in reverse only if such a game is common; a strip
+// on every maximised desktop window is the failure users
+// actually hit, so the maximised case wins (see README limits).
+// Remaining false positives (unowned, non-tool, uncloaked,
+// unzoomed, captionless overlay / wallpaper windows that cover
+// the full rect) still trigger the strip — but a strip, not a
+// disappearance, so they are a cosmetic annoyance, not a
+// stuck-hidden notch.
 // ---------------------------------------------------------------------------
 struct FullscreenCheck {
     RECT monitorRect;
@@ -2614,6 +2627,23 @@ static BOOL CALLBACK EnumFullscreenWindow(HWND hwnd, LPARAM lParam)
     // monitor is a real fullscreen app.
     if (wcscmp(cls, L"Windows.UI.Core.CoreWindow") == 0 &&
         IsStartSearchShellWindow(hwnd)) return TRUE;
+    // v8-strip-fix, primary exclusion: a zoomed (maximised)
+    // window is a desktop app, not a fullscreen app, even when
+    // it covers the whole monitor rect because the taskbar is
+    // auto-hidden. IsZoomed takes one HWND, returns BOOL, and
+    // is a user32 call already linked (same header family as
+    // the GetWindowLongPtrW call above, so WIN32_LEAN_AND_MEAN
+    // does not hide it). Without this, every maximised app
+    // on an auto-hide taskbar forced the strip on the desktop.
+    if (IsZoomed(hwnd)) return TRUE;
+    // v8-strip-fix, second exclusion: a captioned window is a
+    // desktop app, not a fullscreen app. A true fullscreen
+    // app is normally WS_POPUP without a caption. This also
+    // catches captioned windows that are not reported as
+    // zoomed. WS_CAPTION is a winuser style bit, read with
+    // the same GetWindowLongPtrW call used above.
+    LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+    if (style & WS_CAPTION) return TRUE;
     RECT rc;
     if (!GetWindowRect(hwnd, &rc)) return TRUE;
     if (rc.left <= check->monitorRect.left && rc.top <= check->monitorRect.top &&

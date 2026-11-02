@@ -164,8 +164,9 @@ leftover black bar.
 **Hardened detection (what counts as fullscreen now):**
 a window counts only if it is visible, not minimised, not
 DWM-cloaked, not owned by another window, not a tool window,
-not one of our own windows, not the shell window, and its
-rect covers the whole monitor rect. Exclusions, exactly:
+not one of our own windows, not the shell window, not
+zoomed (maximised), not captioned, and its rect covers the
+whole monitor rect. Exclusions, exactly:
 - `Progman`, `WorkerW` (desktop), `Shell_TrayWnd`,
   `Shell_SecondaryTrayWnd` (taskbars), and the shell window
   itself — shell UI that can cover the monitor without
@@ -192,19 +193,35 @@ rect covers the whole monitor rect. Exclusions, exactly:
   `ApplicationFrameWindow` (the UWP frame host) is
   deliberately NOT excluded: a fullscreen UWP app's frame
   covering the monitor is a real fullscreen app.
+- Zoomed windows (`IsZoomed`) and captioned windows
+  (`WS_CAPTION` in the window style) are excluded, after
+  all the exclusions above and before the rect test. This
+  is the v8 strip fix for the reported bug: a maximised
+  desktop window covers the full monitor rect whenever the
+  taskbar is auto-hidden, so the rect test alone misread
+  everyday maximised apps (browser, editor) as fullscreen
+  and left the notch as a strip on the desktop since v7.
+  A true fullscreen app is normally a WS_POPUP window
+  without a caption and is not zoomed, so it still passes.
 - The window does NOT have to be foreground: a fullscreen
   game/app still counts even if a small overlay is briefly
   foreground. The check still runs once per second on the
   existing timer, and still uses the full monitor rect (not
-  the work area), so captioned/maximised windows that leave
-  the taskbar visible still do not trigger it.
+  the work area).
 - Safety net, by design: a remaining false positive (an
-  unowned, non-tool, uncloaked overlay or wallpaper window
-  covering the full rect) now shows a visible strip, not a
-  disappearance — a cosmetic annoyance, not a stuck notch.
-  There is deliberately NO timer that force-restores the
-  notch over a real fullscreen app: that would defeat the
-  feature for games and fullscreen video.
+  unowned, non-tool, uncloaked, unzoomed, captionless
+  overlay or wallpaper window covering the full rect) now
+  shows a visible strip, not a disappearance — a cosmetic
+  annoyance, not a stuck notch. There is deliberately NO
+  timer that force-restores the notch over a real
+  fullscreen app: that would defeat the feature for games
+  and fullscreen video.
+- Accepted trade-off, stated plainly: a borderless game
+  that keeps a caption AND is reported as zoomed is now
+  missed, and the notch stays a normal pill over it. That
+  is deliberate — a strip on every maximised desktop
+  window is the worse failure, and it is the one users
+  actually hit.
 
 **How to test it on Windows, step by step:**
 1. Pull, build with `build.bat` in a Developer Command
@@ -212,7 +229,10 @@ rect covers the whole monitor rect. Exclusions, exactly:
 2. Turn **Hide on fullscreen** ON in the tray menu
    (default is OFF). On the desktop, the notch must stay
    a normal pill — this is the regression test for the old
-   bug: if the desktop alone ever shows a strip, a
+   bug, and now specifically: open a maximised browser or
+   editor, with the taskbar auto-hidden and with it shown.
+   In both cases the notch must stay a normal pill, not a
+   strip. If the desktop alone ever shows a strip, a
    false-positive source is still matching; report which
    app/shell state was open.
 3. Open a fullscreen game or a borderless fullscreen app
@@ -237,9 +257,12 @@ rect covers the whole monitor rect. Exclusions, exactly:
 - Whether the strip actually shows over a real fullscreen
   game/app (topmost + layered + NOACTIVATE together over a
   fullscreen exclusive window) is untested, as is whether
-  the cloaked/owned/tool exclusions fix the desktop
+  the zoomed/captioned exclusions fix the desktop
   false positive on the reporter's machine — that machine
-  is the test.
+  is the test. A captioned borderless game that is also
+  reported as zoomed is now deliberately missed (see the
+  trade-off above); that case is accepted, not a bug to
+  chase by loosening the test again.
 - Start/search shell identification by process image name
   assumes those host exe names; if Windows renames them,
   that one exclusion silently stops matching (the strip
