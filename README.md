@@ -570,10 +570,11 @@ and must not steal focus). Every control below is a mouse
 click or the mouse wheel. New tabs join the dock in this
 order: Home, System, Media, Clock, Calendar, Clipboard,
 Shelf, Timer, Notes, Screen (Screen only when screen time is
-on). All new tabs participate in unified tab size, so the
-panel height is still one height across visible tabs, and
-tab switching still only repaints. The dock pill at 10 icons
-is 496 px at 96 DPI, well inside the 840 px panel; on a
+on), Todo (always visible, like Clock). All new tabs
+participate in unified tab size, so the panel height is
+still one height across visible tabs, and tab switching
+still only repaints. The dock pill at 11 icons is 544 px
+at 96 DPI (11 x 48 + 16), well inside the 840 px panel; on a
 narrow monitor the pill clamps to the left margin, the same
 pre-existing behaviour as with 7 icons.
 
@@ -870,6 +871,117 @@ a 7th selected card does nothing until one is unchecked.
   SYSTEM tab, and no Refresh button for it exists, so there
   is no dead control to click.
 
+#### 6.9 TODO tab (always visible, like Clock) — built on Notes
+
+A to-do list that reuses the Notes infrastructure and
+editing model, but NOT the Notes file. Tasks live in
+`%APPDATA%\OnyxNotch\todos.ini`, separate from `notes.ini`
+(which is unchanged), one `[todo]` section per task:
+
+```
+[todo]
+done=0
+text=<first line>
+text=<next line>
+```
+
+Blank lines end a section; the format, the UTF-8 on-disk
+encoding, and the load/save rules mirror `notes.ini`
+exactly, with `done=` in place of `pinned=`. The tab
+subtitle reads "X open / Y total", or "No tasks yet" when
+the list is empty. The tab has four top buttons, equal
+widths like the fixed Notes buttons, so all four labels
+fit without truncation at 96 DPI: New blank, From
+clipboard, Reload all, Clear completed. Rows are the same
+redesigned Notes rows (286px body at 96 DPI, 5 visible
+rows of 40px, two lines: title plus a muted second-line
+preview when the task has one, divider between rows, mouse
+wheel scrolling with a scroll hint when there is more to
+see, `todoScroll` clamped to items minus 5).
+
+Per row, mouse only: the checkbox at the row's left
+toggles done and persists immediately to `todos.ini`;
+Open writes the task to `todos-edit-<index>.txt` and opens
+it in Notepad, exactly like Notes; Delete (X) removes the
+task and saves at once. Done tasks are drawn muted with a
+small "Done" marker beside Open. There is deliberately NO
+strikethrough: the DirectWrite text code has no
+strikethrough support, and a half-implemented one (drawing
+a line by hand over proportional text) would misalign, so
+muted text plus the Done marker plus the filled checkbox
+carry the state instead. New blank creates a task titled
+"New task", edited in Notepad afterwards — no typing in
+the notch, ever. From clipboard reads the live clipboard
+text directly (it does not depend on clipboard history
+being on) and takes only its first line as the task; if
+the clipboard has no text, it does nothing and shows no
+error. Reload all re-reads every `todos-edit-<index>.txt`
+that exists, replacing that task's text and leaving its
+done flag untouched; tasks with no edit file are
+untouched. Clear completed removes only the done tasks
+and keeps the open ones (unlike Notes' Clear all, which
+removes everything). There are no new settings keys for
+tasks themselves (`todos.ini` is data, like `notes.ini`),
+and no new tray item beyond the dock tab.
+
+HOME decision, stated plainly: Todo is NOT a HOME card
+candidate. Extending the candidate list from 11 to 12
+would grow the HOME edit list (header + 12 rows + Done)
+past the 380px unified max and touch every 11-sized HOME
+array, for a card the dock tab already covers. The HOME
+candidate list, the 6-card cap, and the defaults are
+therefore unchanged, and Todo is dock-only.
+
+Collapsed notch decision: the TODO count is NOT added to
+the collapsed clock. The collapsed pill keeps showing the
+clock (or a running timer, as before); the count lives in
+the TODO tab subtitle, where it is always visible when
+the tab is open.
+
+#### 6.10 Pet + Edge Light cosmetics (both OFF by default)
+
+Two tray toggles, saved in `settings.ini` as `pet=` and
+`edge_light=` and restored at startup. No new settings
+for pet style or colour — each is on/off only. Neither
+adds any expanded height, and neither changes the 380px
+unified max.
+
+Pet: a small, original mascot face drawn with Direct2D
+primitives only — a filled circle, two eyes, one mouth
+line. No Vayli artwork was ever supplied and none is
+copied; this is an original geometric face, not a Vayli
+asset. It appears in the COLLAPSED notch only, at the
+left end of the pill (centre 22px from the left edge),
+where nothing else lives: the collapsed clock is centred,
+and the battery glyph, gear, and close X exist only when
+expanded. The collapsed width grows by only the pet's
+width (34px at 96 DPI: 240px to 274px at Medium size)
+when Pet is on; when Pet is off, the collapsed width and
+layout are byte-for-byte the old ones, with no leftover
+gap. Behaviour: the eyes close for one tick in every four
+(the blink is driven by the existing 1-second manager
+timer, no new timer). No other animation, no sound, no
+interaction: the pet has no hit test of its own, so a
+click landing on it is the normal collapsed click (and
+hover already expands the notch first). The pet is not
+drawn on the fullscreen thin strip, which stays a plain
+accent bar.
+
+Edge Light: when on, a thin theme-accent glow along the
+bottom edge of the notch, collapsed AND expanded (not on
+the fullscreen strip): 3 stacked 1px lines with
+decreasing alpha (0.85 / 0.50 / 0.25), inset 16px each
+side so the glow stays inside the panel's rounded
+corners, drawn right after the panel surface and under
+all content, so it can never obscure text or buttons.
+While a track is playing (SMTC status playing), the
+glow's alpha gently alternates between full and 0.6 on
+the existing 1-second tick — a subtle pulse; otherwise
+it is static. Honest limit, stated plainly: unlike
+Vayli's music light, this glow is NOT coloured from
+album art — SMTC provides no album art, so it uses the
+theme accent colour in all themes.
+
 ### 7. Build (Windows) — v8
 
 From a Visual Studio Developer Command Prompt, in the folder
@@ -996,6 +1108,19 @@ claimed as verified until Kumar builds and runs it:
   bars, the 5-row windows and wheel clamping in both
   list tabs, and the new heights at 96 DPI and other
   DPIs are all unverified.
+- v8-post-release (TODO tab + Pet + Edge Light) is
+  likewise uncompiled and untested on Windows: the TODO
+  tab (todos.ini round-trip, checkbox toggle persistence,
+  From-clipboard first line, Notepad open/reload round
+  trip, Clear completed keeping open tasks, the 5-row
+  window and wheel clamping), the Pet (blink timing,
+  click-through to the normal collapsed click, collapsed
+  width growth of 34px at 96 DPI, no leftover gap when
+  off), the Edge Light (bottom-edge glow under content,
+  pulse while a track plays, static otherwise), the
+  11-icon dock (544px at 96 DPI), unified-size interplay
+  with the new tab, DPI scaling of all three features,
+  and idle memory are all unverified.
 
 # OnyxNotch v6 — Card + dock dashboard look, existing data only
 

@@ -311,6 +311,8 @@
 #define ID_TRAY_HOME_EDIT       1021
 #define ID_TRAY_SCREEN_TIME     1022
 #define ID_TRAY_KEEP_CLIP       1023
+#define ID_TRAY_PET             1024
+#define ID_TRAY_EDGE_LIGHT      1025
 #define IDI_ONYXNOTCH_ICON      100
 
 static const wchar_t kNotchClass[] = L"OnyxNotch";
@@ -339,6 +341,14 @@ static bool g_blurEnabled = false;
 // it on). Saved in settings.ini as clipboard= / shelf=.
 static bool g_clipEnabled = false;
 static bool g_shelfEnabled = false;
+// v8-post-release cosmetics, BOTH OFF by default. Saved in
+// settings.ini as pet= / edge_light=. g_cosmeticTick advances
+// once per manager 1-second timer tick and drives both the pet
+// blink (one tick in four) and the edge-light pulse; it is not
+// a new timer.
+static bool g_petEnabled = false;
+static bool g_edgeLightEnabled = false;
+static int g_cosmeticTick = 0;
 
 // v8-home-custom: HOME card selection + order. Candidate ids:
 // 0 System, 1 Calendar, 2 Clock, 3 Media, 4 Battery, 5 Network,
@@ -525,6 +535,11 @@ static const wchar_t* TimerModeName()
 // the notch itself never accepts typing (no-activate).
 struct NoteItem { std::wstring text; bool pinned = false; };
 static std::vector<NoteItem> g_notes;
+// v8-post-release TODO: same shape as NoteItem plus done. The
+// file (todos.ini) is separate from notes.ini; only the
+// infrastructure and the Notepad-editing model are shared.
+struct TodoItem { std::wstring text; bool done = false; };
+static std::vector<TodoItem> g_todos;
 // Screen time: exe names ONLY, never window titles (titles can
 // hold private content). Seconds for today, local midnight reset.
 struct ScreenApp { std::wstring exe; ULONGLONG seconds = 0; };
@@ -754,6 +769,10 @@ static void LoadSettings()
                     if (ParseBoolValue(val, b)) g_animations = b;
                 } else if (StrEqualsIgnoreCase(key, "blur")) {
                     if (ParseBoolValue(val, b)) g_blurEnabled = b;
+                } else if (StrEqualsIgnoreCase(key, "pet")) {
+                    if (ParseBoolValue(val, b)) g_petEnabled = b;
+                } else if (StrEqualsIgnoreCase(key, "edge_light")) {
+                    if (ParseBoolValue(val, b)) g_edgeLightEnabled = b;
                 } else if (StrEqualsIgnoreCase(key, "clipboard")) {
                     if (ParseBoolValue(val, b)) g_clipEnabled = b;
                 } else if (StrEqualsIgnoreCase(key, "shelf")) {
@@ -826,6 +845,8 @@ static void SaveSettings()
         "widget_calendar=%d\r\n"
         "animations=%d\r\n"
         "blur=%d\r\n"
+        "pet=%d\r\n"
+        "edge_light=%d\r\n"
         "clipboard=%d\r\n"
         "shelf=%d\r\n"
         "screen_time=%d\r\n"
@@ -840,6 +861,8 @@ static void SaveSettings()
         g_widgetCalendar ? 1 : 0,
         g_animations ? 1 : 0,
         g_blurEnabled ? 1 : 0,
+        g_petEnabled ? 1 : 0,
+        g_edgeLightEnabled ? 1 : 0,
         g_clipEnabled ? 1 : 0,
         g_shelfEnabled ? 1 : 0,
         g_screenTimeEnabled ? 1 : 0,
@@ -988,6 +1011,7 @@ struct Notch {
     int clipScroll = 0; // item offset into the filtered display list
     int shelfScroll = 0;
     int noteScroll = 0; // v8-continued: notes list scroll
+    int todoScroll = 0; // v8-post-release: todo list scroll
     int screenScroll = 0; // v8-continued: screen-time list scroll
     int mixScroll = 0; // v8-ui-fix: mixer list scroll (Media tab, per-notch)
     int dragKind = 0; // 0 none, 1 clipboard row, 2 shelf row
@@ -1018,6 +1042,10 @@ static int Scale(int value, int dpi)
 static int CollapsedWidth(int dpi)
 {
     int base = (g_size == 0) ? 200 : (g_size == 2) ? 300 : 240;
+    // v8-post-release: the pet adds exactly its own width
+    // (34 at 96 DPI). Pet OFF returns the old width unchanged,
+    // so the collapsed layout is byte-for-byte the old one.
+    if (g_petEnabled) base += 34;
     return Scale(base, dpi);
 }
 
@@ -1159,6 +1187,7 @@ static const int kTabShelf = 6;
 static const int kTabTimer = 7; // v8-continued: always visible, like Clock
 static const int kTabNotes = 8; // v8-continued: always visible, like Clock
 static const int kTabScreen = 9; // v8-continued: only when screen time is on
+static const int kTabTodo = 10; // v8-post-release: always visible, like Clock
 
 struct Layout {
     int totalH = 0;
@@ -1167,8 +1196,8 @@ struct Layout {
     int closeCX = 0, closeCY = 0, closeR = 0;
     int bodyY = 0;
     int dockY = 0, dockH = 0, dockCount = 0;
-    int dockIds[10] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
-    RECT dockRects[10] = { { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 } };
+    int dockIds[11] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    RECT dockRects[11] = { { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 } };
     RECT dockPill = { 0, 0, 0, 0 };
     // HOME grid cards. homeCardIds: 0 System, 1 Calendar, 2 Clock,
     // 3 Media, 4 Battery, 5 Network, 6 Clipboard, 7 Shelf.
@@ -1198,6 +1227,9 @@ struct Layout {
     RECT notesCard = { 0, 0, 0, 0 };
     int notesListY = 0, notesRowH = 0;
     RECT notesTopRects[4] = { { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 } };
+    RECT todoCard = { 0, 0, 0, 0 };
+    int todoListY = 0, todoRowH = 0;
+    RECT todoTopRects[4] = { { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 } };
     RECT screenCard = { 0, 0, 0, 0 };
     int screenListY = 0, screenRowH = 0;
     int screenTotalY = 0; // v8-ui2: in-card total line top, Screen tab
@@ -1296,7 +1328,7 @@ static int EffectiveTab(Notch* n)
     if (t == kTabClipboard && !g_clipEnabled) return kTabHome;
     if (t == kTabShelf && !g_shelfEnabled) return kTabHome;
     if (t == kTabScreen && !g_screenTimeEnabled) return kTabHome;
-    if (t != kTabHome && t != kTabMedia && t != kTabSystem && t != kTabCalendar && t != kTabClock && t != kTabClipboard && t != kTabShelf && t != kTabTimer && t != kTabNotes && t != kTabScreen) return kTabHome;
+    if (t != kTabHome && t != kTabMedia && t != kTabSystem && t != kTabCalendar && t != kTabClock && t != kTabClipboard && t != kTabShelf && t != kTabTimer && t != kTabNotes && t != kTabScreen && t != kTabTodo) return kTabHome;
     return t;
 }
 
@@ -1314,6 +1346,7 @@ static int DockIds(int* out)
     out[c++] = kTabTimer;
     out[c++] = kTabNotes;
     if (g_screenTimeEnabled) out[c++] = kTabScreen;
+    out[c++] = kTabTodo;
     return c;
 }
 
@@ -1625,6 +1658,27 @@ static Layout ComputeLayoutForTab(Notch* n, int clientW, int tab)
         L.notesListY = topY + Scale(34, dpi);
         L.notesRowH = Scale(40, dpi);
         bodyH = cardH;
+    } else if (effTab == kTabTodo) {
+        // v8-post-release TODO: same card geometry as NOTES
+        // (equal-width top buttons, two-line 40px rows, 5
+        // visible rows): 28 + 34 + 5*40 + 24 = 286 at 96 DPI,
+        // under the Media 380px unified max. No typing: tasks
+        // are created blank or from the clipboard, edited in
+        // Notepad exactly like notes (see README).
+        int cardH = Scale(286, dpi);
+        L.todoCard = { margin, L.bodyY, margin + bodyW, L.bodyY + cardH };
+        int topY = L.bodyY + Scale(28, dpi);
+        int innerX = margin + Scale(14, dpi);
+        int innerW = bodyW - Scale(28, dpi);
+        int btnGap2 = Scale(8, dpi);
+        int topW = (innerW - 3 * btnGap2) / 4;
+        for (int i = 0; i < 4; i++) {
+            int tx = innerX + i * (topW + btnGap2);
+            L.todoTopRects[i] = { tx, topY, tx + topW, topY + Scale(28, dpi) };
+        }
+        L.todoListY = topY + Scale(34, dpi);
+        L.todoRowH = Scale(40, dpi);
+        bodyH = cardH;
     } else if (effTab == kTabScreen) {
         // v8-ui2 SCREEN redesign: in-card total line, rows with
         // duration + percentage + proportional usage bar, top
@@ -1643,7 +1697,7 @@ static Layout ComputeLayoutForTab(Notch* n, int clientW, int tab)
     // Bottom icon dock: centred pill, one icon per dock tab.
     L.dockH = Scale(56, dpi);
     L.dockY = L.bodyY + bodyH + Scale(8, dpi);
-    int dockIds[10];
+    int dockIds[11];
     int dc = DockIds(dockIds);
     L.dockCount = dc;
     int iconStep = Scale(48, dpi);
@@ -1683,7 +1737,7 @@ static void ShiftRectY(RECT& r, int dy)
 static Layout ComputeLayout(Notch* n, int clientW)
 {
     Layout L = ComputeLayoutForTab(n, clientW, EffectiveTab(n));
-    int ids[10];
+    int ids[11];
     int dc = DockIds(ids);
     int maxTotal = L.totalH;
     for (int i = 0; i < dc; i++) {
@@ -1756,6 +1810,9 @@ static Layout ComputeLayout(Notch* n, int clientW)
     ShiftRectY(L.notesCard, shift);
     for (int i = 0; i < 4; i++) ShiftRectY(L.notesTopRects[i], shift);
     L.notesListY += shift;
+    ShiftRectY(L.todoCard, shift);
+    for (int i = 0; i < 4; i++) ShiftRectY(L.todoTopRects[i], shift);
+    L.todoListY += shift;
     ShiftRectY(L.screenCard, shift);
     L.screenTotalY += shift;
     L.screenListY += shift;
@@ -2019,6 +2076,8 @@ static void ShowTrayMenuAt(POINT pt, UINT alignFlags)
     AppendCheck(menu, ID_TRAY_HOME_EDIT, L"Customize Home page", g_homeEdit);
     AppendCheck(menu, ID_TRAY_ANIMATIONS, L"Animations", g_animations);
     AppendCheck(menu, ID_TRAY_BLUR, L"Blur background (experimental)", g_blurEnabled);
+    AppendCheck(menu, ID_TRAY_PET, L"Pet", g_petEnabled);
+    AppendCheck(menu, ID_TRAY_EDGE_LIGHT, L"Edge light", g_edgeLightEnabled);
     AppendCheck(menu, ID_TRAY_AUTOSTART, L"Start with Windows", g_startWithWindows);
     // v5-themes: submenu, so it appears in both the tray menu and
     // the gear menu (the gear opens this same menu). Tick marks
@@ -3088,6 +3147,38 @@ static bool NotesHitAt(Notch* n, int px, int py, bool usePaint, int& itemOut, in
     }
     return false;
 }
+// Todo: part 0 row (no action), 1 checkbox toggle, 2 open,
+// 3 delete, 4 new blank, 5 from clipboard, 6 reload all,
+// 7 clear completed. The checkbox is the 20px box at the row's
+// left; Open/Delete sit at the right, like Notes.
+static bool TodoHitAt(Notch* n, int px, int py, bool usePaint, int& itemOut, int& partOut)
+{
+    if (usePaint ? !n->paintExpanded : !n->expanded) return false;
+    if (EffectiveTab(n) != kTabTodo) return false;
+    RECT rc; GetClientRect(n->hwnd, &rc);
+    Layout L = ComputeLayout(n, rc.right);
+    for (int i = 0; i < 4; i++) {
+        RECT r = L.todoTopRects[i];
+        if (px >= r.left && px < r.right && py >= r.top && py < r.bottom) { partOut = 4 + i; itemOut = -1; return true; }
+    }
+    for (int row = 0; row < 5; row++) {
+        int di = n->todoScroll + row;
+        if (di < 0 || di >= (int)g_todos.size()) break;
+        int y0 = L.todoListY + row * L.todoRowH;
+        int y1 = y0 + L.todoRowH;
+        if (py < y0 || py >= y1) continue;
+        if (px < L.todoCard.left + 14 || px >= L.todoCard.right - 14) return false;
+        int delL = L.todoCard.right - 14 - 24;
+        int openL = delL - 6 - 48;
+        int checkL = L.todoCard.left + 14;
+        int checkT = y0 + (L.todoRowH - 20) / 2;
+        if (px >= delL) { partOut = 3; itemOut = di; return true; }
+        if (px >= openL) { partOut = 2; itemOut = di; return true; }
+        if (px >= checkL && px < checkL + 20 && py >= checkT && py < checkT + 20) { partOut = 1; itemOut = di; return true; }
+        partOut = 0; itemOut = di; return true;
+    }
+    return false;
+}
 static bool ScreenHitAt(Notch* n, int px, int py, bool usePaint, int& itemOut, int& partOut)
 {
     if (!g_screenTimeEnabled) return false;
@@ -3577,6 +3668,186 @@ static void ReloadNotesFromEditFiles()
         if (read >= 3 && (unsigned char)buf[0] == 0xEF && (unsigned char)buf[1] == 0xBB && (unsigned char)buf[2] == 0xBF) start = buf + 3;
         wchar_t wp[8192];
         if (MultiByteToWideChar(CP_UTF8, 0, start, -1, wp, 8192) > 0) g_notes[i].text = wp;
+    }
+}
+// --- Todos: todos.ini format, mirroring notes.ini exactly
+// except the per-item flag is done= instead of pinned=:
+// [todo]
+// done=0
+// text=<first line>
+// text=<next line>
+// (blank line ends the section). Text lines are stored as-is
+// and loaded with the same rules as notes.ini (a line is a
+// header only when it is exactly "[todo]"). Todos are UTF-8
+// on disk, like notes.ini. Done is persisted immediately on
+// every toggle, like pinning a note.
+static bool GetTodosPath(wchar_t* out, size_t count)
+{
+    if (!GetOnyxSettingsDir(out, count)) return false;
+    if (wcscat_s(out, count, L"\\todos.ini") != 0) return false;
+    return true;
+}
+static void SaveTodos()
+{
+    wchar_t dir[MAX_PATH] = { 0 }, path[MAX_PATH] = { 0 };
+    if (!GetOnyxSettingsDir(dir, MAX_PATH)) return;
+    if (!GetTodosPath(path, MAX_PATH)) return;
+    CreateDirectoryW(dir, NULL);
+    HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return;
+    DWORD w = 0;
+    for (size_t i = 0; i < g_todos.size(); i++) {
+        char head[64];
+        int hl = sprintf_s(head, sizeof(head), "[todo]\r\ndone=%d\r\n", g_todos[i].done ? 1 : 0);
+        if (hl > 0) WriteFile(h, head, (DWORD)hl, &w, NULL);
+        std::wstring t = g_todos[i].text;
+        size_t pos = 0;
+        while (true) {
+            size_t nl = t.find(L'\n', pos);
+            std::wstring line = (nl == std::wstring::npos) ? t.substr(pos) : t.substr(pos, nl - pos);
+            if (!line.empty() && line.back() == L'\r') line.pop_back();
+            char mb[4096];
+            int n = WideCharToMultiByte(CP_UTF8, 0, line.c_str(), -1, mb, (int)sizeof(mb) - 8, NULL, NULL);
+            if (n > 0) {
+                char out[4200];
+                int ol = sprintf_s(out, sizeof(out), "text=%s\r\n", mb);
+                if (ol > 0) WriteFile(h, out, (DWORD)ol, &w, NULL);
+            }
+            if (nl == std::wstring::npos) break;
+            pos = nl + 1;
+            if (pos >= t.size()) break;
+        }
+        WriteFile(h, "\r\n", 2, &w, NULL);
+    }
+    CloseHandle(h);
+}
+static void LoadTodos()
+{
+    g_todos.clear();
+    wchar_t path[MAX_PATH] = { 0 };
+    if (!GetTodosPath(path, MAX_PATH)) return;
+    HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return;
+    char buf[65536]; DWORD read = 0;
+    BOOL ok = ReadFile(h, buf, (DWORD)sizeof(buf) - 1, &read, NULL);
+    CloseHandle(h);
+    if (!ok) return;
+    buf[read] = '\0';
+    TodoItem cur; bool inTodo = false;
+    char* p = buf;
+    while (*p) {
+        char* e = p; while (*e && *e != '\n') e++;
+        char saved = *e; *e = '\0';
+        while (*p == ' ' || *p == '\t' || *p == '\r') p++;
+        char* end = p + strlen(p);
+        while (end > p && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\r')) { end--; *end = '\0'; }
+        if (strcmp(p, "[todo]") == 0) {
+            if (inTodo) g_todos.push_back(cur);
+            cur = TodoItem(); inTodo = true;
+        } else if (inTodo && strncmp(p, "done=", 5) == 0) {
+            cur.done = (strcmp(p + 5, "1") == 0);
+        } else if (inTodo && strncmp(p, "text=", 5) == 0) {
+            wchar_t wp[4096];
+            if (MultiByteToWideChar(CP_UTF8, 0, p + 5, -1, wp, 4096) > 0) {
+                if (!cur.text.empty()) cur.text += L"\r\n";
+                cur.text += wp;
+            }
+        }
+        if (saved == '\0') break;
+        p = e + 1;
+    }
+    if (inTodo) g_todos.push_back(cur);
+}
+static std::wstring TodoFirstLine(const TodoItem& td)
+{
+    size_t nl = td.text.find(L'\n');
+    std::wstring line = (nl == std::wstring::npos) ? td.text : td.text.substr(0, nl);
+    if (!line.empty() && line.back() == L'\r') line.pop_back();
+    if (line.empty()) line = L"(empty task)";
+    return line;
+}
+// v8-post-release: second line of a task, mirroring
+// NoteSecondLine exactly, for the two-line row preview.
+static std::wstring TodoSecondLine(const TodoItem& td)
+{
+    size_t nl = td.text.find(L'\n');
+    if (nl == std::wstring::npos) return L"";
+    std::wstring line = td.text.substr(nl + 1);
+    size_t nl2 = line.find(L'\n');
+    if (nl2 != std::wstring::npos) line = line.substr(0, nl2);
+    if (!line.empty() && line.back() == L'\r') line.pop_back();
+    return line;
+}
+static bool TodoAddFromClipboard()
+{
+    // Live clipboard text, read directly (this does NOT depend
+    // on clipboard history being on). Only the FIRST line
+    // becomes the task, so a pasted paragraph does not become
+    // a multi-line task. No text on the clipboard: nothing is
+    // created, and no error is shown.
+    if (!OpenClipboard(g_managerHwnd)) return false;
+    HANDLE hText = GetClipboardData(CF_UNICODETEXT);
+    if (!hText) { CloseClipboard(); return false; }
+    const wchar_t* txt = (const wchar_t*)GlobalLock(hText);
+    if (!txt) { CloseClipboard(); return false; }
+    std::wstring t = txt;
+    GlobalUnlock(hText);
+    CloseClipboard();
+    if (t.empty()) return false;
+    size_t nl = t.find(L'\n');
+    std::wstring first = (nl == std::wstring::npos) ? t : t.substr(0, nl);
+    if (!first.empty() && first.back() == L'\r') first.pop_back();
+    if (first.empty()) return false;
+    TodoItem td; td.text = first; td.done = false;
+    g_todos.insert(g_todos.begin(), td);
+    return true;
+}
+static bool GetTodoEditPath(int idx, wchar_t* out, size_t count)
+{
+    if (!GetOnyxSettingsDir(out, count)) return false;
+    wchar_t tail[64];
+    swprintf(tail, 64, L"\\todos-edit-%d.txt", idx);
+    if (wcscat_s(out, count, tail) != 0) return false;
+    return true;
+}
+static void TodoOpenInNotepad(int idx)
+{
+    if (idx < 0 || idx >= (int)g_todos.size()) return;
+    wchar_t dir[MAX_PATH] = { 0 }, path[MAX_PATH] = { 0 };
+    if (!GetOnyxSettingsDir(dir, MAX_PATH)) return;
+    if (!GetTodoEditPath(idx, path, MAX_PATH)) return;
+    CreateDirectoryW(dir, NULL);
+    HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return;
+    DWORD w = 0;
+    unsigned char bom[3] = { 0xEF, 0xBB, 0xBF };
+    WriteFile(h, bom, 3, &w, NULL);
+    char mb[16384];
+    int n = WideCharToMultiByte(CP_UTF8, 0, g_todos[idx].text.c_str(), -1, mb, (int)sizeof(mb) - 3, NULL, NULL);
+    if (n > 0) WriteFile(h, mb, (DWORD)strlen(mb), &w, NULL);
+    CloseHandle(h);
+    ShellExecuteW(NULL, L"open", L"notepad.exe", path, NULL, SW_SHOWNORMAL);
+}
+static void ReloadTodosFromEditFiles()
+{
+    // Mirror of ReloadNotesFromEditFiles: re-read every
+    // todos-edit-N.txt that exists, replacing that task's
+    // text. Tasks with no edit file, and every done flag,
+    // are untouched.
+    for (int i = 0; i < (int)g_todos.size(); i++) {
+        wchar_t path[MAX_PATH] = { 0 };
+        if (!GetTodoEditPath(i, path, MAX_PATH)) continue;
+        HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (h == INVALID_HANDLE_VALUE) continue;
+        char buf[16384]; DWORD read = 0;
+        BOOL ok = ReadFile(h, buf, (DWORD)sizeof(buf) - 1, &read, NULL);
+        CloseHandle(h);
+        if (!ok) continue;
+        buf[read] = '\0';
+        char* start = buf;
+        if (read >= 3 && (unsigned char)buf[0] == 0xEF && (unsigned char)buf[1] == 0xBB && (unsigned char)buf[2] == 0xBF) start = buf + 3;
+        wchar_t wp[8192];
+        if (MultiByteToWideChar(CP_UTF8, 0, start, -1, wp, 8192) > 0) g_todos[i].text = wp;
     }
 }
 // --- Screen time: screentime.ini, UTF-8:
@@ -4475,6 +4746,63 @@ static void PaintBorderD2D(Canvas* cv, const RECT& rc, int dpi, bool hover, Notc
     (void)n;
 }
 
+// v8-post-release cosmetics. The pet is an ORIGINAL geometric
+// face drawn with D2D primitives only (filled circle, two eyes,
+// one mouth line) — no Vayli artwork was ever supplied and none
+// is copied. It is drawn in the COLLAPSED notch only, at the
+// LEFT end (centre Scale(22) px from the left edge), where the
+// collapsed pill holds nothing else: the clock is centred, and
+// the battery glyph, gear and close X exist only when expanded.
+// The edge light is a thin theme-accent glow along the BOTTOM
+// edge of the notch, 3 stacked 1px lines with decreasing alpha,
+// inset 16px each side so it stays inside the panel's rounded
+// corners. It is drawn UNDER content (right after the surface,
+// before any text), so it can never obscure text or buttons.
+// It is NOT coloured from album art: SMTC provides no art, so
+// it uses the theme accent (see README). Neither helper adds
+// any height, in either collapsed or expanded state.
+static void DrawPetD2D(Canvas* cv, const RECT& rc, int dpi)
+{
+    if (!g_petEnabled) return;
+    const Theme& th = CurrentTheme();
+    int cx = Scale(22, dpi);
+    int cy = rc.bottom / 2;
+    int r = Scale(11, dpi);
+    cv->FillEllipse((float)cx, (float)cy, (float)r, (float)r, th.btnBg);
+    cv->StrokeEllipse((float)cx, (float)cy, (float)r, (float)r, th.muted, 1.0f);
+    // Blink: eyes closed for one tick in every four (the tick
+    // advances on the existing 1-second manager timer).
+    bool blink = (g_cosmeticTick % 4) == 3;
+    int eyeDX = Scale(4, dpi), eyeDY = Scale(3, dpi);
+    float eyeR = (float)Scale(2, dpi);
+    if (blink) {
+        cv->Line((float)(cx - eyeDX - 3), (float)(cy - eyeDY), (float)(cx - eyeDX + 3), (float)(cy - eyeDY), th.primary, 2.0f);
+        cv->Line((float)(cx + eyeDX - 3), (float)(cy - eyeDY), (float)(cx + eyeDX + 3), (float)(cy - eyeDY), th.primary, 2.0f);
+    } else {
+        cv->FillEllipse((float)(cx - eyeDX), (float)(cy - eyeDY), eyeR, eyeR, th.primary);
+        cv->FillEllipse((float)(cx + eyeDX), (float)(cy - eyeDY), eyeR, eyeR, th.primary);
+    }
+    int mouthY = cy + Scale(4, dpi);
+    cv->Line((float)(cx - Scale(4, dpi)), (float)mouthY, (float)(cx + Scale(4, dpi)), (float)mouthY, th.primary, 2.0f);
+}
+static void DrawEdgeLightD2D(Canvas* cv, const RECT& rc, int dpi)
+{
+    if (!g_edgeLightEnabled) return;
+    const Theme& th = CurrentTheme();
+    // Pulse: while a track is PLAYING (g_smtcStatus == 1) the
+    // glow alternates between full and 0.6 alpha on the
+    // 1-second tick; otherwise it is static.
+    float pulse = (g_smtcStatus == 1) ? ((g_cosmeticTick % 2 == 0) ? 1.0f : 0.6f) : 1.0f;
+    static const float kAlphas[3] = { 0.85f, 0.50f, 0.25f };
+    int inset = Scale(16, dpi);
+    int lineH = Scale(1, dpi); if (lineH < 1) lineH = 1;
+    for (int i = 0; i < 3; i++) {
+        int y = rc.bottom - (i + 1) * lineH;
+        if (y < 0) break;
+        cv->FillRectF((float)inset, (float)y, (float)(rc.right - 2 * inset), (float)lineH, th.accent, kAlphas[i] * pulse);
+    }
+}
+
 static void DrawBatteryGlyphD2D(Canvas* cv, int x, int y, int w, int h, int pct, bool charging, bool known)
 {
     const Theme& th = CurrentTheme();
@@ -4570,7 +4898,7 @@ static void DrawDockGlyphD2D(Canvas* cv, int tabId, int cx, int cy, int r, COLOR
         RECT cal = { cx - ir, cy - ir * 3 / 4, cx + ir, cy + ir };
         cv->StrokeRounded(cal, color, 1.0f, 2.0f);
         cv->FillRect(RECT{ cal.left, cal.top, cal.right, cal.top + ir / 3 }, color);
-    } else if (tabId == kTabClipboard || tabId == kTabShelf || tabId == kTabTimer || tabId == kTabNotes || tabId == kTabScreen) {
+    } else if (tabId == kTabClipboard || tabId == kTabShelf || tabId == kTabTimer || tabId == kTabNotes || tabId == kTabScreen || tabId == kTabTodo) {
         DrawDockGlyphExtraD2D(cv, tabId, cx, cy, r, color);
     }
 }
@@ -4600,6 +4928,12 @@ static void DrawDockGlyphExtraD2D(Canvas* cv, int tabId, int cx, int cy, int r, 
         cv->StrokeRounded(RECT{ cx - ir, cy - ir * 3 / 4, cx + ir, cy + ir / 2 }, color, 1.0f, 2.0f);
         cv->Line((float)cx, (float)(cy + ir / 2), (float)cx, (float)(cy + ir), color, 2.0f);
         cv->Line((float)(cx - ir / 2), (float)(cy + ir), (float)(cx + ir / 2), (float)(cy + ir), color, 2.0f);
+    } else if (tabId == kTabTodo) {
+        // Checkbox square with a check mark: distinct from the
+        // Notes page glyph and the Clipboard board glyph.
+        cv->StrokeRounded(RECT{ cx - ir * 3 / 4, cy - ir * 3 / 4, cx + ir * 3 / 4, cy + ir * 3 / 4 }, color, 1.0f, 2.0f);
+        cv->Line((float)(cx - ir / 2), (float)cy, (float)(cx - ir / 6), (float)(cy + ir / 3), color, 2.0f);
+        cv->Line((float)(cx - ir / 6), (float)(cy + ir / 3), (float)(cx + ir / 2), (float)(cy - ir / 3), color, 2.0f);
     }
 }
 static void DrawMediaButtonsRowD2D(Canvas* cv, Notch* n, const Layout& L, bool home)
@@ -4649,6 +4983,9 @@ static void PaintNotchD2D(Notch* n, Canvas* cv)
         return;
     }
     PaintSurfaceD2D(cv, n, rc, panelAlpha);
+    // v8-post-release: edge light sits under all content;
+    // the fullscreen strip returned above, so it never draws there.
+    DrawEdgeLightD2D(cv, rc, n->dpi);
     wchar_t clockText[32]; FormatClock(clockText, 32);
     // v8-continued live activity: a running (or just finished)
     // countdown/focus timer replaces the collapsed clock, so the
@@ -4662,12 +4999,16 @@ static void PaintNotchD2D(Notch* n, Canvas* cv)
     const Theme& th = CurrentTheme();
     if (!n->paintExpanded) {
         D2DText(cv, kFontClock, clockText, 0, 0, (float)rc.right, (float)rc.bottom, th.primary, true);
+        // v8-post-release pet: left end only, no hit test of
+        // its own, so a click on it is the normal collapsed
+        // click (hover already expands the notch first).
+        DrawPetD2D(cv, rc, dpi);
         PaintBorderD2D(cv, rc, dpi, n->hoverNotch, n);
         return;
     }
     Layout L = ComputeLayout(n, rc.right);
     int effTab = EffectiveTab(n);
-    static const wchar_t* kTabTitles[10] = { L"Home", L"Media", L"System", L"Calendar", L"Clock", L"Clipboard", L"Shelf", L"Timer", L"Notes", L"Screen" };
+    static const wchar_t* kTabTitles[11] = { L"Home", L"Media", L"System", L"Calendar", L"Clock", L"Clipboard", L"Shelf", L"Timer", L"Notes", L"Screen", L"Todo" };
     wchar_t subtitle[128] = { 0 };
     if (effTab == kTabHome) { FormatDate(subtitle, 128); }
     else if (effTab == kTabSystem) { wcscpy_s(subtitle, 128, L"Power \x00B7 Network \x00B7 Display"); }
@@ -4688,6 +5029,13 @@ static void PaintNotchD2D(Notch* n, Canvas* cv)
         swprintf(subtitle, 128, L"%s  %s%s", TimerModeName(), tt, g_timerDone ? L"  Done" : (g_timerRunning ? L"" : L"  Paused"));
     } else if (effTab == kTabNotes) {
         swprintf(subtitle, 128, L"%d note%s", (int)g_notes.size(), g_notes.size() == 1 ? L"" : L"s");
+    } else if (effTab == kTabTodo) {
+        if (g_todos.empty()) wcscpy_s(subtitle, 128, L"No tasks yet");
+        else {
+            int openTodo = 0;
+            for (size_t ti = 0; ti < g_todos.size(); ti++) if (!g_todos[ti].done) openTodo++;
+            swprintf(subtitle, 128, L"%d open / %d total", openTodo, (int)g_todos.size());
+        }
     } else if (effTab == kTabScreen) {
         ULONGLONG tot = ScreenTotalSeconds();
         swprintf(subtitle, 128, L"%llu min today", tot / 60);
@@ -5229,6 +5577,63 @@ static void PaintNotchD2D(Notch* n, Canvas* cv)
                 }
                 if (n->noteScroll > 0 || n->noteScroll + 5 < (int)disp.size())
                     D2DText(cv, kFontTiny, L"Scroll with mouse wheel", (float)(c.left + 14), (float)(L.notesCard.bottom - Scale(20, dpi)), (float)(c.right - c.left - 28), (float)Scale(16, dpi), th.muted, false);
+            }
+        }
+    } else if (effTab == kTabTodo) {
+        DrawCardD2D(cv, L.todoCard, L"TODO");
+        {
+            RECT c = L.todoCard;
+            static const wchar_t* kTop[4] = { L"New blank", L"From clipboard", L"Reload all", L"Clear completed" };
+            for (int i = 0; i < 4; i++) {
+                RECT r = L.todoTopRects[i];
+                cv->StrokeRounded(r, th.muted, 1.0f, 4.0f);
+                D2DText(cv, kFontTiny, kTop[i], (float)r.left, (float)r.top, (float)(r.right - r.left), (float)(r.bottom - r.top), th.secondary, true);
+            }
+            if (g_todos.empty()) {
+                D2DText(cv, kFontTiny, L"No tasks yet", (float)(c.left + 14), (float)L.todoListY, (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.secondary, false);
+                D2DText(cv, kFontTiny, L"Created blank or from the clipboard, edited in Notepad. See README.", (float)(c.left + 14), (float)(L.todoListY + Scale(22, dpi)), (float)(c.right - c.left - 28), (float)Scale(20, dpi), th.muted, false);
+            } else {
+                // Two-line rows like NOTES: title on top, muted
+                // second-line preview below (when the task has
+                // one), checkbox at the left, Open/Delete at
+                // the right, divider between rows. Done tasks
+                // are muted with a small Done marker; there is
+                // no strikethrough support in the text code, so
+                // none is faked here (see README).
+                for (int row = 0; row < 5; row++) {
+                    int di = n->todoScroll + row;
+                    if (di < 0 || di >= (int)g_todos.size()) break;
+                    TodoItem& it = g_todos[di];
+                    int y0 = L.todoListY + row * L.todoRowH;
+                    int checkS = Scale(20, dpi);
+                    int checkY = y0 + (L.todoRowH - checkS) / 2;
+                    RECT checkRc = { c.left + 14, checkY, c.left + 14 + checkS, checkY + checkS };
+                    if (it.done) {
+                        cv->FillRounded(checkRc, th.accent, 3.0f);
+                        float lw = (float)Scale(2, dpi);
+                        float x0 = (float)checkRc.left + Scale(4, dpi), x1 = (float)checkRc.left + Scale(9, dpi), x2 = (float)checkRc.right - Scale(4, dpi);
+                        float ym = (float)(checkRc.top + checkRc.bottom) / 2.0f;
+                        cv->Line(x0, ym, x1, (float)checkRc.bottom - Scale(5, dpi), th.pillText, lw);
+                        cv->Line(x1, (float)checkRc.bottom - Scale(5, dpi), x2, (float)checkRc.top + Scale(5, dpi), th.pillText, lw);
+                    } else {
+                        cv->StrokeRounded(checkRc, th.muted, 1.0f, 3.0f);
+                    }
+                    int delL = c.right - 14 - 24;
+                    int openL = delL - 6 - 48;
+                    int doneL = openL - 6 - 44;
+                    int titleW = (int)(c.right - c.left) - (it.done ? 184 : 134);
+                    D2DTextEllipsis(cv, kFontTiny, TodoFirstLine(it).c_str(), (float)(c.left + 42), (float)y0, (float)titleW, (float)Scale(20, dpi), it.done ? th.muted : th.primary);
+                    std::wstring prev = TodoSecondLine(it);
+                    if (!prev.empty()) D2DTextEllipsis(cv, kFontTiny, prev.c_str(), (float)(c.left + 42), (float)(y0 + Scale(20, dpi)), (float)titleW, (float)Scale(16, dpi), th.muted);
+                    int actY = y0 + (L.todoRowH - Scale(20, dpi)) / 2;
+                    if (it.done) D2DText(cv, kFontTiny, L"Done", (float)doneL, (float)actY, 44.0f, (float)Scale(20, dpi), th.muted, true);
+                    D2DText(cv, kFontTiny, L"Open", (float)openL, (float)actY, 48.0f, (float)Scale(20, dpi), th.accent, true);
+                    D2DText(cv, kFontTiny, L"X", (float)delL, (float)actY, 24.0f, (float)Scale(20, dpi), th.muted, true);
+                    if (row < 4 && di + 1 < (int)g_todos.size())
+                        cv->FillRect(RECT{ c.left + Scale(14, dpi), y0 + L.todoRowH - 1, c.right - Scale(14, dpi), y0 + L.todoRowH }, th.divider);
+                }
+                if (n->todoScroll > 0 || n->todoScroll + 5 < (int)g_todos.size())
+                    D2DText(cv, kFontTiny, L"Scroll with mouse wheel", (float)(c.left + 14), (float)(L.todoCard.bottom - Scale(20, dpi)), (float)(c.right - c.left - 28), (float)Scale(16, dpi), th.muted, false);
             }
         }
     } else if (effTab == kTabScreen) {
@@ -5848,6 +6253,30 @@ static LRESULT CALLBACK NotchWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                 return 0;
             }
         }
+        if (EffectiveTab(n) == kTabTodo) {
+            int item = -1, part = -1;
+            if (TodoHitAt(n, pt.x, pt.y, false, item, part)) {
+                if (part == 4) {
+                    TodoItem td; td.text = L"New task"; td.done = false;
+                    g_todos.insert(g_todos.begin(), td); SaveTodos();
+                } else if (part == 5) {
+                    if (TodoAddFromClipboard()) SaveTodos();
+                } else if (part == 6) {
+                    ReloadTodosFromEditFiles(); SaveTodos();
+                } else if (part == 7) {
+                    for (int i = (int)g_todos.size() - 1; i >= 0; i--) if (g_todos[i].done) g_todos.erase(g_todos.begin() + i);
+                    SaveTodos();
+                } else if (part == 1 && item >= 0 && item < (int)g_todos.size()) {
+                    g_todos[item].done = !g_todos[item].done; SaveTodos();
+                } else if (part == 2 && item >= 0 && item < (int)g_todos.size()) {
+                    TodoOpenInNotepad(item);
+                } else if (part == 3 && item >= 0 && item < (int)g_todos.size()) {
+                    g_todos.erase(g_todos.begin() + item); SaveTodos();
+                }
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 0;
+            }
+        }
         if (EffectiveTab(n) == kTabScreen) {
             int item = -1, part = -1;
             if (ScreenHitAt(n, pt.x, pt.y, false, item, part)) {
@@ -6034,6 +6463,12 @@ static LRESULT CALLBACK NotchWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                 n->noteScroll -= step;
                 if (n->noteScroll < 0) n->noteScroll = 0;
                 if (n->noteScroll > maxOff) n->noteScroll = maxOff;
+                InvalidateRect(hwnd, NULL, FALSE);
+            } else if (EffectiveTab(n) == kTabTodo) {
+                int maxOff = (int)g_todos.size() - 5; if (maxOff < 0) maxOff = 0;
+                n->todoScroll -= step;
+                if (n->todoScroll < 0) n->todoScroll = 0;
+                if (n->todoScroll > maxOff) n->todoScroll = maxOff;
                 InvalidateRect(hwnd, NULL, FALSE);
             } else if (EffectiveTab(n) == kTabScreen) {
                 int maxOff = (int)g_screenApps.size() - 5; if (maxOff < 0) maxOff = 0;
@@ -6328,6 +6763,9 @@ static LRESULT CALLBACK ManagerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             // keeps the same height and is just a repaint below.
             RefreshSmtc();
             TimerUpdate();
+            // v8-post-release: one tick per second drives the
+            // pet blink (1 in 4) and the edge-light pulse.
+            g_cosmeticTick++;
             if (g_screenTimeEnabled) SampleScreenTime();
             // v6-fix: no resize here any more. The MEDIA layout
             // always reserves title+artist rows, so a track
@@ -6369,6 +6807,7 @@ static LRESULT CALLBACK ManagerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             SaveSettings();
             SaveShelf();
             SaveNotes();
+            SaveTodos();
             SaveScreenTime();
             SaveClipPersist();
             // Destroy notch windows first, then the manager (which quits).
@@ -6482,12 +6921,24 @@ static LRESULT CALLBACK ManagerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             SaveSettings();
             ApplyBlurToAll();
             break;
+        case ID_TRAY_PET:
+            // Collapsed width changes, so resize every notch;
+            // expanded panels are unaffected in height.
+            g_petEnabled = !g_petEnabled;
+            SaveSettings();
+            ApplySizeToAll();
+            break;
+        case ID_TRAY_EDGE_LIGHT:
+            g_edgeLightEnabled = !g_edgeLightEnabled;
+            SaveSettings();
+            InvalidateAllNotches();
+            break;
         case ID_TRAY_MEDIA_PREV: SendMediaKey(VK_MEDIA_PREV_TRACK); break;
         case ID_TRAY_MEDIA_PLAYPAUSE: SendMediaKey(VK_MEDIA_PLAY_PAUSE); break;
         case ID_TRAY_MEDIA_NEXT: SendMediaKey(VK_MEDIA_NEXT_TRACK); break;
         case ID_TRAY_ABOUT:
             MessageBoxW(hwnd,
-                L"OnyxNotch v8 (clipboard history + file shelf)\nMac-style notch for Windows.\nNative Win32 C++, no runtime, low memory.\nDirect2D/DirectWrite rendering on a layered\nwindow with per-pixel alpha; spring animation;\nblur is an OFF-by-default experimental tray\ntoggle with an opaque fallback.\n\nv4: premium UI — gradient surface, lighter\ntypography, circular media buttons, battery glyph,\ncalendar pill — reorganized in place: compact\ntwo-column body (media beside system stats),\nsection headers, stats rows with bars.\n\nv5-SMTC: with Media controls on, the Media tab\nshows the current track title and artist from\nWindows SMTC (read-only), and Home shows a\ncompact title line. No track, no title — the\nmedia buttons still work via media keys.\n\nv5-settings: size and toggles are saved to\n%APPDATA%\\OnyxNotch\\settings.ini and restored\nat startup. Start with Windows (tray menu) writes\nthe Run registry value for this .exe.\n\nThemes: tray menu Themes submenu — Onyx, Midnight,\nGraphite — applies instantly to all notches and is\nsaved to settings.ini as theme=onyx|midnight|graphite.\n\nClick the notch header to pin it open;\nclick again to unpin. The gear button in the\nexpanded header opens this menu from the notch.\n\nv6: wide card dashboard with a header bar,\ncard grid and a bottom icon dock. Home is a\ncompact summary; System, Clock, Calendar\nand Media show full card versions. Click a\ndock icon to switch. Close X collapses only.\n\nv8: clipboard history + file shelf, both OFF by\ndefault in the tray menu. Clipboard history is\nin-memory by default (clears on quit unless the\nkeep-after-quit toggle is on), capped at 50, with a password-manager\nheuristic skip that is NOT a guarantee. Click an\nitem to copy it back; drag text/files out to\nanother app (images: drag/copy as thumbnails only). File shelf parks\nreferenced paths only; paths are saved in\n%APPDATA%\\OnyxNotch\\shelf.ini. No search box:\nthe notch must not steal keyboard focus, so\nfilters are mouse-click chips only.\n\nHome page: tray or gear menu, Customize Home page,\nopens an edit list on HOME (mouse clicks only):\ncheck up to 6 of the 11 cards (System, Calendar,\nClock, Media, Battery, Network, Clipboard, Shelf,\nTimer, Notes, Screen),\narrows reorder them, Done exits. Edit mode itself\nis not saved; the selection and order are saved in\nsettings.ini as home_cards= and home_order=.\n\nv8-continued: TIMER tab (stopwatch, countdown, focus;\npresets and steps, mouse only, in-memory, no sound),\nNOTES tab (local notes.ini; blank or from clipboard;\nedited in Notepad, never typed in the notch), SCREEN\ntab (exe names only, screentime.ini, OFF by default),\nMEDIA sound/mic row + fixed 150px scrolling mixer (4 visible rows; Media body 380px, unified max) and SYSTEM brightness (WMI)\n(unavailable on displays WMI cannot control), clipboard\npersistence (OFF by default, text only, DPAPI file\nclipboard.dat), image drag-out (thumbnails only).\nPrivacy dots and Bluetooth battery were CUT: no\nreliable public native signal exists for either, and\nfaking them would be worse than omitting them.",
+                L"OnyxNotch v8 (clipboard history + file shelf)\nMac-style notch for Windows.\nNative Win32 C++, no runtime, low memory.\nDirect2D/DirectWrite rendering on a layered\nwindow with per-pixel alpha; spring animation;\nblur is an OFF-by-default experimental tray\ntoggle with an opaque fallback.\n\nv4: premium UI — gradient surface, lighter\ntypography, circular media buttons, battery glyph,\ncalendar pill — reorganized in place: compact\ntwo-column body (media beside system stats),\nsection headers, stats rows with bars.\n\nv5-SMTC: with Media controls on, the Media tab\nshows the current track title and artist from\nWindows SMTC (read-only), and Home shows a\ncompact title line. No track, no title — the\nmedia buttons still work via media keys.\n\nv5-settings: size and toggles are saved to\n%APPDATA%\\OnyxNotch\\settings.ini and restored\nat startup. Start with Windows (tray menu) writes\nthe Run registry value for this .exe.\n\nThemes: tray menu Themes submenu — Onyx, Midnight,\nGraphite — applies instantly to all notches and is\nsaved to settings.ini as theme=onyx|midnight|graphite.\n\nClick the notch header to pin it open;\nclick again to unpin. The gear button in the\nexpanded header opens this menu from the notch.\n\nv6: wide card dashboard with a header bar,\ncard grid and a bottom icon dock. Home is a\ncompact summary; System, Clock, Calendar\nand Media show full card versions. Click a\ndock icon to switch. Close X collapses only.\n\nv8: clipboard history + file shelf, both OFF by\ndefault in the tray menu. Clipboard history is\nin-memory by default (clears on quit unless the\nkeep-after-quit toggle is on), capped at 50, with a password-manager\nheuristic skip that is NOT a guarantee. Click an\nitem to copy it back; drag text/files out to\nanother app (images: drag/copy as thumbnails only). File shelf parks\nreferenced paths only; paths are saved in\n%APPDATA%\\OnyxNotch\\shelf.ini. No search box:\nthe notch must not steal keyboard focus, so\nfilters are mouse-click chips only.\n\nHome page: tray or gear menu, Customize Home page,\nopens an edit list on HOME (mouse clicks only):\ncheck up to 6 of the 11 cards (System, Calendar,\nClock, Media, Battery, Network, Clipboard, Shelf,\nTimer, Notes, Screen),\narrows reorder them, Done exits. Edit mode itself\nis not saved; the selection and order are saved in\nsettings.ini as home_cards= and home_order=.\n\nv8-continued: TIMER tab (stopwatch, countdown, focus;\npresets and steps, mouse only, in-memory, no sound),\nNOTES tab (local notes.ini; blank or from clipboard;\nedited in Notepad, never typed in the notch), SCREEN\ntab (exe names only, screentime.ini, OFF by default),\nMEDIA sound/mic row + fixed 150px scrolling mixer (4 visible rows; Media body 380px, unified max) and SYSTEM brightness (WMI)\n(unavailable on displays WMI cannot control), clipboard\npersistence (OFF by default, text only, DPAPI file\nclipboard.dat), image drag-out (thumbnails only).\nPrivacy dots and Bluetooth battery were CUT: no\nreliable public native signal exists for either, and\nfaking them would be worse than omitting them.\n\nv8-post-release: TODO tab (todos.ini, separate from\nnotes.ini; blank or from clipboard; edited in\nNotepad, never typed in the notch; checkbox\ntoggles done, persisted at once) and cosmetics\nPet (original geometric face in the collapsed\nnotch, blinks, OFF by default) + Edge light\n(theme-accent bottom glow, pulses while a track\nplays, OFF by default; not coloured from album\nart — SMTC provides no art). Todo is dock-only,\nnot a HOME card, so the 6-card cap and the\n380px unified max are unchanged.",
                 L"OnyxNotch", MB_OK | MB_ICONINFORMATION);
             break;
         }
@@ -6499,6 +6950,7 @@ static LRESULT CALLBACK ManagerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
         SaveSettings();
         SaveShelf();
         SaveNotes();
+        SaveTodos();
         SaveScreenTime();
         SaveClipPersist();
         KillTimer(hwnd, ID_TIMER_CLOCK);
@@ -6555,6 +7007,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/,
     LoadAutoStart();
     LoadShelf();
     LoadNotes();
+    LoadTodos();
     LoadScreenTime();
     if (g_keepClipboard) LoadClipPersist();
 
