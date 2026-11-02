@@ -161,12 +161,20 @@ leftover black bar.
   The name now means "thin strip on fullscreen, never total
   hide" — only the behaviour changed, not the setting.
 
-**Hardened detection (what counts as fullscreen now):**
-a window counts only if it is visible, not minimised, not
+**Foreground-only detection (what counts as fullscreen now):**
+only the foreground window can trigger the strip. That
+window counts only if it is visible, not minimised, not
 DWM-cloaked, not owned by another window, not a tool window,
 not one of our own windows, not the shell window, not
 zoomed (maximised), not captioned, and its rect covers the
-whole monitor rect. Exclusions, exactly:
+whole monitor rect. In plain terms: the normal collapsed
+pill shows when a maximised app is in use AND when no app
+is open (empty desktop), and the strip appears only for a
+true fullscreen app actually in front of the user. This
+replaced the old walk over every window, which kept failing
+because ANY background window covering the monitor (a
+wallpaper or overlay window, a shell-adjacent window) could
+trigger the strip. Exclusions, exactly:
 - `Progman`, `WorkerW` (desktop), `Shell_TrayWnd`,
   `Shell_SecondaryTrayWnd` (taskbars), and the shell window
   itself — shell UI that can cover the monitor without
@@ -203,53 +211,63 @@ whole monitor rect. Exclusions, exactly:
   and left the notch as a strip on the desktop since v7.
   A true fullscreen app is normally a WS_POPUP window
   without a caption and is not zoomed, so it still passes.
-- The window does NOT have to be foreground: a fullscreen
-  game/app still counts even if a small overlay is briefly
-  foreground. The check still runs once per second on the
-  existing timer, and still uses the full monitor rect (not
-  the work area).
-- Safety net, by design: a remaining false positive (an
-  unowned, non-tool, uncloaked, unzoomed, captionless
-  overlay or wallpaper window covering the full rect) now
-  shows a visible strip, not a disappearance — a cosmetic
-  annoyance, not a stuck notch. There is deliberately NO
-  timer that force-restores the notch over a real
-  fullscreen app: that would defeat the feature for games
-  and fullscreen video.
-- Accepted trade-off, stated plainly: a borderless game
-  that keeps a caption AND is reported as zoomed is now
-  missed, and the notch stays a normal pill over it. That
-  is deliberate — a strip on every maximised desktop
-  window is the worse failure, and it is the one users
-  actually hit.
+- The window MUST be the foreground window
+  (`GetForegroundWindow`): background windows, however
+  large, can never trigger the strip. The check still runs
+  once per second on the existing timer, and still uses
+  the full monitor rect (not the work area).
+- Safety net, by design: the strip itself is never a
+  disappearance — even if a foreground window is
+  misread, it shows a visible accent bar, not a hidden
+  notch. There is deliberately NO timer that
+  force-restores the notch over a real fullscreen app:
+  that would defeat the feature for games and fullscreen
+  video.
+- Accepted trade-offs, stated plainly: (a) a fullscreen
+  app briefly behind a small overlay temporarily restores
+  the normal pill until it is foreground again (within
+  the 1-second check) — accepted, because background
+  windows were the false-positive source; (b) a
+  borderless game that keeps a caption AND is reported
+  as zoomed is still missed, and the notch stays a
+  normal pill over it. That is deliberate — a strip on
+  every maximised desktop window is the worse failure,
+  and it is the one users actually hit.
+- Per-monitor rule: the foreground window covers at most
+  one monitor's rect, so a fullscreen game on monitor A
+  strips only A's notch; B stays a normal pill.
 
 **How to test it on Windows, step by step:**
 1. Pull, build with `build.bat` in a Developer Command
    Prompt, quit any running OnyxNotch first (LNK1104).
 2. Turn **Hide on fullscreen** ON in the tray menu
-   (default is OFF). On the desktop, the notch must stay
-   a normal pill — this is the regression test for the old
-   bug, and now specifically: open a maximised browser or
-   editor, with the taskbar auto-hidden and with it shown.
-   In both cases the notch must stay a normal pill, not a
-   strip. If the desktop alone ever shows a strip, a
-   false-positive source is still matching; report which
-   app/shell state was open.
+   (default is OFF). On the empty desktop, with no app
+   open, the notch must stay a normal pill. Then open a
+   maximised browser or editor, with the taskbar
+   auto-hidden and with it shown. In both cases the notch
+   must stay a normal pill, not a strip. If the desktop
+   alone ever shows a strip, a false-positive source is
+   still matching; report which app/shell state was open.
 3. Open a fullscreen game or a borderless fullscreen app
-   (or press F11 in a browser). The notch must shrink to
-   a thin accent strip at the top, not disappear.
+   in the foreground (or press F11 in a browser). The
+   notch must shrink to a thin accent strip at the top,
+   not disappear.
 4. Hover the strip: the full panel must open over the
    fullscreen app. Move away (unpinned): it must return
    to the strip, not to the normal pill and not to hidden.
-5. Leave fullscreen (exit the game / un-maximise): the
+5. Alt-tab away from the fullscreen app to a normal
+   window: the pill must return within about a second.
+   Alt-tab back to the game: the strip must return.
+6. Leave fullscreen (exit the game / un-maximise): the
    notch must return to its pre-strip state (collapsed, or
    expanded+pinned if it was pinned before).
-6. While in strip mode, turn Hide on fullscreen OFF in
+7. While in strip mode, turn Hide on fullscreen OFF in
    the tray menu: the notch must restore to normal at
    once, without leaving fullscreen.
-7. Repeat 3–5 on a second monitor if you have one: the
-   strip must appear only on the fullscreen monitor.
-8. Report: does the strip show over a real fullscreen
+8. Repeat 3–5 on a second monitor if you have one: the
+   strip must appear only on the monitor whose foreground
+   window is fullscreen.
+9. Report: does the strip show over a real fullscreen
    game, does hover/click over it work, and does the
    desktop ever show a strip when nothing is fullscreen?
 
@@ -259,8 +277,9 @@ tray menu (tray icon, or the gear in the expanded header)
 and click **Fullscreen culprit**, right under "Hide on
 fullscreen". It shows whether any notch is currently in
 strip mode, whether Hide on fullscreen is ON or OFF, and —
-if the fullscreen test last matched a window — that
-window's class, title, process exe name, and rect. That
+if the foreground window last matched the fullscreen
+test — that window's class, title, process exe name, and
+rect. That
 names the false-positive window to report (or to exclude
 next). If no window is detected, it says so plainly: then
 the strip is not coming from fullscreen detection at all.
