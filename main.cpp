@@ -313,6 +313,7 @@
 #define ID_TRAY_KEEP_CLIP       1023
 #define ID_TRAY_PET             1024
 #define ID_TRAY_EDGE_LIGHT      1025
+#define ID_TRAY_FS_CULPRIT      1026
 #define IDI_ONYXNOTCH_ICON      100
 
 static const wchar_t kNotchClass[] = L"OnyxNotch";
@@ -2066,6 +2067,7 @@ static void ShowTrayMenuAt(POINT pt, UINT alignFlags)
     AppendCheck(menu, ID_TRAY_SIZE_L, L"Size: Large", g_size == 2);
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
     AppendCheck(menu, ID_TRAY_HIDE_FULLSCREEN, L"Hide on fullscreen", g_hideOnFullscreen);
+    AppendMenuW(menu, MF_STRING, ID_TRAY_FS_CULPRIT, L"Fullscreen culprit");
     AppendCheck(menu, ID_TRAY_MEDIA, L"Media controls", g_mediaEnabled);
     AppendCheck(menu, ID_TRAY_WIDGET_STATS, L"Widget: System stats", g_widgetStats);
     AppendCheck(menu, ID_TRAY_WIDGET_CALENDAR, L"Widget: Calendar", g_widgetCalendar);
@@ -2588,6 +2590,44 @@ static bool IsStartSearchShellWindow(HWND hwnd)
            ExeNameEqualsIgnoreCase(base, L"SearchUI.exe");
 }
 
+// v8-strip-diagnostic: the last window that passed the
+// fullscreen rect test, recorded so the tray "Fullscreen
+// culprit" item can NAME the false-positive window instead of
+// guessing at it. One global record only: on a multi-monitor
+// setup it reflects the last monitor checked in the 1-second
+// tick, not one record per monitor. It is cleared whenever a
+// check finds no matching window, so a stale culprit is never
+// shown after the desktop clears. Recording never changes any
+// exclusion or return value below.
+static wchar_t g_fsCulpritClass[64] = { 0 };
+static wchar_t g_fsCulpritTitle[128] = { 0 };
+static wchar_t g_fsCulpritExe[128] = { 0 };
+static RECT g_fsCulpritRect = { 0, 0, 0, 0 };
+static bool g_fsCulpritFound = false;
+
+// Process image base name for a window, mirroring the exact
+// QueryFullProcessImageNameW pattern used by
+// IsStartSearchShellWindow above. Returns false when the
+// process cannot be opened or the name cannot be read; the
+// caller then shows "(unknown)".
+static bool GetProcessExeBaseName(HWND hwnd, wchar_t* out, int outCount)
+{
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid == 0) return false;
+    HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!proc) return false;
+    wchar_t path[MAX_PATH] = { 0 };
+    DWORD len = MAX_PATH;
+    BOOL ok = QueryFullProcessImageNameW(proc, 0, path, &len);
+    CloseHandle(proc);
+    if (!ok) return false;
+    const wchar_t* base = wcsrchr(path, L'\\');
+    base = base ? base + 1 : path;
+    wcsncpy_s(out, outCount, base, _TRUNCATE);
+    return true;
+}
+
 static BOOL CALLBACK EnumFullscreenWindow(HWND hwnd, LPARAM lParam)
 {
     FullscreenCheck* check = (FullscreenCheck*)lParam;
@@ -2648,7 +2688,16 @@ static BOOL CALLBACK EnumFullscreenWindow(HWND hwnd, LPARAM lParam)
     if (!GetWindowRect(hwnd, &rc)) return TRUE;
     if (rc.left <= check->monitorRect.left && rc.top <= check->monitorRect.top &&
         rc.right >= check->monitorRect.right && rc.bottom >= check->monitorRect.bottom) {
+        // v8-strip-diagnostic: record the culprit only here,
+        // after the rect test passes. No exclusion above is
+        // changed, and the return value is unchanged.
         check->found = true;
+        wcsncpy_s(g_fsCulpritClass, 64, cls, _TRUNCATE);
+        g_fsCulpritTitle[0] = L'\0';
+        GetWindowTextW(hwnd, g_fsCulpritTitle, 128);
+        if (!GetProcessExeBaseName(hwnd, g_fsCulpritExe, 128)) g_fsCulpritExe[0] = L'\0';
+        g_fsCulpritRect = rc;
+        g_fsCulpritFound = true;
         return FALSE; // stop enumerating
     }
     return TRUE;
@@ -2658,6 +2707,18 @@ static bool IsFullscreenOnMonitor(const RECT& monitorRect)
 {
     FullscreenCheck check; check.monitorRect = monitorRect; check.found = false;
     EnumWindows(EnumFullscreenWindow, (LPARAM)&check);
+    if (!check.found) {
+        // v8-strip-diagnostic: no match on this check, so
+        // clear the record rather than showing a stale culprit.
+        // On a multi-monitor setup this is the last monitor
+        // checked in the tick; see the README limitation.
+        g_fsCulpritFound = false;
+        g_fsCulpritClass[0] = L'\0';
+        g_fsCulpritTitle[0] = L'\0';
+        g_fsCulpritExe[0] = L'\0';
+        g_fsCulpritRect.left = 0; g_fsCulpritRect.top = 0;
+        g_fsCulpritRect.right = 0; g_fsCulpritRect.bottom = 0;
+    }
     return check.found;
 }
 
@@ -6855,6 +6916,32 @@ static LRESULT CALLBACK ManagerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             SaveSettings();
             UpdateFullscreenAndVisibility();
             break;
+        case ID_TRAY_FS_CULPRIT: {
+            // v8-strip-diagnostic: name the window that the
+            // fullscreen test last matched, if any. Same
+            // MessageBoxW pattern as About, from the manager
+            // window. This only reports; it changes nothing.
+            bool anyStrip = false;
+            for (size_t i = 0; i < g_notches.size(); i++)
+                if (g_notches[i] && g_notches[i]->inFullscreenStrip) { anyStrip = true; break; }
+            wchar_t msg[1024] = { 0 };
+            if (g_fsCulpritFound) {
+                swprintf(msg, 1024, L"Strip mode: %s\nHide on fullscreen: %s\n\nFullscreen window detected:\nClass: %s\nTitle: %s\nProcess: %s\nRect: left %d, top %d, right %d, bottom %d",
+                    anyStrip ? L"YES" : L"NO",
+                    g_hideOnFullscreen ? L"ON" : L"OFF",
+                    g_fsCulpritClass[0] ? g_fsCulpritClass : L"(unknown)",
+                    g_fsCulpritTitle[0] ? g_fsCulpritTitle : L"(no title)",
+                    g_fsCulpritExe[0] ? g_fsCulpritExe : L"(unknown)",
+                    g_fsCulpritRect.left, g_fsCulpritRect.top,
+                    g_fsCulpritRect.right, g_fsCulpritRect.bottom);
+            } else {
+                swprintf(msg, 1024, L"Strip mode: %s\nHide on fullscreen: %s\n\nNo fullscreen window is currently detected \x2014 if the strip is showing, it is not coming from fullscreen detection.",
+                    anyStrip ? L"YES" : L"NO",
+                    g_hideOnFullscreen ? L"ON" : L"OFF");
+            }
+            MessageBoxW(hwnd, msg, L"Fullscreen culprit", MB_OK | MB_ICONINFORMATION);
+            break;
+        }
         case ID_TRAY_MEDIA:
             g_mediaEnabled = !g_mediaEnabled;
             SaveSettings();

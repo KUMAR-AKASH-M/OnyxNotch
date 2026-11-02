@@ -253,7 +253,25 @@ whole monitor rect. Exclusions, exactly:
    game, does hover/click over it work, and does the
    desktop ever show a strip when nothing is fullscreen?
 
+**Finding the culprit window (diagnostic):** if the strip
+shows on the desktop with no fullscreen app open, open the
+tray menu (tray icon, or the gear in the expanded header)
+and click **Fullscreen culprit**, right under "Hide on
+fullscreen". It shows whether any notch is currently in
+strip mode, whether Hide on fullscreen is ON or OFF, and —
+if the fullscreen test last matched a window — that
+window's class, title, process exe name, and rect. That
+names the false-positive window to report (or to exclude
+next). If no window is detected, it says so plainly: then
+the strip is not coming from fullscreen detection at all.
+The diagnostic only reports; it changes no detection, no
+strip behaviour, and no setting, and it writes no log file.
+
 **Honest limits for the strip (untested on Windows):**
+- The diagnostic records only the first matching window
+  per check, and on a multi-monitor setup it reflects the
+  last monitor checked in the 1-second tick, not one
+  record per monitor.
 - Whether the strip actually shows over a real fullscreen
   game/app (topmost + layered + NOACTIVATE together over a
   fullscreen exclusive window) is untested, as is whether
