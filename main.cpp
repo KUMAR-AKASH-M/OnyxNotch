@@ -2495,38 +2495,38 @@ static void FormatOffset(int offsetMin, wchar_t* out, size_t count)
 // failure mode instead of merely shrinking it: a false positive
 // now shows a visible 6 px accent bar, never a disappearance,
 // and hovering that bar still opens the full panel.
-// FOREGROUND-ONLY RULE (v8, after the EnumWindows approach kept
-// failing): only the foreground window can put a notch into
-// strip mode. A window counts as fullscreen on a monitor when
-// it IS the foreground window and it is visible, not
-// minimised, not cloaked, not owned, not a tool window, not
+// A window counts as fullscreen on a monitor when it is visible,
+// not minimised, not cloaked, not owned, not a tool window, not
 // one of our own windows, not the desktop/shell, not zoomed,
 // not captioned, and its rect covers the whole monitor rect.
-// That is the user's rule, stated plainly: the normal
-// collapsed pill shows when a maximised app is in use AND
-// when no app is open (empty desktop), and the strip appears
-// only for a true fullscreen app actually in front of the
-// user. The old EnumWindows approach failed because ANY
-// background window covering the monitor (a wallpaper or
-// overlay window, a shell-adjacent window) could trigger the
-// strip, and the zoomed/captioned exclusions could not rule
-// those out. A true fullscreen app is normally a WS_POPUP
-// window without a caption and is not zoomed in the
+// The window does NOT have to be foreground: a fullscreen
+// game/app should still count even if a small overlay is
+// briefly foreground, because the app behind the overlay is
+// still fullscreen. A true fullscreen app is normally a
+// WS_POPUP window without a caption and is not zoomed in the
 // window-manager sense, so the zoomed/captioned exclusions
 // below are what separate it from a maximised desktop app.
-// Per-monitor behaviour falls out naturally: the foreground
-// window covers at most one monitor's rect, so a fullscreen
-// game on monitor A strips only A's notch and B stays a
-// normal pill.
-// Trade-offs, accepted deliberately:
-// (a) a fullscreen app briefly behind a small overlay
-// temporarily restores the normal pill until it is foreground
-// again (the check runs once per second), because background
-// windows were the false-positive source;
-// (b) a borderless game that keeps a caption AND is reported
-// as zoomed is still missed and the notch stays a normal
-// pill over it, as before.
+// v8-strip-fix: a maximised desktop window covers the full
+// monitor rect whenever the taskbar is auto-hidden, so the
+// rect test alone misread everyday maximised apps (browser,
+// editor) as fullscreen and left the notch as a strip on the
+// desktop. That was the reported bug, present since v7.
+// Trade-off, accepted deliberately: a borderless game that
+// keeps a caption AND is reported as zoomed is now missed and
+// the notch stays a normal pill over it. That is the worse
+// failure in reverse only if such a game is common; a strip
+// on every maximised desktop window is the failure users
+// actually hit, so the maximised case wins (see README limits).
+// Remaining false positives (unowned, non-tool, uncloaked,
+// unzoomed, captionless overlay / wallpaper windows that cover
+// the full rect) still trigger the strip — but a strip, not a
+// disappearance, so they are a cosmetic annoyance, not a
+// stuck-hidden notch.
 // ---------------------------------------------------------------------------
+struct FullscreenCheck {
+    RECT monitorRect;
+    bool found = false;
+};
 
 // DWMWA_CLOAKED = 14. Resolved at runtime (same pattern as the
 // blur accent call): no dwmapi.lib link dependency, no header
@@ -2628,19 +2628,13 @@ static bool GetProcessExeBaseName(HWND hwnd, wchar_t* out, int outCount)
     return true;
 }
 
-// Single shared test for one candidate window: every exclusion
-// lives here and nowhere else, so the foreground check and
-// the culprit diagnostic can never diverge. Returns true only
-// when the window passes every exclusion AND its rect covers
-// the whole monitor rect. On a match it records the culprit
-// (class/title/exe/rect) for the tray diagnostic; it never
-// changes any exclusion or return value for recording.
-static bool IsCandidateFullscreenWindow(HWND hwnd, const RECT& monitorRect)
+static BOOL CALLBACK EnumFullscreenWindow(HWND hwnd, LPARAM lParam)
 {
-    if (!IsWindowVisible(hwnd) || IsIconic(hwnd)) return false;
-    if (hwnd == g_managerHwnd) return false;
-    if (FindNotch(hwnd) != NULL) return false;
-    if (hwnd == GetShellWindow()) return false;
+    FullscreenCheck* check = (FullscreenCheck*)lParam;
+    if (!IsWindowVisible(hwnd) || IsIconic(hwnd)) return TRUE;
+    if (hwnd == g_managerHwnd) return TRUE;
+    if (FindNotch(hwnd) != NULL) return TRUE;
+    if (hwnd == GetShellWindow()) return TRUE;
     wchar_t cls[64] = { 0 };
     GetClassNameW(hwnd, cls, 64);
     // Desktop / shell windows that can cover the monitor
@@ -2648,23 +2642,23 @@ static bool IsCandidateFullscreenWindow(HWND hwnd, const RECT& monitorRect)
     // Shell_SecondaryTrayWnd are the taskbars (primary and
     // secondary monitors); Progman/WorkerW are the desktop.
     if (wcscmp(cls, L"Progman") == 0 || wcscmp(cls, L"WorkerW") == 0 ||
-        wcscmp(cls, L"Shell_TrayWnd") == 0 || wcscmp(cls, L"Shell_SecondaryTrayWnd") == 0) return false;
+        wcscmp(cls, L"Shell_TrayWnd") == 0 || wcscmp(cls, L"Shell_SecondaryTrayWnd") == 0) return TRUE;
     // Owned windows (dialogs, popups, dropdowns owned by an app)
     // are not the fullscreen app itself: a real fullscreen app
     // is a top-level, unowned window. Counting an owned window
     // was a prime false-positive source (an owned overlay that
     // happens to cover the monitor latched the old hide).
-    if (GetWindow(hwnd, GW_OWNER) != NULL) return false;
+    if (GetWindow(hwnd, GW_OWNER) != NULL) return TRUE;
     // Tool windows (floating palettes, tooltips, IME windows)
     // are UI chrome, not apps, even when they cover the rect.
     LONG_PTR exStyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-    if (exStyle & WS_EX_TOOLWINDOW) return false;
+    if (exStyle & WS_EX_TOOLWINDOW) return TRUE;
     // Cloaked windows (DWM-cloaked: UWP/Store windows on another
     // virtual desktop, or hidden behind the shell) still report
     // IsWindowVisible, so visibility alone cannot exclude them.
     // A cloaked window covering the rect was the other prime
     // false-positive source for the old stuck-hide bug.
-    if (IsWindowCloaked(hwnd)) return false;
+    if (IsWindowCloaked(hwnd)) return TRUE;
     // Start/search shell only, by process image (see
     // IsStartSearchShellWindow): never a blanket CoreWindow
     // exclusion, so real UWP fullscreen apps still count.
@@ -2672,7 +2666,7 @@ static bool IsCandidateFullscreenWindow(HWND hwnd, const RECT& monitorRect)
     // NOT excluded: a fullscreen UWP app's frame covering the
     // monitor is a real fullscreen app.
     if (wcscmp(cls, L"Windows.UI.Core.CoreWindow") == 0 &&
-        IsStartSearchShellWindow(hwnd)) return false;
+        IsStartSearchShellWindow(hwnd)) return TRUE;
     // v8-strip-fix, primary exclusion: a zoomed (maximised)
     // window is a desktop app, not a fullscreen app, even when
     // it covers the whole monitor rect because the taskbar is
@@ -2681,7 +2675,7 @@ static bool IsCandidateFullscreenWindow(HWND hwnd, const RECT& monitorRect)
     // the GetWindowLongPtrW call above, so WIN32_LEAN_AND_MEAN
     // does not hide it). Without this, every maximised app
     // on an auto-hide taskbar forced the strip on the desktop.
-    if (IsZoomed(hwnd)) return false;
+    if (IsZoomed(hwnd)) return TRUE;
     // v8-strip-fix, second exclusion: a captioned window is a
     // desktop app, not a fullscreen app. A true fullscreen
     // app is normally WS_POPUP without a caption. This also
@@ -2689,56 +2683,43 @@ static bool IsCandidateFullscreenWindow(HWND hwnd, const RECT& monitorRect)
     // zoomed. WS_CAPTION is a winuser style bit, read with
     // the same GetWindowLongPtrW call used above.
     LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
-    if (style & WS_CAPTION) return false;
+    if (style & WS_CAPTION) return TRUE;
     RECT rc;
-    if (!GetWindowRect(hwnd, &rc)) return false;
-    if (rc.left <= monitorRect.left && rc.top <= monitorRect.top &&
-        rc.right >= monitorRect.right && rc.bottom >= monitorRect.bottom) {
+    if (!GetWindowRect(hwnd, &rc)) return TRUE;
+    if (rc.left <= check->monitorRect.left && rc.top <= check->monitorRect.top &&
+        rc.right >= check->monitorRect.right && rc.bottom >= check->monitorRect.bottom) {
         // v8-strip-diagnostic: record the culprit only here,
         // after the rect test passes. No exclusion above is
         // changed, and the return value is unchanged.
+        check->found = true;
         wcsncpy_s(g_fsCulpritClass, 64, cls, _TRUNCATE);
         g_fsCulpritTitle[0] = L'\0';
         GetWindowTextW(hwnd, g_fsCulpritTitle, 128);
         if (!GetProcessExeBaseName(hwnd, g_fsCulpritExe, 128)) g_fsCulpritExe[0] = L'\0';
         g_fsCulpritRect = rc;
         g_fsCulpritFound = true;
-        return true;
+        return FALSE; // stop enumerating
     }
-    return false;
+    return TRUE;
 }
 
-// Foreground-only fullscreen test: no EnumWindows walk. Only
-// the foreground window is tested, with the shared helper
-// above, so background wallpaper/overlay/shell windows can
-// never trigger the strip. If there is no foreground window,
-// or it does not match, the record is cleared rather than
-// showing a stale culprit. GetForegroundWindow takes no
-// arguments and returns HWND (user32, already linked).
 static bool IsFullscreenOnMonitor(const RECT& monitorRect)
 {
-    HWND fg = GetForegroundWindow();
-    if (fg == NULL) {
+    FullscreenCheck check; check.monitorRect = monitorRect; check.found = false;
+    EnumWindows(EnumFullscreenWindow, (LPARAM)&check);
+    if (!check.found) {
+        // v8-strip-diagnostic: no match on this check, so
+        // clear the record rather than showing a stale culprit.
+        // On a multi-monitor setup this is the last monitor
+        // checked in the tick; see the README limitation.
         g_fsCulpritFound = false;
         g_fsCulpritClass[0] = L'\0';
         g_fsCulpritTitle[0] = L'\0';
         g_fsCulpritExe[0] = L'\0';
         g_fsCulpritRect.left = 0; g_fsCulpritRect.top = 0;
         g_fsCulpritRect.right = 0; g_fsCulpritRect.bottom = 0;
-        return false;
     }
-    if (IsCandidateFullscreenWindow(fg, monitorRect)) return true;
-    // No match on this check, so clear the record rather than
-    // showing a stale culprit. On a multi-monitor setup this
-    // is the last monitor checked in the tick; see the README
-    // limitation.
-    g_fsCulpritFound = false;
-    g_fsCulpritClass[0] = L'\0';
-    g_fsCulpritTitle[0] = L'\0';
-    g_fsCulpritExe[0] = L'\0';
-    g_fsCulpritRect.left = 0; g_fsCulpritRect.top = 0;
-    g_fsCulpritRect.right = 0; g_fsCulpritRect.bottom = 0;
-    return false;
+    return check.found;
 }
 
 // Enter strip mode on one monitor only (per-monitor state, so
